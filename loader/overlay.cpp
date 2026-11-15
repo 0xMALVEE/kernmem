@@ -1,5 +1,6 @@
 #include "overlay.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -39,25 +40,25 @@ namespace
     constexpr uint64_t OFF_VIEW_MATRIX     = 0x1D7CC60;
     constexpr uint64_t OFF_VIEW_PROJECTION = 0x40;
 
-    constexpr uint64_t OFF_HERO_TEAM    = 0x128;
-    constexpr uint64_t OFF_HERO_NAME    = 0x3F00;
+    constexpr uint64_t OFF_HERO_TEAM     = 0x1638;
+    constexpr uint64_t OFF_HERO_NAME     = 0x3F00;
 
     /*
-     * The stat block is not at one distance for every entry: some list entries are
-     * handed to us 0x100 above their own base, so the same field is reachable at
-     * two distances. Try the near one, then the far one, and validate the result -
-     * a denormal triple is the signature of a miss.
+     * The position is not inline. Each object carries a pointer at one of a few
+     * class-specific distances and the position sits 0x2E4 into whatever that
+     * pointer targets - the local hero uses 0x5BA8, another class 0x1790. All known
+     * distances are tried and every result is validated, so a miss is skipped
+     * instead of drawn.
      */
-    constexpr uint64_t OFF_HERO_POS_NEAR = 0x4584;
-    constexpr uint64_t OFF_HERO_POS_FAR  = 0x4484;
+    constexpr uint64_t OFF_HERO_POS_CHAIN = 0x2E4;
 
-    /* Health and max health live 0x40 and 0x44 into the stat block, i.e. relative
-     * to whichever position offset resolved. */
-    constexpr uint64_t OFF_HERO_HP_FROM_POS    = 0x40;
-    constexpr uint64_t OFF_HERO_MAXHP_FROM_POS = 0x44;
+    /* Health and max health sit 0x98 and 0x9C after the position itself. */
+    constexpr uint64_t OFF_HERO_HP_FROM_POS    = 0x98;
+    constexpr uint64_t OFF_HERO_MAXHP_FROM_POS = 0x9C;
 
-    /* Own attack range, read from the local hero. */
-    constexpr uint64_t OFF_HERO_ATTACK_RANGE = 0x30B0;
+    /* Own attack range, read from the local hero; the second is the older offset. */
+    constexpr uint64_t OFF_HERO_ATTACK_RANGE     = 0x3E30;
+    constexpr uint64_t OFF_HERO_ATTACK_RANGE_ALT = 0x30B0;
 
     constexpr int32_t TEAM_OWN   = 1;
     constexpr int32_t TEAM_ENEMY = 2;
@@ -127,6 +128,10 @@ namespace
         float view[16];
         float projection[16];
         float matrix[16];   /* view * projection, composed once per read */
+        float offsetX;      /* screen correction, see CentreOnLocal */
+        float offsetY;
+        float scaleX;       /* per-axis normalisation, see CentreOnLocal */
+        float scaleY;
     };
 
     /*
@@ -141,6 +146,11 @@ namespace
      */
     bool ReadMatrix(Camera* camera)
     {
+        camera->offsetX = 0.0f;
+        camera->offsetY = 0.0f;
+        camera->scaleX = 1.0f;
+        camera->scaleY = 1.0f;
+
         if (!HAVE_VIEW_MATRIX)
             return false;
 
@@ -187,13 +197,21 @@ namespace
 
     bool Project(const Camera& camera, const Vec3& world, float* sx, float* sy)
     {
-        /* Column vector: clip[r] = sum_c M[r][c] * v[c], strided on the flat array. */
-        const float clipX = world.x * camera.matrix[0] + world.y * camera.matrix[1] +
-                            world.z * camera.matrix[2] + camera.matrix[3];
-        const float clipY = world.x * camera.matrix[4] + world.y * camera.matrix[5] +
-                            world.z * camera.matrix[6] + camera.matrix[7];
-        const float clipW = world.x * camera.matrix[12] + world.y * camera.matrix[13] +
-                            world.z * camera.matrix[14] + camera.matrix[15];
+        /*
+         * Row vector against a row-major matrix, strided: clip = v * M. This is the
+         * apply that matches how the matrix above is composed (row-major V*P) and
+         * how the game stores both matrices, with the translation in the last row.
+         *
+         * Mixing this apply with a column-vector stride still centres the hero -
+         * the near-zero off-diagonal terms make it a rotation-only matrix - but the
+         * scale collapses about 20x, so a 700 unit ring draws as a few pixels.
+         */
+        const float clipX = world.x * camera.matrix[0] + world.y * camera.matrix[4] +
+                            world.z * camera.matrix[8] + camera.matrix[12];
+        const float clipY = world.x * camera.matrix[1] + world.y * camera.matrix[5] +
+                            world.z * camera.matrix[9] + camera.matrix[13];
+        const float clipW = world.x * camera.matrix[3] + world.y * camera.matrix[7] +
+                            world.z * camera.matrix[11] + camera.matrix[15];
 
         /* The camera looks down -Z, so anything in front has a negative w and only
          * a w of (near) zero is degenerate. Testing w > 0 here would reject the
@@ -201,10 +219,76 @@ namespace
         if (fabsf(clipW) <= 0.001f)
             return false;
 
-        *sx = (g_width * 0.5f) * (1.0f + clipX / clipW);
-        *sy = (g_height * 0.5f) * (1.0f - clipY / clipW);
+        const float ndcX = clipX / clipW;
+        const float ndcY = clipY / clipW;
+
+        *sx = (g_width * 0.5f) + (g_width * 0.5f) * ndcX * camera.scaleX + camera.offsetX;
+        *sy = (g_height * 0.5f) - (g_height * 0.5f) * ndcY * camera.scaleY + camera.offsetY;
 
         return std::isfinite(*sx) && std::isfinite(*sy);
+    }
+
+    /*
+     * Two corrections, both measured at the local hero.
+     *
+     * The camera block's rotation and translation are not in the frame the world
+     * positions use: with the plain projection the hero lands a constant distance
+     * off screen, and because the camera is pitched a flat ground ring comes out
+     * squashed (measured 464x55 px at 700 units).
+     *
+     * The camera follows the player, so the hero is the one point whose screen
+     * position is known - it is the centre. Measure where it lands and shift every
+     * point by that delta, then measure how many pixels one world unit moves each
+     * axis and rescale so both axes agree. Everything shares the transform, so the
+     * ring keeps its shape, sits on the champion and is the right size.
+     */
+    void CentreOnLocal(Camera* camera, const Vec3& localPos)
+    {
+        camera->offsetX = 0.0f;
+        camera->offsetY = 0.0f;
+        camera->scaleX = 1.0f;
+        camera->scaleY = 1.0f;
+
+        const float step = 1000.0f;
+
+        float selfX = 0.0f;
+        float selfY = 0.0f;
+        float stepX = 0.0f;
+        float stepY = 0.0f;
+
+        Vec3 alongX = { localPos.x + step, localPos.y, localPos.z };
+        Vec3 alongY = { localPos.x, localPos.y + step, localPos.z };
+
+        if (!Project(*camera, localPos, &selfX, &selfY))
+            return;
+
+        if (!Project(*camera, alongX, &stepX, &stepY))
+            return;
+
+        const float gradientX = fabsf(stepX - selfX);
+
+        if (!Project(*camera, alongY, &stepX, &stepY))
+            return;
+
+        const float gradientY = fabsf(stepY - selfY);
+
+        if (gradientX > 0.01f && gradientY > 0.01f)
+        {
+            const float target = (gradientX + gradientY) * 0.5f;
+
+            camera->scaleX = target / gradientX;
+            camera->scaleY = target / gradientY;
+
+            /* Keep it sane if a gradient is tiny or the camera is degenerate. */
+            camera->scaleX = std::clamp(camera->scaleX, 0.05f, 20.0f);
+            camera->scaleY = std::clamp(camera->scaleY, 0.05f, 20.0f);
+        }
+
+        if (!Project(*camera, localPos, &selfX, &selfY))
+            return;
+
+        camera->offsetX = g_width * 0.5f - selfX;
+        camera->offsetY = g_height * 0.5f - selfY;
     }
 
     /* ---- drawing ------------------------------------------------------ */
@@ -273,41 +357,55 @@ namespace
     /* ---- scene -------------------------------------------------------- */
 
     /*
-     * Reads a hero's world position, trying both stat-block distances. Returns the
-     * distance that worked so the caller can find the health pair from it.
+     * Reads a hero's world position through its chain.
+     *
+     * The pointer must look like pool memory (not an image address, not a small
+     * scalar such as the 0x100000001 that sits at the same distance on some
+     * objects), and the triple must be finite world coordinates rather than a
+     * denormal or the map origin. A wrong distance therefore fails validation
+     * instead of putting a hero at (0, 0, 0).
      */
-    bool ReadHeroPosition(uint64_t object, Vec3* out, uint64_t* posOffset)
+    bool ReadHeroPosition(uint64_t object, Vec3* out, uint64_t* posAddress)
     {
-        const uint64_t candidates[] = { OFF_HERO_POS_NEAR, OFF_HERO_POS_FAR };
+        static const uint64_t kChainOffsets[] = { 0x5BA8, 0x1790, 0x2AD0, 0x3098 };
 
-        for (uint64_t offset : candidates)
+        for (uint64_t chainOffset : kChainOffsets)
         {
+            uint64_t target = 0;
+
+            if (!ReadU64(object + chainOffset, &target))
+                continue;
+
+            if (target < 0x10000000000ULL || target > 0x7FFFFFFFFFFFULL)
+                continue;
+
+            if (target >= g_base && target < g_base + 0x4000000ULL)
+                continue;
+
+            const uint64_t address = target + OFF_HERO_POS_CHAIN;
+
             float x = 0.0f;
             float y = 0.0f;
             float z = 0.0f;
 
-            if (!ReadF32(object + offset, &x) ||
-                !ReadF32(object + offset + 4, &y) ||
-                !ReadF32(object + offset + 8, &z))
+            if (!ReadF32(address, &x) || !ReadF32(address + 4, &y) || !ReadF32(address + 8, &z))
                 continue;
 
             if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
                 continue;
 
-            /* A miss reads as a denormal or as zero; a real hero is never at the
-             * origin of the map, so both cases are rejected. */
-            if (fabsf(x) < 1.0f || fabsf(y) < 1.0f)
+            if (fabsf(x) < 200.0f || fabsf(y) < 200.0f)
                 continue;
 
-            if (fabsf(x) > 100000.0f || fabsf(y) > 100000.0f || fabsf(z) > 10000.0f)
+            if (fabsf(x) > 20000.0f || fabsf(y) > 20000.0f || fabsf(z) > 3000.0f)
                 continue;
 
             out->x = x;
             out->y = y;
             out->z = z;
 
-            if (posOffset)
-                *posOffset = offset;
+            if (posAddress)
+                *posAddress = address;
 
             return true;
         }
@@ -349,13 +447,13 @@ namespace
             if (hero.team != TEAM_OWN && hero.team != TEAM_ENEMY)
                 continue;
 
-            uint64_t posOffset = 0;
+            uint64_t posAddress = 0;
 
-            if (!ReadHeroPosition(object, &hero.position, &posOffset))
+            if (!ReadHeroPosition(object, &hero.position, &posAddress))
                 continue;
 
-            ReadF32(object + posOffset + OFF_HERO_HP_FROM_POS, &hero.health);
-            ReadF32(object + posOffset + OFF_HERO_MAXHP_FROM_POS, &hero.maxHealth);
+            ReadF32(posAddress + OFF_HERO_HP_FROM_POS, &hero.health);
+            ReadF32(posAddress + OFF_HERO_MAXHP_FROM_POS, &hero.maxHealth);
             ReadName(object + OFF_HERO_NAME, hero.name, _countof(hero.name));
 
             /* The visible/dead flags are not identified on this build, so they stay
@@ -435,13 +533,13 @@ namespace
 
         if (local)
         {
-            uint64_t posOffset = 0;
-            hasLocal = ReadHeroPosition(local, &localPos, &posOffset);
+            uint64_t posAddress = 0;
+            hasLocal = ReadHeroPosition(local, &localPos, &posAddress);
 
             if (hasLocal)
             {
-                ReadF32(local + posOffset + OFF_HERO_HP_FROM_POS, &localHp);
-                ReadF32(local + posOffset + OFF_HERO_MAXHP_FROM_POS, &localMaxHp);
+                ReadF32(posAddress + OFF_HERO_HP_FROM_POS, &localHp);
+                ReadF32(posAddress + OFF_HERO_MAXHP_FROM_POS, &localMaxHp);
             }
 
             ReadI32(local + OFF_HERO_TEAM, &localTeam);
@@ -452,7 +550,14 @@ namespace
 
             if (ReadF32(local + OFF_HERO_ATTACK_RANGE, &measured) &&
                 std::isfinite(measured) && measured > 100.0f && measured < 1500.0f)
+            {
                 attackRange = measured;
+            }
+            else if (ReadF32(local + OFF_HERO_ATTACK_RANGE_ALT, &measured) &&
+                     std::isfinite(measured) && measured > 100.0f && measured < 1500.0f)
+            {
+                attackRange = measured;
+            }
         }
 
         std::vector<Hero> heroes;
@@ -463,6 +568,8 @@ namespace
 
         if (hasLocal && hasMatrix)
         {
+            CentreOnLocal(&camera, localPos);
+
             /* own attack range ring */
             const int segments = 64;
             float prevX = 0.0f;

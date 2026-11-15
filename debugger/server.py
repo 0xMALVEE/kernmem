@@ -26,11 +26,13 @@ IOCTL_GET_BASE = 0x80002024
 
 OFF_LOCAL = 0x1CBB810
 OFF_ARRAY = 0x1CBB7F8
-OFF_TEAM = 0x128
+OFF_TEAM = 0x1638
 OFF_NAME = 0x3F00
 OFF_RANGE = 0x30B0
 OFF_AI_MANAGER = 0x44A0
 OFF_AI_POSITION = 0x25C
+OFF_POS_CHAIN = 0x2E4
+POS_CHAINS = (0x5BA8, 0x1790, 0x2AD0, 0x3098)
 POS_CANDIDATES = (0x4584, 0x4484)
 
 SIG = b'\x48\x8D\x0D\x00\x00\x00\x00\x0F\x10\x00'
@@ -235,12 +237,16 @@ def position_candidates(session, obj):
     where the older project's dump put it, which is why the inline guesses read
     denormals on an unpopulated graph."""
     found = []
-    manager = session.u64(obj + OFF_AI_MANAGER)
-    if manager:
-        chain = session.f3(manager + OFF_AI_POSITION)
-        if chain:
-            found.append({'offset': OFF_AI_MANAGER, 'chain': OFF_AI_POSITION,
-                          'address': manager, 'value': list(chain)})
+    for chain in POS_CHAINS:
+        target = session.u64(obj + chain)
+        if not target or target < 0x10000000000 or target > 0x7FFFFFFFFFFF:
+            continue
+        if session.base <= target < session.base + 0x4000000:
+            continue
+        address = target + OFF_POS_CHAIN
+        point = session.f3(address)
+        found.append({'offset': chain, 'chain': OFF_POS_CHAIN, 'address': address,
+                      'value': list(point) if point else None})
     for off in POS_CANDIDATES:
         point = session.f3(obj + off)
         found.append({'offset': off, 'chain': None, 'address': obj + off,
