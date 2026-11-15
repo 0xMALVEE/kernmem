@@ -27,6 +27,7 @@ flowchart LR
 | 05 | [API reference](05-api-reference.md) | Every IOCTL, every struct, every status code, C++ and Python usage |
 | 06 | [Troubleshooting](06-troubleshooting.md) | Decision trees for each failure mode |
 | 07 | [Production checklist](07-production-checklist.md) | What is done, what is genuinely still missing, and in what order |
+| 08 | [Scripting](08-scripting.md) | How a script reads memory without a handle, and how offsets are managed |
 
 ---
 
