@@ -56,28 +56,40 @@ The CLI form blocks until F9, because the render thread dies with the process.
 | Element | Meaning |
 |---------|---------|
 | green box + `YOU hp/maxhp` | you |
-| cyan ring around you | your attack range (550 units) |
+| cyan ring around you | your attack range, read live from the hero (700 on this build), projected into the world as 64 points |
 | blue box | ally hero |
 | red box | enemy hero |
 | health bar above each box | current health fraction |
-| `name Llevel distance` above each box | identity and range |
+| `name distance` above each box | identity and range |
 | thin line from you to each hero | who is in range of what |
 | top-left status block | pid, base, fps, hero count, matrix/self state |
 
 If the status block says `matrix MISSING` or `self null`, the overlay is running but the offsets are not resolving — see §6.
 
+The attack range is read from the hero itself (`HeroAttackRange`), with the constant only as a fallback when the read misses — it is never assumed to be 550.
+
+The radar is now only the fallback. It appears when the camera cannot be read, and it still draws the range ring, because a world radius there is just `range * scale` — no projection needed. With a camera, boxes and the world-space ring are the output and the radar is suppressed.
+
 ---
 
 ## 5. How positions become pixels
 
-The game's view matrix (world → clip) is read through the device, then the standard divide:
+The camera is **two** matrices, 0x40 apart, both inline in the image and neither behind a pointer. The view goes first, then the projection, and only then the standard divide:
 
 ```
+viewX = dot(world, viewColumn0) + view[12]   // and likewise for y, z
+clip  = dot(view, projectionColumn)          // x, y, w
 screen.x = (width  / 2) * (1 + clipX / clipW)
 screen.y = (height / 2) * (1 - clipY / clipW)
 ```
 
-Any point with `clipW <= 0` is behind the camera and is dropped, as is any non-finite result. The attack-range ring is 64 points around you in world space, each projected and the valid neighbours joined — so the ring curves correctly in perspective instead of being a circle drawn in screen space.
+They are applied one after the other rather than multiplied into a single 4x4 — composing them loses the depth the projection needs, while the sequential form reproduces the true camera depth exactly (a point 700 units out gives the expected pixel radius).
+
+`clipW` is **negative** in front of this camera, because it looks down -Z, so the reject is `fabsf(clipW) <= 0.001f`. Testing `clipW <= 0` rejects the entire visible world.
+
+Any point failing that, or producing a non-finite result, is dropped. The attack-range ring is 64 points around you in world space, each projected and the valid neighbours joined — so the ring curves correctly in perspective instead of being a circle drawn in screen space.
+
+The offset is recovered, not memorised: scan for `48 8D 0D ? ? ? ? 0F 10 00` (`lea rcx,[rip+x]` / `movups xmm0,[rax]`). It hits once, and the LEA target is the view matrix itself. `scripts/find_viewmatrix.py` does that scan and proves the hit by projecting your own hero, which must land near screen centre because the camera follows you.
 
 ---
 
@@ -86,12 +98,17 @@ Any point with `clipW <= 0` is behind the camera and is dropped, as is any non-f
 | Symptom | Cause |
 |---------|-------|
 | `heroes 0`, `self null` | not in a match — the object graph is null between games |
-| `matrix MISSING` | the view-matrix offset moved on a patch |
+| `matrix MISSING` | the view-matrix offset moved on a patch — rerun `scripts/find_viewmatrix.py` |
+| hero projects far off-centre | the game window is not focused, so it stops rendering and the camera freezes |
 | boxes in the wrong place | position or matrix offset is stale |
 | nothing at all, no window | game window not found; the overlay needs the client running |
 | window appears but is black | DIB creation failed — check the log |
 
 The offsets are duplicated in `loader/overlay.cpp` from `scripts/offsets.py`. **Re-distil both together.** The overlay is a fast, dumb renderer; the Python side is where offsets are tracked and verified.
+
+`scripts/verify_offsets.py` runs the loader's exact walk — same team enum, same two position distances, same validation — against the live process through the device, and prints what would be collected. Run it after any patch before trusting the overlay: a working run lists heroes with positions and health, a broken one lists none. It also tries the DOS path and the `GLOBALROOT` device path, so it doubles as a device check.
+
+Two things about this build worth knowing. The object list is a **null-terminated inline array at the global**, so the local hero is an entry in it and must be skipped by address. And entries do not share one stat-block distance: some arrive 0x100 high, so the position is tried at `0x4584` then `0x4484` and a denormal or origin result is treated as a miss.
 
 ---
 

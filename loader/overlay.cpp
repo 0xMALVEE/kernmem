@@ -22,17 +22,22 @@ namespace
      *
      * scripts/offsets.py carries the same values; update both in the same change.
      *
-     * The view matrix is NOT recovered yet, so HAVE_VIEW_MATRIX is false and the
-     * overlay falls back to the radar. Flip it once the matrix is found.
+     * The view matrix is recovered, from the signature the older projects under
+     * research/ document: `48 8D 0D ? ? ? ? 0F 10 00` (lea rcx,[rip+x] / movups
+     * xmm0,[rax]). It hits once in the image and the LEA target is the matrix
+     * itself - inline, not a pointer. The projection sits 0x40 after it and the two
+     * are multiplied. Confirmed by projecting the local hero: it lands within a
+     * pixel of screen centre, which is where the camera keeps you.
      */
-    constexpr bool     HAVE_VIEW_MATRIX   = false;
+    constexpr bool     HAVE_VIEW_MATRIX   = true;
 
     constexpr uint64_t OFF_LOCAL_PLAYER   = 0x1CBB810;
     constexpr uint64_t OFF_OBJECT_MANAGER = 0x1CBB7F8;
     constexpr uint64_t OFF_OBJ_BEGIN      = 0x0;
     constexpr uint64_t OFF_OBJ_END        = 0x8;
     constexpr uint64_t OFF_OBJ_STRIDE     = 0x8;
-    constexpr uint64_t OFF_VIEW_MATRIX    = 0x0;
+    constexpr uint64_t OFF_VIEW_MATRIX     = 0x1D7CC60;
+    constexpr uint64_t OFF_VIEW_PROJECTION = 0x40;
 
     constexpr uint64_t OFF_HERO_TEAM    = 0x128;
     constexpr uint64_t OFF_HERO_NAME    = 0x3F00;
@@ -117,33 +122,65 @@ namespace
 
     /* ---- projection --------------------------------------------------- */
 
-    bool ReadMatrix(float matrix[16])
+    struct Camera
     {
-        uint64_t instance = 0;
+        float view[16];
+        float projection[16];
+    };
 
+    /*
+     * Reads the camera. Both matrices sit back to back in the image and neither is
+     * behind a pointer. They are kept apart instead of being multiplied into one
+     * 4x4: composing them loses the depth the projection needs, while applying them
+     * one after the other reproduces the true camera depth exactly.
+     */
+    bool ReadMatrix(Camera* camera)
+    {
         if (!HAVE_VIEW_MATRIX)
             return false;
 
-        if (!ReadU64(g_base + OFF_VIEW_MATRIX, &instance) || !instance)
+        if (!Read(g_base + OFF_VIEW_MATRIX, camera->view, sizeof(camera->view)))
             return false;
 
-        if (!Read(instance, matrix, sizeof(float) * 16))
+        if (!Read(g_base + OFF_VIEW_MATRIX + OFF_VIEW_PROJECTION,
+                  camera->projection, sizeof(camera->projection)))
+            return false;
+
+        /* A camera that has not been set up yet reads as all zeroes, and every
+         * point then divides by zero. */
+        if (camera->view[0] == 0.0f && camera->view[15] == 0.0f)
             return false;
 
         for (int i = 0; i < 16; ++i)
-            if (!std::isfinite(matrix[i]))
+        {
+            if (!std::isfinite(camera->view[i]) || !std::isfinite(camera->projection[i]))
                 return false;
+        }
 
         return true;
     }
 
-    bool Project(const float matrix[16], const Vec3& world, float* sx, float* sy)
+    bool Project(const Camera& camera, const Vec3& world, float* sx, float* sy)
     {
-        const float clipX = world.x * matrix[0] + world.y * matrix[4] + world.z * matrix[8] + matrix[12];
-        const float clipY = world.x * matrix[1] + world.y * matrix[5] + world.z * matrix[9] + matrix[13];
-        const float clipW = world.x * matrix[3] + world.y * matrix[7] + world.z * matrix[11] + matrix[15];
+        /* World -> view -> clip, each a strided multiply against a row vector. */
+        const float viewX = world.x * camera.view[0] + world.y * camera.view[4] +
+                            world.z * camera.view[8] + camera.view[12];
+        const float viewY = world.x * camera.view[1] + world.y * camera.view[5] +
+                            world.z * camera.view[9] + camera.view[13];
+        const float viewZ = world.x * camera.view[2] + world.y * camera.view[6] +
+                            world.z * camera.view[10] + camera.view[14];
 
-        if (clipW <= 0.001f)
+        const float clipX = viewX * camera.projection[0] + viewY * camera.projection[4] +
+                            viewZ * camera.projection[8] + camera.projection[12];
+        const float clipY = viewX * camera.projection[1] + viewY * camera.projection[5] +
+                            viewZ * camera.projection[9] + camera.projection[13];
+        const float clipW = viewX * camera.projection[3] + viewY * camera.projection[7] +
+                            viewZ * camera.projection[11] + camera.projection[15];
+
+        /* The camera looks down -Z, so anything in front has a negative w and only
+         * a w of (near) zero is degenerate. Testing w > 0 here would reject the
+         * whole visible world. */
+        if (fabsf(clipW) <= 0.001f)
             return false;
 
         *sx = (g_width * 0.5f) * (1.0f + clipX / clipW);
@@ -336,9 +373,8 @@ namespace
 
         Filled(dc, x + (int)half - 2, y + (int)half - 2, 5, 5, RGB(120, 255, 120));
 
-        /* Own attack range. The ring belongs to the projection path, but that path
-         * needs a view matrix we do not have - so draw it here, in radar space,
-         * where a world radius is just range * scale. */
+        /* Own attack range, in radar space, where a world radius is just
+         * range * scale. The projection path draws its own ring in the world. */
         const int ringRadius = (int)(attackRange * scale);
 
         if (ringRadius > 2 && ringRadius < size / 2)
@@ -365,8 +401,8 @@ namespace
 
     void DrawFrame(HDC dc, float fps)
     {
-        float matrix[16];
-        const bool hasMatrix = ReadMatrix(matrix);
+        Camera camera;
+        const bool hasMatrix = ReadMatrix(&camera);
 
         uint64_t local = 0;
         ReadU64(g_base + OFF_LOCAL_PLAYER, &local);
@@ -418,13 +454,13 @@ namespace
             for (int i = 0; i <= segments; ++i)
             {
                 const float angle = (float)i / (float)segments * 6.2831853f;
-                Vec3 point = { localPos.x + cosf(angle) * ATTACK_RANGE,
-                               localPos.y + sinf(angle) * ATTACK_RANGE,
+                Vec3 point = { localPos.x + cosf(angle) * attackRange,
+                               localPos.y + sinf(angle) * attackRange,
                                localPos.z };
 
                 float sx = 0.0f;
                 float sy = 0.0f;
-                const bool valid = Project(matrix, point, &sx, &sy);
+                const bool valid = Project(camera, point, &sx, &sy);
 
                 if (valid && prevValid)
                     Line(dc, (int)prevX, (int)prevY, (int)sx, (int)sy, RGB(90, 200, 255), 1);
@@ -438,7 +474,7 @@ namespace
             float feetX = 0.0f, feetY = 0.0f, headX = 0.0f, headY = 0.0f;
             Vec3 head = { localPos.x, localPos.y, localPos.z + HERO_HEIGHT };
 
-            if (Project(matrix, localPos, &feetX, &feetY) && Project(matrix, head, &headX, &headY))
+            if (Project(camera, localPos, &feetX, &feetY) && Project(camera, head, &headX, &headY))
             {
                 const int height = (int)fabsf(feetY - headY);
                 const int width = (int)(height * 0.55f);
@@ -463,10 +499,10 @@ namespace
             float feetX = 0.0f, feetY = 0.0f, headX = 0.0f, headY = 0.0f;
             Vec3 head = { hero.position.x, hero.position.y, hero.position.z + HERO_HEIGHT };
 
-            if (!Project(matrix, hero.position, &feetX, &feetY))
+            if (!Project(camera, hero.position, &feetX, &feetY))
                 continue;
 
-            if (!Project(matrix, head, &headX, &headY))
+            if (!Project(camera, head, &headX, &headY))
                 continue;
 
             if (feetX < -200.0f || feetX > g_width + 200.0f ||
@@ -504,7 +540,7 @@ namespace
                 float selfX = 0.0f;
                 float selfY = 0.0f;
 
-                if (Project(matrix, localPos, &selfX, &selfY))
+                if (Project(camera, localPos, &selfX, &selfY))
                     Line(dc, (int)selfX, (int)selfY, (int)feetX, (int)feetY, colour, 1);
             }
         }

@@ -35,7 +35,8 @@ CLIENT = "22.8910"
 # hero. The 26.16 values this table used to carry were stale on this build and
 # pointed into float data, which is why every read failed with error 299.
 #
-# ViewMatrix is still NOT recovered. The renderer hunt lives in build/*.py.
+# ViewMatrix is recovered: signature 48 8D 0D ? ? ? ? 0F 10 00, one hit, LEA target is
+# the matrix. The projection sits 0x40 after it and the two are applied in sequence.
 SCRAPED = "2026-11-15"
 SOURCE = "research/unknowncheats/posts/310587_reversal-structs-offsets_2026-11-15.md"
 THREAD = "https://www.unknowncheats.me/forum/league-of-legends/310587-league-legends-reversal-structs-offsets.html"
@@ -144,7 +145,11 @@ OFFSETS: dict[str, Offset] = {
     "CameraFov": Offset("CameraFov", 0x3C, chain=(0x1FBA090, 0x0), note="field of view", verified=False),
 
     # -- render ------------------------------------------------------------- #
-    "ViewMatrix": Offset("ViewMatrix", 0x0, chain=(0x1FBA090,), note="view matrix instance", verified=False),
+    "ViewMatrix": Offset("ViewMatrix", 0x1D7CC60,
+                         note="view matrix, inline; projection is +0x40; verify by projecting the local hero",
+                         verified=True),
+    "ViewProjection": Offset("ViewProjection", 0x1D7CC60 + 0x40,
+                             note="projection matrix, applied after the view", verified=True),
     "SwapChain": Offset("SwapChain", 0x1F919D0, note="D3D swap chain", verified=True),
 
     # -- caps --------------------------------------------------------------- #
