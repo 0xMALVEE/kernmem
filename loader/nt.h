@@ -117,6 +117,14 @@ namespace nt
     /* Base address of a loaded kernel module, 0 when absent. */
     uint64_t GetKernelModuleAddress(const std::string& moduleName);
 
+    /* Base address of the kernel image itself.
+     *
+     * An exact-name lookup is not enough: modern Windows loads the kernel as
+     * ntkrnlmp.exe, so "ntoskrnl.exe" misses and callers get 0. Known names are
+     * tried in order, then module 0 is used (the kernel is always first in
+     * SystemModuleInformation). Returns 0 only if nothing plausible is found. */
+    uint64_t GetKernelBase();
+
     BOOLEAN bDataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask);
     uintptr_t FindPattern(uintptr_t dwAddress, uintptr_t dwLen, BYTE* bMask, const char* szMask);
     PVOID FindSection(const char* sectionName, uintptr_t modulePtr, PULONG size);

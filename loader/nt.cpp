@@ -52,51 +52,116 @@ namespace nt
         return true;
     }
 
+    namespace
+    {
+        /* Pulls the module list into a heap buffer; free with VirtualFree. */
+        PRTL_PROCESS_MODULES QueryModules()
+        {
+            void* buffer = nullptr;
+            DWORD bufferSize = 0;
+
+            NTSTATUS status = NtQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize, &bufferSize);
+
+            while (status == STATUS_INFO_LENGTH_MISMATCH)
+            {
+                if (buffer)
+                    VirtualFree(buffer, 0, MEM_RELEASE);
+
+                buffer = VirtualAlloc(nullptr, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!buffer)
+                    return nullptr;
+
+                status = NtQuerySystemInformation(
+                    (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize,
+                    &bufferSize);
+            }
+
+            if (!NT_SUCCESS(status) || !buffer)
+            {
+                if (buffer)
+                    VirtualFree(buffer, 0, MEM_RELEASE);
+                return nullptr;
+            }
+
+            return static_cast<PRTL_PROCESS_MODULES>(buffer);
+        }
+
+        const char* ModuleNameOf(const RTL_PROCESS_MODULE_INFORMATION& module)
+        {
+            return reinterpret_cast<const char*>(module.FullPathName) + module.OffsetToFileName;
+        }
+
+        /* A kernel image base is page aligned and inside the kernel range. */
+        bool PlausibleKernelBase(uint64_t base)
+        {
+            return base >= 0xFFFF800000000000ULL && (base & 0xFFF) == 0;
+        }
+    }
+
     uint64_t GetKernelModuleAddress(const std::string& moduleName)
     {
-        void* buffer = nullptr;
-        DWORD bufferSize = 0;
+        PRTL_PROCESS_MODULES modules = QueryModules();
 
-        NTSTATUS status = NtQuerySystemInformation(
-            (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize, &bufferSize);
-
-        while (status == STATUS_INFO_LENGTH_MISMATCH)
-        {
-            if (buffer)
-                VirtualFree(buffer, 0, MEM_RELEASE);
-
-            buffer = VirtualAlloc(nullptr, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!buffer)
-                return 0;
-
-            status = NtQuerySystemInformation(
-                (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize, &bufferSize);
-        }
-
-        if (!NT_SUCCESS(status) || !buffer)
-        {
-            if (buffer)
-                VirtualFree(buffer, 0, MEM_RELEASE);
+        if (!modules)
             return 0;
-        }
 
-        const auto modules = static_cast<PRTL_PROCESS_MODULES>(buffer);
         uint64_t result = 0;
 
         for (ULONG i = 0; i < modules->NumberOfModules; ++i)
         {
-            const char* current = reinterpret_cast<char*>(modules->Modules[i].FullPathName) +
-                                  modules->Modules[i].OffsetToFileName;
-
-            if (_stricmp(current, moduleName.c_str()) == 0)
+            if (_stricmp(ModuleNameOf(modules->Modules[i]), moduleName.c_str()) == 0)
             {
                 result = reinterpret_cast<uint64_t>(modules->Modules[i].ImageBase);
                 break;
             }
         }
 
-        VirtualFree(buffer, 0, MEM_RELEASE);
+        VirtualFree(modules, 0, MEM_RELEASE);
         return result;
+    }
+
+    uint64_t GetKernelBase()
+    {
+        /* ntkrnlmp.exe is the real x64 name; the rest are historical, kept so a
+         * different build cannot silently regress this to zero again. */
+        static const char* names[] =
+        {
+            "ntoskrnl.exe",
+            "ntkrnlmp.exe",
+            "ntkrnlpa.exe",
+            "ntkrnlpamp.exe",
+        };
+
+        PRTL_PROCESS_MODULES modules = QueryModules();
+
+        if (!modules)
+            return 0;
+
+        uint64_t result = 0;
+
+        for (const char* name : names)
+        {
+            for (ULONG i = 0; i < modules->NumberOfModules; ++i)
+            {
+                if (_stricmp(ModuleNameOf(modules->Modules[i]), name) == 0)
+                {
+                    result = reinterpret_cast<uint64_t>(modules->Modules[i].ImageBase);
+                    break;
+                }
+            }
+
+            if (result)
+                break;
+        }
+
+        /* The kernel is always module 0, so this is a sound last resort. */
+        if (!result && modules->NumberOfModules > 0)
+            result = reinterpret_cast<uint64_t>(modules->Modules[0].ImageBase);
+
+        VirtualFree(modules, 0, MEM_RELEASE);
+
+        return PlausibleKernelBase(result) ? result : 0;
     }
 
     BOOLEAN bDataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)

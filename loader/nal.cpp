@@ -125,6 +125,21 @@ namespace nal
     HANDLE  hDevice = INVALID_HANDLE_VALUE;
     ULONG64 ntoskrnlBase = 0;
 
+    /* Resolves the kernel base on demand. Cheap enough to call defensively, so a
+     * base that failed to resolve during Load cannot brick every later call. */
+    static bool EnsureKernelBase()
+    {
+        if (ntoskrnlBase)
+            return true;
+
+        ntoskrnlBase = nt::GetKernelBase();
+
+        if (!ntoskrnlBase)
+            vgb_log::Error("kernel base unresolved - export resolution is impossible");
+
+        return ntoskrnlBase != 0;
+    }
+
     void SetStatePath(const std::wstring& path)
     {
         g_statePath = path;
@@ -228,11 +243,24 @@ namespace nal
             return false;
         }
 
-        ntoskrnlBase = nt::GetKernelModuleAddress("ntoskrnl.exe");
+        ntoskrnlBase = nt::GetKernelBase();
+
         if (!ntoskrnlBase)
         {
-            vgb_log::Warn("could not resolve ntoskrnl.exe base");
+            /* Fatal, not a warning: with no kernel base there is no export
+             * resolution, so mapping cannot proceed. Saying so here stops it
+             * surfacing later as a bare "allocation failed". */
+            vgb_log::Error("could not resolve the kernel image base");
+            vgb_log::Info("SystemModuleInformation was unreadable - is this a normal Windows x64 install?");
+
+            CloseHandle(hDevice);
+            hDevice = INVALID_HANDLE_VALUE;
+            service::StopAndRemove(g_serviceName);
+            _wremove(g_driverPath.c_str());
+            return false;
         }
+
+        vgb_log::Step("kernel base resolved at 0x%llX", (unsigned long long)ntoskrnlBase);
 
         SaveState();
         return true;
@@ -455,7 +483,7 @@ namespace nal
     {
         static uint64_t kernelExAllocatePool = 0;
 
-        if (!size || !ntoskrnlBase)
+        if (!size || !EnsureKernelBase())
             return 0;
 
         if (!kernelExAllocatePool)
@@ -477,7 +505,7 @@ namespace nal
     {
         static uint64_t kernelExFreePool = 0;
 
-        if (!address || !ntoskrnlBase)
+        if (!address || !EnsureKernelBase())
             return false;
 
         if (!kernelExFreePool)
@@ -515,7 +543,7 @@ namespace nal
 
         if (!kernelNtAddAtom)
         {
-            if (!ntoskrnlBase)
+            if (!EnsureKernelBase())
                 return false;
 
             kernelNtAddAtom = GetKernelModuleExport(ntoskrnlBase, "NtAddAtom");
