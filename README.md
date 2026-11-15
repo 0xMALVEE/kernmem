@@ -1,10 +1,10 @@
-# VanguardBypass
+# kernmem
 
-A kernel-assisted external memory interface for League of Legends.
+A kernel-assisted external memory interface for protected games, with per-game tooling kept separate.
 
-Vanguard registers an object callback and strips `PROCESS_VM_READ`, `PROCESS_VM_WRITE` and `PROCESS_VM_OPERATION` from every handle another process opens to the game. `ReadProcessMemory` on `League of Legends.exe` therefore fails with `ERROR_PARTIAL_COPY`, which is why external script tooling dies at the first step.
+Vanguard registers an object callback and strips `PROCESS_VM_READ`, `PROCESS_VM_WRITE` and `PROCESS_VM_OPERATION` from every handle another process opens to a protected game. `ReadProcessMemory` on the game therefore fails with `ERROR_PARTIAL_COPY`, which is why external script tooling dies at the first step.
 
-This restores that access from kernel mode, two independent ways, and adds module hiding so injected code is not enumerated.
+The driver restores that access from kernel mode, two independent ways, and adds module hiding so injected code is not enumerated. Everything above the driver is per game.
 
 ---
 
@@ -13,7 +13,7 @@ This restores that access from kernel mode, two independent ways, and adds modul
 | Path | Mechanism | Survives |
 |------|-----------|----------|
 | **A — primary** | `MmCopyVirtualMemory` against the target `EPROCESS`; no handle is ever opened | any handle-stripping version |
-| **B — secondary** | own object pre-op callback at altitude `321000`, above Vanguard's, re-ORs the VM rights back in for the registered client PID | makes plain `ReadProcessMemory` work |
+| **B — secondary** | own object pre-op callback at altitude `321000`, above the anticheat's, re-ORs the VM rights back in for the registered client PID | makes plain `ReadProcessMemory` work |
 
 Neither path patches the game, so code-page hashing is unaffected.
 
@@ -23,17 +23,25 @@ Full explanation, with diagrams: [`docs/README.md`](docs/README.md).
 
 ## Layout
 
+Shared, game-independent:
+
 ```
- driver/    kernel driver — the bypass
+ driver/    kernel driver — the memory interface
  loader/    user-mode mapper, loads vgb.sys through the signed Intel NAL driver
  sdk/       client library (C++ header, Python ctypes binding)
- scripts/   game reader and offset table (what an actual script is built on)
- client/    example client and smoke test
- dist/      shippable output
  docs/      engineering documentation
  tools/     maintenance utilities
- research/  primary sources; research/unknowncheats/ holds offset material
+ dist/      shippable output
 ```
+
+Per game — each folder holds that game's scripts, offsets, overlay and notes:
+
+```
+ league/    League of Legends
+ valorant/  Valorant
+```
+
+A game folder is self-contained. Adding a game means adding a folder with its own reader, offset table and docs; the driver does not change.
 
 ---
 
@@ -70,7 +78,7 @@ Manual control, if you want it:
 
 `overlay <pid>` puts a click-through window over the game that draws your box, your attack range and every visible enemy with health and distance. It reads through the driver, so nothing is injected and the game is untouched. F9 stops it. It is also the fastest way to see whether the offsets still resolve — the status block reports `matrix` and `self` state.
 
-See [docs/09-overlay.md](docs/09-overlay.md).
+See [league/docs/overlay.md](league/docs/overlay.md).
 
 ```python
 import vgb
@@ -85,7 +93,7 @@ with vgb.Client() as c:
 
 ## Scripting
 
-A script never calls `ReadProcessMemory` — it goes through the driver, so handle stripping never applies to it.
+A script never calls `ReadProcessMemory` — it goes through the driver, so handle stripping never applies to it. Readers live inside the game folder, not at the root.
 
 ```python
 from reader import Game
@@ -95,7 +103,7 @@ with Game() as game:
         print(hero.name, hero.level, hero.health, hero.visible)
 ```
 
-Offsets are patch-stamped and refuse to run against a different client patch. See [docs/08-scripting.md](docs/08-scripting.md).
+Offsets are patch-stamped and refuse to run against a different client patch. See [league/docs/scripting.md](league/docs/scripting.md).
 
 ---
 
@@ -112,8 +120,8 @@ Offsets are patch-stamped and refuse to run against a different client patch. Se
 - One registered client pid at a time
 - Writes to read-only game pages can fail; reads always work
 - `iqvw64e.sys` ships as a third-party Intel binary
-- Not a guarantee of permanent undetection — see [docs/02 §6](docs/02-vanguard-detection-model.md)
-- Vanguard updates can move the callback altitude; `321000` is the constant to revisit first
+- Not a guarantee of permanent undetection — see [docs/detection-model.md](docs/detection-model.md)
+- Anticheat updates can move the callback altitude; `321000` is the constant to revisit first
 
 ---
 

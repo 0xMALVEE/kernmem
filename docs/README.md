@@ -1,8 +1,8 @@
-# VanguardBypass for League of Legends — Engineering Documentation
+# kernmem — Engineering Documentation
 
 This documentation explains **what every component does, why it exists, and exactly how data moves between them**. Read it in order the first time; it is written so that each document builds on the previous one.
 
-> Scope: this is a kernel-assisted external memory interface for League of Legends. It does not inject into the game and it does not touch the Vanguard driver itself. It restores the ability to read and write game memory from a normal user-mode process, which Vanguard otherwise removes.
+> Scope: this is a kernel-assisted external memory interface for protected games. Everything above the driver is per game. It does not inject into the game and it does not touch the Vanguard driver itself. It restores the ability to read and write game memory from a normal user-mode process, which Vanguard otherwise removes.
 
 ---
 
@@ -20,16 +20,16 @@ flowchart LR
 
 | # | Document | What it answers |
 |---|----------|-----------------|
-| 01 | [Architecture](01-architecture.md) | What are the pieces, who talks to whom, where is the trust boundary |
-| 02 | [Detection model](02-vanguard-detection-model.md) | What Vanguard actually does, and which countermeasure covers which mechanism |
-| 03 | [Component flows](03-component-flows.md) | Step-by-step sequence for load, read, write, hide, unload, and how each one fails |
-| 04 | [Build and load](04-build-and-load.md) | Toolchain, build graph, artifact table, and the load-path matrix for Secure Boot / HVCI |
-| 05 | [API reference](05-api-reference.md) | Every IOCTL, every struct, every status code, C++ and Python usage |
-| 06 | [Troubleshooting](06-troubleshooting.md) | Decision trees for each failure mode |
-| 07 | [Production checklist](07-production-checklist.md) | What is done, what is genuinely still missing, and in what order |
-| 08 | [Scripting](08-scripting.md) | How a script reads memory without a handle, and how offsets are managed |
-| 09 | [Overlay](09-overlay.md) | The in-game renderer: what it draws, how projection works, when it draws nothing |
-| 10 | [Crash debugging](10-crash-debugging.md) | Where the crash log is, how to read the bugcheck code, and which faults are already fixed |
+| 01 | [Architecture](architecture.md) | What are the pieces, who talks to whom, where is the trust boundary |
+| 02 | [Detection model](detection-model.md) | What Vanguard actually does, and which countermeasure covers which mechanism |
+| 03 | [Component flows](component-flows.md) | Step-by-step sequence for load, read, write, hide, unload, and how each one fails |
+| 04 | [Build and load](build-and-load.md) | Toolchain, build graph, artifact table, and the load-path matrix for Secure Boot / HVCI |
+| 05 | [API reference](api-reference.md) | Every IOCTL, every struct, every status code, C++ and Python usage |
+| 06 | [Troubleshooting](troubleshooting.md) | Decision trees for each failure mode |
+| 07 | [Production checklist](production-checklist.md) | What is done, what is genuinely still missing, and in what order |
+| 08 | [Scripting](../league/docs/scripting.md) | How a script reads memory without a handle, and how offsets are managed |
+| 09 | [Overlay](../league/docs/overlay.md) | The in-game renderer: what it draws, how projection works, when it draws nothing |
+| 10 | [Crash debugging](../league/docs/crash-debugging.md) | Where the crash log is, how to read the bugcheck code, and which faults are already fixed |
 
 ---
 
@@ -79,15 +79,15 @@ flowchart TB
 ## Repository layout
 
 ```
- driver/    kernel driver — the actual bypass
+ driver/    kernel driver — the memory interface
  loader/    user-mode mapper: loads vgb.sys through the signed NAL driver
  sdk/       client library (C++ header + Python ctypes binding)
- client/    reference client
+ docs/      this documentation
+ tools/     maintenance utilities
  build/     compiler output
  dist/      shippable layout (loader, sdk, drivers, docs)
- docs/      this documentation
- research/  primary sources the design is based on
- tools/     maintenance utilities
+ league/    League of Legends: client, scripts, overlay, research, docs
+ valorant/  Valorant: scripts, docs
 ```
 
 ---

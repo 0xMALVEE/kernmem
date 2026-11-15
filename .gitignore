@@ -13,7 +13,7 @@ __pycache__/
 
 # Debugger
 node_modules/
-debugger/ui/dist/
+league/debugger/ui/dist/
 *.pyc
 *.obj
 
@@ -22,4 +22,4 @@ debugger/ui/dist/
 *.user
 Thumbs.db
 desktop.ini
-debugger/vite.log
+league/debugger/vite.log

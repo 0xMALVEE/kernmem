@@ -21,7 +21,7 @@ namespace
      * The team field is a small enum (1 = own side, 2 = enemy), not the 100/200 the
      * older table used - checking for those dropped every single hero.
      *
-     * scripts/offsets.py carries the same values; update both in the same change.
+     * league/scripts/offsets.py carries the same values; update both in the same change.
      *
      * The view matrix is recovered, from the signature the older projects under
      * research/ document: `48 8D 0D ? ? ? ? 0F 10 00` (lea rcx,[rip+x] / movups

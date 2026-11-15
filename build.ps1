@@ -110,13 +110,13 @@ Write-Host '=== dist ==='
 # The shipped executable is built with the interactive menu as its default
 # entry point; the CLI verbs remain available for scripting.
 Write-Host '=== example client ==='
-& powershell -ExecutionPolicy Bypass -File (Join-Path $root 'client/build.ps1')
+& powershell -ExecutionPolicy Bypass -File (Join-Path $root 'league/client/build.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'example client build failed' }
 
 Copy-Item (Join-Path $buildDir 'vgb-loader.exe') $distDir -Force
 Copy-Item (Join-Path $buildDir 'vgb-example.exe') $distDir -Force
 
-foreach ($d in @('docs', 'sdk', 'client', 'scripts')) {
+foreach ($d in @('docs', 'sdk', 'tools', 'league', 'valorant')) {
     $src = Join-Path $root $d
     if (Test-Path $src) {
         $target = Join-Path $distDir $d
