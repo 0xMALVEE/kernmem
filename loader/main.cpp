@@ -174,13 +174,13 @@ namespace
 
         for (const wchar_t* p = text; *p; ++p)
         {
-            if (*p == L' ' || *p == L'\\t' || *p == L'-' || *p == L',')
+            if (*p == L' ' || *p == L'\t' || *p == L'-' || *p == L',')
                 continue;
 
             if (!iswxdigit(*p))
                 return false;
 
-            digits.push_back((char)*p);
+            digits.push_back(static_cast<char>(*p));
         }
 
         if (digits.empty() || (digits.size() % 2) != 0)

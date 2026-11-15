@@ -216,6 +216,16 @@ namespace mapper
             nal::FreePool(result.driverObject);
         }
 
+        /*
+         * DriverUnload deleted the device, but an IRP already past the device
+         * lookup can still be executing inside this image. Freeing the pool the
+         * instant DriverUnload returns leaves it dispatching into freed memory,
+         * which is a bugcheck on a machine that was only closing a handle.
+         * The driver also sets its own unloading flag; this drain covers the
+         * window before that flag is observable.
+         */
+        Sleep(250);
+
         nal::FreePool(result.imageBase);
         return true;
     }

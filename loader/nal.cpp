@@ -482,23 +482,35 @@ namespace nal
     uint64_t AllocatePool(uint64_t size)
     {
         static uint64_t kernelExAllocatePool = 0;
+        static uint64_t kernelExAllocatePoolWithTag = 0;
+        uint64_t result = 0;
+
+        /* NonPagedPool (0), not Nx: the mapped image is executed, so its pages
+         * have to be executable. The third slot carries the pool tag. */
+        const uint64_t args[4] = { 0, size, 0x42475662, 0 };
 
         if (!size || !EnsureKernelBase())
             return 0;
 
+        /* A NonPagedPool request above PAGE_SIZE is refused on some builds, and
+         * the image is 32 KB, so two allocators are tried before giving up. */
         if (!kernelExAllocatePool)
             kernelExAllocatePool = GetKernelModuleExport(ntoskrnlBase, "ExAllocatePool");
 
-        if (!kernelExAllocatePool)
-            return 0;
+        if (kernelExAllocatePool &&
+            CallKernelFunctionRaw(&result, kernelExAllocatePool, args, 2) && result)
+            return result;
 
-        const uint64_t args[4] = { 0, size, 0x42475662, 0 };
-        uint64_t result = 0;
+        if (!kernelExAllocatePoolWithTag)
+            kernelExAllocatePoolWithTag = GetKernelModuleExport(ntoskrnlBase, "ExAllocatePoolWithTag");
 
-        if (!CallKernelFunctionRaw(&result, kernelExAllocatePool, args, 3))
-            return 0;
+        if (kernelExAllocatePoolWithTag &&
+            CallKernelFunctionRaw(&result, kernelExAllocatePoolWithTag, args, 3) && result)
+            return result;
 
-        return result;
+        vgb_log::Error("both pool allocators failed for %llu bytes",
+                       (unsigned long long)size);
+        return 0;
     }
 
     bool FreePool(uint64_t address)

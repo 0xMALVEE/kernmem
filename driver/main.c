@@ -908,7 +908,19 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
      */
     driver->Type = IO_TYPE_DRIVER;
     driver->Size = sizeof(DRIVER_OBJECT);
-    driver->DeviceObject = NULL;
+    driver->DriverStart = NULL;
+    driver->DriverSize = 0;
+
+    /*
+     * Zeroed is not initialised. IoCreateDevice calls
+     * InsertTailList(&DriverObject->DeviceObject, ...), which reads Blink and
+     * dereferences it - a zeroed head has Flink = Blink = NULL and faults. The
+     * head must be a real, self-linked list head before any I/O API is touched.
+     *
+     * DeviceObject is declared PDEVICE_OBJECT but IoCreateDevice treats the field
+     * as a LIST_ENTRY, so the cast is required - the OS does the same internally.
+     */
+    InitializeListHead((PLIST_ENTRY)&driver->DeviceObject);
 
     /* Manual mapping hands us the loader's init block in the 2nd argument. */
     if (VgbLooksLikePointer(registryPath))
