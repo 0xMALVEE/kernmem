@@ -1,5 +1,8 @@
 #include "service.h"
 
+#include <cstdlib>
+#include <cwchar>
+
 #include "log.h"
 #include "nt.h"
 
@@ -55,6 +58,61 @@ namespace service
             RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
 
         return ntStatus;
+    }
+
+    int StopAllIqvw()
+    {
+        SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+
+        if (!manager)
+            return 0;
+
+        DWORD needed = 0;
+        DWORD count = 0;
+        int stopped = 0;
+
+        EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
+                              SERVICE_STATE_ALL, nullptr, 0, &needed, &count,
+                              nullptr, nullptr);
+
+        auto buffer = static_cast<LPBYTE>(malloc(needed + 0x400));
+
+        if (!buffer)
+        {
+            CloseServiceHandle(manager);
+            return 0;
+        }
+
+        if (EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
+                                  SERVICE_STATE_ALL, buffer, needed + 0x400, &needed,
+                                  &count, nullptr, nullptr))
+        {
+            auto entries = reinterpret_cast<LPENUM_SERVICE_STATUS_PROCESSW>(buffer);
+
+            for (DWORD i = 0; i < count; ++i)
+            {
+                if (!wcsstr(entries[i].lpDisplayName, L"iqvw"))
+                    continue;
+
+                SC_HANDLE service = OpenServiceW(manager, entries[i].lpServiceName,
+                                                 SERVICE_STOP | DELETE);
+
+                if (!service)
+                    continue;
+
+                SERVICE_STATUS status = { 0 };
+                ControlService(service, SERVICE_CONTROL_STOP, &status);
+                DeleteService(service);
+                CloseServiceHandle(service);
+
+                ++stopped;
+            }
+        }
+
+        free(buffer);
+        CloseServiceHandle(manager);
+
+        return stopped;
     }
 
     NTSTATUS StopAndRemove(const std::wstring& serviceName)

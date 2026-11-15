@@ -321,10 +321,19 @@ namespace nal
 
     bool Load(const wchar_t* driverPath)
     {
+        /*
+         * A resident host is not a failure. After a crash the previous image can be
+         * gone while \Device\Nal stays held, and refusing here meant only a reboot
+         * could recover. Attach to what is already running instead.
+         */
         if (IsRunning())
         {
-            vgb_log::Warn("\\Device\\Nal is already in use");
-            vgb_log::Warn("another NAL user (or a crashed run) holds it — reboot if it persists");
+            vgb_log::Warn("\\Device\\Nal is already resident - attaching to it");
+
+            if (Attach())
+                return true;
+
+            vgb_log::Warn("attach failed - another NAL user holds it, reboot if it persists");
             return false;
         }
 
@@ -408,6 +417,15 @@ namespace nal
         {
             service::StopAndRemove(g_serviceName);
             g_serviceName.clear();
+        }
+        else
+        {
+            /* The state file may be gone; find the service by its display name so
+             * \Device\Nal is released instead of staying held until a reboot. */
+            const int stopped = service::StopAllIqvw();
+
+            if (stopped)
+                vgb_log::Info("released %d stale mapping host service(s)", stopped);
         }
 
         if (!g_driverPath.empty())
