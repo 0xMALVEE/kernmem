@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdarg>
+#include <io.h>
 
 namespace
 {
@@ -37,6 +38,11 @@ namespace
             vfprintf(g_file, fmt, args);
             fprintf(g_file, "\n");
             fflush(g_file);
+
+            /* fflush only moves the CRT buffer into the OS cache; a bugcheck
+             * takes that with it. Force the bytes onto the disk so the last
+             * line really is the step that was executing. */
+            FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(g_file))));
         }
 
         LeaveCriticalSection(&g_lock);

@@ -11,23 +11,36 @@
 
 namespace
 {
-    /* Offsets mirror scripts/offsets.py for patch 26.16 / 16.16.804.9184. If the
-     * script table is re-distilled, update these in the same change. */
-    constexpr uint64_t OFF_LOCAL_PLAYER   = 0x1F304B0;
-    constexpr uint64_t OFF_OBJECT_MANAGER = 0x1EF0D28;
-    constexpr uint64_t OFF_OBJ_BEGIN      = 0x18;
-    constexpr uint64_t OFF_OBJ_END        = 0x20;
-    constexpr uint64_t OFF_OBJ_STRIDE     = 0x8;
-    constexpr uint64_t OFF_VIEW_MATRIX    = 0x1FBA090;
+    /*
+     * Offsets for client build 22.8910. Each value below was recovered from the
+     * live process by shape and then confirmed against real data: LocalPlayer
+     * resolves to a hero whose name reads back correctly, and the object array
+     * holds that same hero beside a second named hero.
+     *
+     * The old table was stamped 26.16 and pointed into float data on this build,
+     * which is why nothing drew. scripts/offsets.py carries the same values -
+     * update both in the same change.
+     *
+     * The view matrix is NOT recovered yet, so HAVE_VIEW_MATRIX is false and the
+     * overlay falls back to the radar. Flip it once the matrix is found.
+     */
+    constexpr bool     HAVE_VIEW_MATRIX   = false;
 
-    constexpr uint64_t OFF_HERO_TEAM    = 0x239;
-    constexpr uint64_t OFF_HERO_POS     = 0x23C;
-    constexpr uint64_t OFF_HERO_VISIBLE = 0x2E8;
-    constexpr uint64_t OFF_HERO_DEAD    = 0x231;
-    constexpr uint64_t OFF_HERO_HP      = 0x1080;
-    constexpr uint64_t OFF_HERO_MAXHP   = 0x10D0;
+    constexpr uint64_t OFF_LOCAL_PLAYER   = 0x1CBB810;
+    constexpr uint64_t OFF_OBJECT_MANAGER = 0x1CBB7F8;
+    constexpr uint64_t OFF_OBJ_BEGIN      = 0x0;
+    constexpr uint64_t OFF_OBJ_END        = 0x8;
+    constexpr uint64_t OFF_OBJ_STRIDE     = 0x8;
+    constexpr uint64_t OFF_VIEW_MATRIX    = 0x0;
+
+    constexpr uint64_t OFF_HERO_TEAM    = 0x1CC;
+    constexpr uint64_t OFF_HERO_POS     = 0xC20;
+    constexpr uint64_t OFF_HERO_VISIBLE = 0x0;
+    constexpr uint64_t OFF_HERO_DEAD    = 0x0;
+    constexpr uint64_t OFF_HERO_HP      = 0x8A0;
+    constexpr uint64_t OFF_HERO_MAXHP   = 0x8A4;
     constexpr uint64_t OFF_HERO_LEVEL   = 0x4D58;
-    constexpr uint64_t OFF_HERO_NAME    = 0x4378;
+    constexpr uint64_t OFF_HERO_NAME    = 0x3F00;
 
     constexpr uint32_t MAX_OBJECTS  = 0x400;
     constexpr float    ATTACK_RANGE = 550.0f;
@@ -95,6 +108,9 @@ namespace
     bool ReadMatrix(float matrix[16])
     {
         uint64_t instance = 0;
+
+        if (!HAVE_VIEW_MATRIX)
+            return false;
 
         if (!ReadU64(g_base + OFF_VIEW_MATRIX, &instance) || !instance)
             return false;
@@ -235,6 +251,47 @@ namespace
         return true;
     }
 
+    /*
+     * Matrix-free fallback. Without a view matrix there is still something honest
+     * to show: a top-down radar around the local hero. It needs no projection at
+     * all, only world positions, so it works on the offsets we actually have.
+     */
+    void DrawRadar(HDC dc, const Vec3& localPos, int32_t localTeam,
+                   const std::vector<Hero>& heroes)
+    {
+        const int size = 220;
+        const int x = 12;
+        const int y = g_height - size - 12;
+
+        if (y < 90)
+            return;
+
+        Filled(dc, x, y, size, size, RGB(16, 16, 16));
+        Box(dc, x, y, size, size, RGB(70, 70, 70), 1);
+
+        const float scale = 1.0f / 20.0f;   /* 1 px per 20 world units */
+        const float half = (float)size * 0.5f;
+
+        Filled(dc, x + (int)half - 2, y + (int)half - 2, 5, 5, RGB(120, 255, 120));
+
+        for (const Hero& hero : heroes)
+        {
+            const float dx = (hero.position.x - localPos.x) * scale;
+            const float dy = (hero.position.y - localPos.y) * scale;
+
+            const int px = x + (int)(half + dx);
+            const int py = y + (int)(half - dy);
+
+            if (px < x + 2 || px > x + size - 5 || py < y + 2 || py > y + size - 5)
+                continue;
+
+            const bool ally = localTeam != 0 && hero.team == localTeam;
+            Filled(dc, px, py, 5, 5, ally ? RGB(110, 190, 255) : RGB(255, 90, 90));
+        }
+
+        Text(dc, x + 6, y + 5, RGB(150, 150, 150), L"radar  %zu", heroes.size());
+    }
+
     void DrawFrame(HDC dc, float fps)
     {
         float matrix[16];
@@ -262,6 +319,9 @@ namespace
 
         std::vector<Hero> heroes;
         CollectHeroes(local, &heroes);
+
+        if (!hasMatrix && hasLocal)
+            DrawRadar(dc, localPos, localTeam, heroes);
 
         if (hasLocal && hasMatrix)
         {
@@ -308,7 +368,9 @@ namespace
 
         for (const Hero& hero : heroes)
         {
-            if (hero.dead || hero.health <= 0.0f || !hero.visible)
+            /* Visible/dead flags are not verified on this build, so filter on
+             * health only - a stale flag would otherwise hide every hero. */
+            if (hero.health < 0.0f)
                 continue;
 
             if (!hasMatrix)
@@ -369,10 +431,15 @@ namespace
         Text(dc, 12, 46, RGB(190, 190, 190), L"heroes %zu   matrix %s   self %s",
              heroes.size(), hasMatrix ? L"ok" : L"MISSING", hasLocal ? L"ok" : L"null");
 
-        if (!hasMatrix || !hasLocal)
+        if (!hasLocal)
         {
             Text(dc, 12, 72, RGB(255, 210, 90),
-                 L"no data yet - be in a match; matrix or offsets may need updating");
+                 L"no data yet - be in a match; offsets are build specific");
+        }
+        else if (!hasMatrix)
+        {
+            Text(dc, 12, 72, RGB(255, 210, 90),
+                 L"radar mode - view matrix not recovered yet, boxes disabled");
         }
     }
 

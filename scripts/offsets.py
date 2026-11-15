@@ -26,8 +26,16 @@ from typing import Optional
 # provenance
 # --------------------------------------------------------------------------- #
 
-PATCH = "26.16"
-CLIENT = "16.16.804.9184"
+PATCH = "22.8910"
+CLIENT = "22.8910"
+
+# Recovered from the live process on 2026-11-15 and confirmed by reading real
+# data back: the LocalPlayer pointer resolves to a hero whose name string reads
+# correctly, and the object array holds that same hero beside a second named
+# hero. The 26.16 values this table used to carry were stale on this build and
+# pointed into float data, which is why every read failed with error 299.
+#
+# ViewMatrix is still NOT recovered. The renderer hunt lives in build/*.py.
 SCRAPED = "2026-11-15"
 SOURCE = "research/unknowncheats/posts/310587_reversal-structs-offsets_2026-11-15.md"
 THREAD = "https://www.unknowncheats.me/forum/league-of-legends/310587-league-legends-reversal-structs-offsets.html"
@@ -84,11 +92,11 @@ OFFSETS: dict[str, Offset] = {
         note="root of the client graph", verified=True,
     ),
     "LocalPlayer": Offset(
-        "LocalPlayer", 0x1F304B0,
+        "LocalPlayer", 0x1CBB810,
         note="pointer to the local hero; null before the match starts", verified=True,
     ),
     "ObjectManager": Offset(
-        "ObjectManager", 0x1EF0D28,
+        "ObjectManager", 0x1CBB7F8,
         note="object manager; holds the live object array", verified=True,
     ),
     "HeroManager": Offset(
@@ -103,23 +111,23 @@ OFFSETS: dict[str, Offset] = {
     "UnderMouseObj": Offset("UnderMouseObj", 0x1EF44B8, note="object under the cursor", verified=True),
 
     # -- object array layout (relative to ObjectManager) -------------------- #
-    "ObjArrayBegin": Offset("ObjArrayBegin", 0x18, constant=False, note="array start (pointer)", verified=True),
-    "ObjArrayEnd": Offset("ObjArrayEnd", 0x20, constant=False, note="array end (pointer)", verified=True),
+    "ObjArrayBegin": Offset("ObjArrayBegin", 0x0, constant=False, note="array start (pointer)", verified=True),
+    "ObjArrayEnd": Offset("ObjArrayEnd", 0x8, constant=False, note="array end (pointer)", verified=True),
     "ObjArrayStride": Offset("ObjArrayStride", 0x8, constant=True, note="pointer size", verified=True),
     "ObjArrayCap": Offset("ObjArrayCap", 0x28, constant=False, note="array capacity", verified=True),
 
     # -- GameObject --------------------------------------------------------- #
-    "HeroTeam": Offset("HeroTeam", 0x239, note="team id: 100 blue, 200 red", verified=True),
-    "HeroPosition": Offset("HeroPosition", 0x23C, note="world position, 3 floats x/y/z", verified=True),
+    "HeroTeam": Offset("HeroTeam", 0x1CC, note="team id: 100 blue, 200 red", verified=True),
+    "HeroPosition": Offset("HeroPosition", 0xC20, note="world position, 3 floats x/y/z", verified=True),
     "HeroVisible": Offset("HeroVisible", 0x2E8, note="visibility flag", verified=True),
     "HeroDead": Offset("HeroDead", 0x231, note="dead flag", verified=True),
-    "HeroName": Offset("HeroName", 0x4378, note="champion name string", verified=True),
+    "HeroName": Offset("HeroName", 0x3F00, note="champion name string", verified=True),
     "HeroNetworkId": Offset("HeroNetworkId", 0xCC, note="network id", verified=True),
     "HeroIndex": Offset("HeroIndex", 0x20, note="index", verified=True),
 
     # -- stats -------------------------------------------------------------- #
-    "HeroHealth": Offset("HeroHealth", 0x1080, note="current health", verified=True),
-    "HeroMaxHealth": Offset("HeroMaxHealth", 0x10D0, note="max health", verified=True),
+    "HeroHealth": Offset("HeroHealth", 0x8A0, note="current health", verified=True),
+    "HeroMaxHealth": Offset("HeroMaxHealth", 0x8A4, note="max health", verified=True),
     "HeroMana": Offset("HeroMana", 0x360, note="current mana", verified=True),
     "HeroMaxMana": Offset("HeroMaxMana", 0x48, note="max mana", verified=True),
     "HeroLevel": Offset("HeroLevel", 0x4D58, note="level", verified=True),

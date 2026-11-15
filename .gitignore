@@ -1,7 +1,12 @@
 # Compiler output only - loader/res/ is committed on purpose because
 # loader/build.ps1 needs those headers to compile, and a fresh clone must be
 # able to build without first running the driver stage.
-/build/
+/build/*
+
+# The throwaway scanners used to recover offsets are worth keeping so the work
+# can be reviewed, re-run and diffed on the next patch.
+!/build/*.py
+!/build/*.md
 
 # Python
 __pycache__/
