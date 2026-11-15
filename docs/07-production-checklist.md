@@ -12,12 +12,12 @@ This is the honest status document. It separates **must work for the product to 
 |------|-----|-------|
 | `driver/main.c` + build | the bypass itself | **done, builds, mapper-safe** |
 | `dist/iqvw64e.sys` | only load path under Secure Boot | **done, extracted** |
-| `loader/nal.cpp` | speaks to the mapping host | **missing** |
-| `loader/pe.cpp` | parse/relocate/resolve the image | **missing** |
-| `loader/mapper.cpp` | allocate, map, call `DriverEntry` | **missing** |
-| `loader/main.cpp` | the CLI the user runs | **missing** |
-| `build.ps1` (root) | reproducible build + dist assembly | **missing** |
-| `loader/build.ps1` | builds the loader | **missing** |
+| `loader/nal.cpp` | speaks to the mapping host | **done** |
+| `loader/pe.cpp` | parse/relocate/resolve the image | **done** |
+| `loader/mapper.cpp` | allocate, map, call `DriverEntry` | **done** |
+| `loader/main.cpp` | the UI and CLI the user runs | **done** |
+| `build.ps1` (root) | reproducible build + dist assembly | **done** |
+| `loader/build.ps1` | builds the loader | **done** |
 
 Eight items. Nothing here is optional — a driver that cannot be loaded and a loader that cannot map are a library, not a product.
 
@@ -25,12 +25,12 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 
 | Item | Why | State |
 |------|-----|-------|
-| `sdk/vgb-sdk.h` | clients stop hand-rolling IOCTL buffers | **missing** |
-| `sdk/vgb.py` | Python is the dominant LoL scripting language | **missing** |
-| `client/` example | proof it works end to end | **missing** |
-| Elevated-launch helper | `load` is useless without it | **missing** |
-| `status` / `unload` verbs | operator sanity and clean teardown | **missing** |
-| Live smoke test | nothing has run in a kernel yet | **missing** |
+| `sdk/vgb-sdk.h` | clients stop hand-rolling IOCTL buffers | **done** |
+| `sdk/vgb.py` | Python is the dominant LoL scripting language | **done** |
+| `client/` example | proof it works end to end | **done** |
+| Elevated-launch helper | `load` is useless without it | **done** (UI shows elevation state) |
+| `status` / `unload` verbs | operator sanity and clean teardown | **done** |
+| Live smoke test | nothing has run in a kernel yet | **outstanding** |
 
 ### Tier 2 — needed to *sell* it
 

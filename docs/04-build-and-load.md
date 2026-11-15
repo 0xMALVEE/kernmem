@@ -38,6 +38,8 @@ flowchart TB
 
 Build order is not optional: `vgb.sys` must exist and pass the safety check before its bytes can be embedded, and the loader cannot link before the resource headers exist.
 
+The generated headers are **committed**, so a fresh clone can build the loader without first building the driver. That creates a staleness risk, which is closed by a hash guard: `tools/embed.ps1` stamps the source SHA-256 into each header as `#define <symbol>_SHA256 "..."`, and `loader/build.ps1` refuses to link when that value does not match `build/vgb.sys`. The check is skipped when `build/vgb.sys` is absent, which is exactly the fresh-clone case, so a clone is never blocked by it. Timestamps are not used — a clone stamps every file with clone time.
+
 ---
 
 ## 3. Compile and link flags, and why each one
@@ -118,17 +120,18 @@ flowchart TD
 
 ## 6. Artifact table
 
-| Artifact | Source | Ships | Purpose |
-|----------|--------|-------|---------|
-| `build/vgb.sys` | `driver/main.c` | no (embedded) | intermediate only |
-| `loader/res/vgb_sys.h` | generated | no | byte array of the above |
-| `dist/iqvw64e.sys` | Intel, extracted | **yes** | signed mapping host |
-| `dist/vgb-loader.exe` | `loader/*.cpp` | **yes** | the product |
-| `dist/vgb-sdk.h` | `sdk/` | **yes** | client API |
-| `dist/vgb.py` | `sdk/` | **yes** | Python binding |
-| `dist/docs/` | `docs/` | **yes** | this set |
+| Artifact | Source | Committed | Ships | Purpose |
+|----------|--------|-----------|-------|---------|
+| `build/vgb.sys` | `driver/main.c` | no | no (embedded) | intermediate only |
+| `loader/res/vgb_sys.h` | generated | **yes** | no | byte array of the above, hash-stamped |
+| `loader/res/iqvw_sys.h` | `dist/iqvw64e.sys` | **yes** | no | byte array of the mapping host |
+| `dist/iqvw64e.sys` | Intel, extracted | **yes** | **yes** | signed mapping host |
+| `dist/vgb-loader.exe` | `loader/*.cpp` | **yes** | **yes** | the product |
+| `dist/vgb-example.exe` | `client/` | **yes** | **yes** | end-to-end smoke test |
+| `dist/sdk/` | `sdk/` | **yes** | **yes** | client API |
+| `dist/docs/` | `docs/` | **yes** | **yes** | this set |
 
-`vgb.sys` is embedded, not shipped loose, so a user cannot accidentally load the wrong build against a stale loader.
+`vgb.sys` is embedded, not shipped loose, so a user cannot accidentally load the wrong build against a stale loader. The embedded headers are committed for buildability, and the hash guard above keeps them honest.
 
 ---
 
