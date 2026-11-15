@@ -102,15 +102,45 @@ Two verbs let you test layers separately, so a failure is attributable:
 
 ## 6. Recovery after a crash
 
-The vulnerable driver is service-registered, so a bugcheck can leave `\Device\Nal` held:
+A bugcheck can leave two different messes, and they need different answers.
+
+**Host held (`\Device\Nal` busy, load says "already resident").**
+The loader now attaches to a resident host instead of refusing, and unload sweeps any
+leftover service whose display name contains `iqvw` even when the state file is gone:
+
+```powershell
+.\dist\vgb-loader.exe unload
+```
+
+**A mapped image leaked in pool.** If the device still answers after a successful
+`unload`, the image was never freed and only a **reboot** reclaims the pool. This
+happens with images older than protocol 4, which cannot report their own mapping. After
+rebooting, `load` starts clean.
+
+Signs of the leak, so it is not mistaken for something else:
+
+```
+[+] driver unmapped
+[*] NAL: resident
+[+] device: present, protocol 3      <-- still there after unload
+[!] protocol mismatch (expected 4)
+```
+
+Manual cleanup of the file and key, if you want it gone:
 
 ```powershell
 Get-Service | Where-Object Name -match 'iqvw'
 sc.exe stop <name>
 sc.exe delete <name>
+Remove-Item "$env:TEMP\<random>.sys"
 ```
 
-Then reboot if it persists. A stale `%TEMP%\<random>.sys` can be deleted by hand.
+## 7. Why the leak cannot recur
+
+The driver reports its own `ImageBase`, `ImageSize` and `DriverObject` over
+`IOCTL_VGB_GET_INFO` (protocol 4), so teardown reads them from the driver instead of a
+temp file. `mapper::Unmap` also refuses to free the image if it cannot read
+`DriverUnload`, so the pool can no longer be released while the device is still live.
 
 ---
 

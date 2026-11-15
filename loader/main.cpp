@@ -325,8 +325,8 @@ namespace
 
         if (OpenDevice())
         {
-            /* A live device is a success, not an error: the one-click path checks
-             * this too, and a dangling one still answers protocol 3. */
+            /* A live device at our protocol is a success, not an error: the
+             * one-click path checks this too, so a second double-click is harmless. */
             ULONG existing = 0;
 
             if (Ioctl(IOCTL_VGB_GET_VERSION, nullptr, 0, &existing, sizeof(existing), nullptr) &&
@@ -336,7 +336,24 @@ namespace
                 return 0;
             }
 
-            vgb_log::Error("device present but not answering - unload first");
+            /*
+             * Anything else is an older or leaked image. `unload` can only free it if
+             * it can read the mapping back, and an image older than protocol 4 cannot
+             * report itself - so say that instead of the vague "unload first".
+             */
+            vgb_log::Error("a different driver build is already mapped (protocol %u, expected %u)",
+                           existing, VGB_PROTOCOL_VERSION);
+
+            if (existing && existing < VGB_PROTOCOL_VERSION)
+            {
+                vgb_log::Info("it cannot report its own mapping, so try `unload` once; "
+                              "if the device still answers afterwards, reboot");
+            }
+            else
+            {
+                vgb_log::Info("run `unload` first, then load again");
+            }
+
             return 1;
         }
 
