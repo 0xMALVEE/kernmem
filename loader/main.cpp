@@ -120,11 +120,29 @@ namespace
         if (g_device != INVALID_HANDLE_VALUE && g_device)
             return true;
 
-        g_device = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        /*
+         * Try the DOS symlink first, then the device object itself. A teardown
+         * that deleted the symlink but left the device pinned by an open handle
+         * leaves the second path as the only way in, and without it every later
+         * open fails with "file not found" while the driver is still answering.
+         */
+        static const wchar_t* const paths[] =
+        {
+            VGB_WIN32_NAME,
+            L"\\\\?\\GLOBALROOT\\Device\\VanguardBypass",
+        };
 
-        return g_device != INVALID_HANDLE_VALUE;
+        for (const wchar_t* path : paths)
+        {
+            g_device = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+            if (g_device != INVALID_HANDLE_VALUE)
+                return true;
+        }
+
+        return false;
     }
 
     void CloseDevice()

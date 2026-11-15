@@ -12,14 +12,15 @@
 namespace
 {
     /*
-     * Offsets for client build 22.8910. Each value below was recovered from the
-     * live process by shape and then confirmed against real data: LocalPlayer
-     * resolves to a hero whose name reads back correctly, and the object array
-     * holds that same hero beside a second named hero.
+     * Offsets for client build 22.8910, every one recovered from the live process
+     * and confirmed against real data: the object array yields the local hero plus
+     * a second named hero, positions are stable world coordinates across reads,
+     * and the health pair sits 0x40 into the stat block.
      *
-     * The old table was stamped 26.16 and pointed into float data on this build,
-     * which is why nothing drew. scripts/offsets.py carries the same values -
-     * update both in the same change.
+     * The team field is a small enum (1 = own side, 2 = enemy), not the 100/200 the
+     * older table used - checking for those dropped every single hero.
+     *
+     * scripts/offsets.py carries the same values; update both in the same change.
      *
      * The view matrix is NOT recovered yet, so HAVE_VIEW_MATRIX is false and the
      * overlay falls back to the radar. Flip it once the matrix is found.
@@ -33,17 +34,31 @@ namespace
     constexpr uint64_t OFF_OBJ_STRIDE     = 0x8;
     constexpr uint64_t OFF_VIEW_MATRIX    = 0x0;
 
-    constexpr uint64_t OFF_HERO_TEAM    = 0x1CC;
-    constexpr uint64_t OFF_HERO_POS     = 0xC20;
-    constexpr uint64_t OFF_HERO_VISIBLE = 0x0;
-    constexpr uint64_t OFF_HERO_DEAD    = 0x0;
-    constexpr uint64_t OFF_HERO_HP      = 0x8A0;
-    constexpr uint64_t OFF_HERO_MAXHP   = 0x8A4;
-    constexpr uint64_t OFF_HERO_LEVEL   = 0x4D58;
+    constexpr uint64_t OFF_HERO_TEAM    = 0x128;
     constexpr uint64_t OFF_HERO_NAME    = 0x3F00;
 
+    /*
+     * The stat block is not at one distance for every entry: some list entries are
+     * handed to us 0x100 above their own base, so the same field is reachable at
+     * two distances. Try the near one, then the far one, and validate the result -
+     * a denormal triple is the signature of a miss.
+     */
+    constexpr uint64_t OFF_HERO_POS_NEAR = 0x4584;
+    constexpr uint64_t OFF_HERO_POS_FAR  = 0x4484;
+
+    /* Health and max health live 0x40 and 0x44 into the stat block, i.e. relative
+     * to whichever position offset resolved. */
+    constexpr uint64_t OFF_HERO_HP_FROM_POS    = 0x40;
+    constexpr uint64_t OFF_HERO_MAXHP_FROM_POS = 0x44;
+
+    /* Own attack range, read from the local hero. */
+    constexpr uint64_t OFF_HERO_ATTACK_RANGE = 0x30B0;
+
+    constexpr int32_t TEAM_OWN   = 1;
+    constexpr int32_t TEAM_ENEMY = 2;
+
     constexpr uint32_t MAX_OBJECTS  = 0x400;
-    constexpr float    ATTACK_RANGE = 550.0f;
+    constexpr float    ATTACK_RANGE = 700.0f;
     constexpr float    HERO_HEIGHT  = 110.0f;
 
     HANDLE   g_device = INVALID_HANDLE_VALUE;
@@ -67,11 +82,8 @@ namespace
     {
         uint64_t address;
         int32_t  team;
-        int32_t  level;
         float    health;
         float    maxHealth;
-        bool     visible;
-        bool     dead;
         Vec3     position;
         wchar_t  name[48];
     };
@@ -167,6 +179,19 @@ namespace
         DeleteObject(pen);
     }
 
+    void Circle(HDC dc, int cx, int cy, int radius, COLORREF colour, int thickness)
+    {
+        HPEN pen = CreatePen(PS_SOLID, thickness, colour);
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+        Ellipse(dc, cx - radius, cy - radius, cx + radius, cy + radius);
+
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+    }
+
     void Filled(HDC dc, int x, int y, int w, int h, COLORREF colour)
     {
         RECT rect = { x, y, x + w, y + h };
@@ -191,6 +216,49 @@ namespace
     }
 
     /* ---- scene -------------------------------------------------------- */
+
+    /*
+     * Reads a hero's world position, trying both stat-block distances. Returns the
+     * distance that worked so the caller can find the health pair from it.
+     */
+    bool ReadHeroPosition(uint64_t object, Vec3* out, uint64_t* posOffset)
+    {
+        const uint64_t candidates[] = { OFF_HERO_POS_NEAR, OFF_HERO_POS_FAR };
+
+        for (uint64_t offset : candidates)
+        {
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+
+            if (!ReadF32(object + offset, &x) ||
+                !ReadF32(object + offset + 4, &y) ||
+                !ReadF32(object + offset + 8, &z))
+                continue;
+
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                continue;
+
+            /* A miss reads as a denormal or as zero; a real hero is never at the
+             * origin of the map, so both cases are rejected. */
+            if (fabsf(x) < 1.0f || fabsf(y) < 1.0f)
+                continue;
+
+            if (fabsf(x) > 100000.0f || fabsf(y) > 100000.0f || fabsf(z) > 10000.0f)
+                continue;
+
+            out->x = x;
+            out->y = y;
+            out->z = z;
+
+            if (posOffset)
+                *posOffset = offset;
+
+            return true;
+        }
+
+        return false;
+    }
 
     bool CollectHeroes(uint64_t localAddress, std::vector<Hero>* out)
     {
@@ -223,27 +291,21 @@ namespace
             if (!ReadI32(object + OFF_HERO_TEAM, &hero.team))
                 continue;
 
-            if (hero.team != 100 && hero.team != 200)
+            if (hero.team != TEAM_OWN && hero.team != TEAM_ENEMY)
                 continue;
 
-            if (!ReadF32(object + OFF_HERO_POS, &hero.position.x) ||
-                !ReadF32(object + OFF_HERO_POS + 4, &hero.position.y) ||
-                !ReadF32(object + OFF_HERO_POS + 8, &hero.position.z))
+            uint64_t posOffset = 0;
+
+            if (!ReadHeroPosition(object, &hero.position, &posOffset))
                 continue;
 
-            ReadF32(object + OFF_HERO_HP, &hero.health);
-            ReadF32(object + OFF_HERO_MAXHP, &hero.maxHealth);
-            ReadI32(object + OFF_HERO_LEVEL, &hero.level);
+            ReadF32(object + posOffset + OFF_HERO_HP_FROM_POS, &hero.health);
+            ReadF32(object + posOffset + OFF_HERO_MAXHP_FROM_POS, &hero.maxHealth);
             ReadName(object + OFF_HERO_NAME, hero.name, _countof(hero.name));
 
-            int32_t visible = 0;
-            int32_t dead = 0;
-            ReadI32(object + OFF_HERO_VISIBLE, &visible);
-            ReadI32(object + OFF_HERO_DEAD, &dead);
-
+            /* The visible/dead flags are not identified on this build, so they stay
+             * false and the draw path filters on health alone. */
             hero.address = object;
-            hero.visible = visible != 0;
-            hero.dead = dead != 0;
 
             out->push_back(hero);
         }
@@ -256,7 +318,7 @@ namespace
      * to show: a top-down radar around the local hero. It needs no projection at
      * all, only world positions, so it works on the offsets we actually have.
      */
-    void DrawRadar(HDC dc, const Vec3& localPos, int32_t localTeam,
+    void DrawRadar(HDC dc, const Vec3& localPos, int32_t localTeam, float attackRange,
                    const std::vector<Hero>& heroes)
     {
         const int size = 220;
@@ -274,6 +336,14 @@ namespace
 
         Filled(dc, x + (int)half - 2, y + (int)half - 2, 5, 5, RGB(120, 255, 120));
 
+        /* Own attack range. The ring belongs to the projection path, but that path
+         * needs a view matrix we do not have - so draw it here, in radar space,
+         * where a world radius is just range * scale. */
+        const int ringRadius = (int)(attackRange * scale);
+
+        if (ringRadius > 2 && ringRadius < size / 2)
+            Circle(dc, x + (int)half, y + (int)half, ringRadius, RGB(90, 200, 255), 1);
+
         for (const Hero& hero : heroes)
         {
             const float dx = (hero.position.x - localPos.x) * scale;
@@ -289,7 +359,8 @@ namespace
             Filled(dc, px, py, 5, 5, ally ? RGB(110, 190, 255) : RGB(255, 90, 90));
         }
 
-        Text(dc, x + 6, y + 5, RGB(150, 150, 150), L"radar  %zu", heroes.size());
+        Text(dc, x + 6, y + 5, RGB(150, 150, 150), L"radar  %zu   range %.0f",
+             heroes.size(), attackRange);
     }
 
     void DrawFrame(HDC dc, float fps)
@@ -306,22 +377,35 @@ namespace
         float localMaxHp = 0.0f;
         bool hasLocal = false;
 
+        float attackRange = ATTACK_RANGE;
+
         if (local)
         {
-            hasLocal = ReadF32(local + OFF_HERO_POS, &localPos.x) &&
-                       ReadF32(local + OFF_HERO_POS + 4, &localPos.y) &&
-                       ReadF32(local + OFF_HERO_POS + 8, &localPos.z);
+            uint64_t posOffset = 0;
+            hasLocal = ReadHeroPosition(local, &localPos, &posOffset);
+
+            if (hasLocal)
+            {
+                ReadF32(local + posOffset + OFF_HERO_HP_FROM_POS, &localHp);
+                ReadF32(local + posOffset + OFF_HERO_MAXHP_FROM_POS, &localMaxHp);
+            }
 
             ReadI32(local + OFF_HERO_TEAM, &localTeam);
-            ReadF32(local + OFF_HERO_HP, &localHp);
-            ReadF32(local + OFF_HERO_MAXHP, &localMaxHp);
+
+            /* The real range is on the hero; the constant is only a fallback for
+             * when the read misses. */
+            float measured = 0.0f;
+
+            if (ReadF32(local + OFF_HERO_ATTACK_RANGE, &measured) &&
+                std::isfinite(measured) && measured > 100.0f && measured < 1500.0f)
+                attackRange = measured;
         }
 
         std::vector<Hero> heroes;
         CollectHeroes(local, &heroes);
 
         if (!hasMatrix && hasLocal)
-            DrawRadar(dc, localPos, localTeam, heroes);
+            DrawRadar(dc, localPos, localTeam, attackRange, heroes);
 
         if (hasLocal && hasMatrix)
         {
@@ -413,7 +497,7 @@ namespace
             const float dy = hero.position.y - localPos.y;
             const float distance = sqrtf(dx * dx + dy * dy);
 
-            Text(dc, left, top - 26, colour, L"%ls L%d %.0f", hero.name, hero.level, distance);
+            Text(dc, left, top - 26, colour, L"%ls %.0f", hero.name, distance);
 
             if (hasLocal)
             {
@@ -738,9 +822,23 @@ namespace overlay
         if (!pid)
             return false;
 
-        g_device = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        /* The DOS symlink can be gone while the device object is still live, so
+         * fall back to the object path before giving up. */
+        static const wchar_t* const paths[] =
+        {
+            VGB_WIN32_NAME,
+            L"\\\\?\\GLOBALROOT\\Device\\VanguardBypass",
+        };
+
+        for (const wchar_t* path : paths)
+        {
+            g_device = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+            if (g_device != INVALID_HANDLE_VALUE)
+                break;
+        }
 
         if (g_device == INVALID_HANDLE_VALUE)
         {

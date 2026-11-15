@@ -1,0 +1,79 @@
+oNavGrid: 48 8B 05 ? ? ? ? 0F 28 DA
+CastSpellFlag:  C6 05 ? ? ? ? ? E8 ? ? ? ? 8B 50 ?
+
+oBasicAttackBase: 48 8B 81 ? ? ? ? C3 CC 40 56 48
+oBasicAttackOffset1: 5B C3 CC 48 8B 81 ? ? ? ? C3
+oBasicAttackOffset2 : 48 8B 41 ? 48 89 02 4C 89 42 08 F0 41
+
+oLocalPlayer: 48 8B 0D ? ? ? ? 4C ? ? 74 ? 49
+oHerroList: 48 8B 0D ? ? ? ? 0F 85 ? ? ? ? 83
+oGametime: F3 0F 5C 35 ? ? ? ? 0F 28 F8
+oMinionList: 48 8B 05 ? ? ? ? F3 ? ? ? ? 45
+oMissileList: 48 8b 0d ? ? ? ? 48 8d 55 0f e8 ? ? ? ?
+oObjNetId: 8B 80 ? ? ? ? 89 43 ? 48 83 C4 ? 5B C3 8B
+
+
+
+oTargetable: 0F B6 83 ? ? ? ? 48 83 C4 ? 5B
+TeamID: 0F B6 88 ? ? ? ? EB 07 0F B6 8E
+NamePlayer: 48 81 C1 ? ? ? ? 48 3B CA 74 ? 48 83 7A ? ? 76
+
+RangeAttack: F3 0F 10 80 ? ? ? ? F3 0F 11 47
+oBasicAttackBase: 48 8B 81 ? ? ? ? C3 CC 40 56 48
+oBasicAttackOffset1: 5B C3 CC 48 8B 81 ? ? ? ? C3
+oBasicAttackOffset2: 48 8B 41 ? 48 89 02 4C 89 42 08 F0 41
+LaneMinionArray: 48 8B 46 ? 8B 4E ? ? ? ? ? 48 3B C2
+LaneMinionType: 0F B6 81 ? ? ? ? 3C ? 74 ? 2C ? 3C ? 76
+oGetAiManagerFunc: 73 20 90 0F B6 0C 02
+oObjSpellBook: 49 8D ? ? ? ? ? 8B D0 4C 8D ? ? E8
+
+oSpellSlotSpellInfo: 48 83 BA ? ? ? ? 00 74 03 B0 01
+oObjBuffManager: 48 8D 8B ? ? ? ? 48 8B D7 E8 ? ? ? ? ? ? ? 48 8B CB
+oHudInstance: 48 8B 0D ? ? ? ? 48 85 c9 74 ? 48 8b 49 ? 48 8d
+oHudMouseVec3: F3 0F 10 4F ? 48 8B BC 24
+oHudInstanceSpellInfo: 48 8B 48 ? 48 85 C9 74 ? 48 8B 51 ? 48 85 D2 75
+oMouseScreenVec2: 48 8B 0D ? ? ? ? E8 ? ? ? ? 48 8B 0D ? ? ? ? 48 8B 01
+oMouseDevice: 48 8B 0D ? ? ? ? 4C 8D 0D ? ? ? ? 4C 8B 05 ? ? ? ? BA
+oKeyboardDevice: 48 8B 0D ? ? ? ? 4C 8D 0D ? ? ? ? 4C 8B 05 ? ? ? ? BA
+oKeyboardHit: C6 84 ? ? ? ? ? 01 C6 84 ? ? ? ? ? 01 89
+oKeyboardRgDOD: 4C 8B 05 ? ? ? ? BA ? ? ? ? C7
+oKeyboardPdInOut: 4C 8B 05 ? ? ? ? BA ? ? ? ? C7
+oGetDeviceState: 83 BB ? ? ? ? 00 74 ? F6 43 ? 01 75 14 F6
+oIAT_GetCursorPos: FF 15 ? ? ? ? 48 8D 54 24 ? 48 8B CB FF
+oChatInstance: 48 8B 0D ? ? ? ? E8 ? ? ? ? 48 8B B4 24 ? ? ? ? EB
+oChatState: 44 8B 05 ? ? ? ? 48 8B 54 24 ? 48 8B 0D ? ? ? ? E8 ? ? ? ? 48 8B B4
+oPrintChat: E8 ? ? ? ? 4C 8B C3 B2 01
+GlobalPtr: 48 8B 05 ? ? ? ? 0F 28 DA
+ViewPort: 4c 8B 3D ? ? ? ? 48 03 ? 49
+oViewportW2S: 49 8B B7 ? ? ? ? 48 3B DF
+ViewProjectionMatrix: 48 8D 0D ? ? ? ? 0F 10 00
+oUnderMouseObj: 48 89 0D ? ? ? ? 48 8D 05 ? ? ? ? 48 89 01 33 D2
+oUnderMouseObjOffset: 48 8B 4B ? 0F 28 74 24 ? 8B 81
+WorldToScreen: E8 ? ? ? ? F3 0F 10 44 24 ? F3 41 0F 11 06
+oIssueOrder: E8 ? ? ? ? 8D 43 11
+oCastSpellWrapper: 48 89 48 ? 55 56 57 41 54 41 55 48
+AttackDelay: E8 ? ? ? ? 33 C0 F3 0F 11 83 ? ? ? ?
+
+GetPing: E8 ? ? ? ? 8B F8 39 03
+isMinion: E8 ? ? ? ? 48 8B 0B F3 0F 10 41 ?
+isTurret: 40 53 48 83 EC 20 48 8B D9 48 85 C9 74 27
+GetFirstObject: 48 83 EC ? 48 8B 51 ? 8B 41 ? 48 8D 0C C2
+GetNextObject: 0F B7 42 ? 44 8B 41
+oGetBoundingRadius: 40 53 48 83 EC ? 48 83 B9 ? ? ? ? 00 48 8B D9 0F 29 74 24 20
+oGetCollisionFlags: 48 83 ec 28 48 8b d1 48 8b 0d ? ? ? ? 48 8b 49 08 e8 29 00 00 00 48 ? ?
+
+oBasicAttackBase: 48 8B 81 ? ? ? ? C3 CC 40 56 48
+oBasicAttackOffset2: 48 8B 41 ? 48 89 02 4C 89 42 08 F0 41
+LaneMinionType: 0F B6 81 ? ? ? ? 3C ? 74 ? 2C ? 3C ? 76
+oObjBuffManager: 48 8D 8B ? ? ? ? 48 8B D7 E8
+oHudMouseVec3: F3 0F 10 4F ? 48 8B BC 24
+oHudInstanceSpellInfo: 48 8B 48 ? 48 85 C9 74 ? 48 8B 51 ? 48 85 D2 75
+oCastSpellWrapper: 48 89 48 ? 55 56 57 41 54 41 55
+AttackDelay: E8 ? ? ? ? 33 C0 F3 0F 11 83
+oGetAttackWindup: 48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 60
+GetPing: E8 ? ? ? ? 8B F8 39 03
+WorldToScreen: E8 ? ? ? ? F3 0F 10 44 24 ? F3 41 0F 11 06
+isMinion: E8 ? ? ? ? 48 8B 0B F3 0F 10 41
+isTurret: 40 53 48 83 EC 20 48 8B D9 48 85 C9 74 27
+GetFirstObject: 48 83 EC ? 48 8B 51 ? 8B 41 ? 48 8D 0C C2
+GetNextObject: 0F B7 42 ? 44 8B 41

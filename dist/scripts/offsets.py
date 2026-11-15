@@ -117,20 +117,24 @@ OFFSETS: dict[str, Offset] = {
     "ObjArrayCap": Offset("ObjArrayCap", 0x28, constant=False, note="array capacity", verified=True),
 
     # -- GameObject --------------------------------------------------------- #
-    "HeroTeam": Offset("HeroTeam", 0x1CC, note="team id: 100 blue, 200 red", verified=True),
-    "HeroPosition": Offset("HeroPosition", 0xC20, note="world position, 3 floats x/y/z", verified=True),
-    "HeroVisible": Offset("HeroVisible", 0x2E8, note="visibility flag", verified=True),
-    "HeroDead": Offset("HeroDead", 0x231, note="dead flag", verified=True),
+    "HeroTeam": Offset("HeroTeam", 0x128, note="team enum: 1 own side, 2 enemy", verified=True),
+    "HeroPosition": Offset("HeroPosition", 0x4584, note="world position, 3 floats x/y/z", verified=True),
+    "HeroPositionAlt": Offset("HeroPositionAlt", 0x4484,
+                              note="same field, 0x100 lower on entries handed over 0x100 high",
+                              verified=True),
+    "HeroVisible": Offset("HeroVisible", 0x2E8, note="visibility flag - not confirmed on 22.8910", verified=False),
+    "HeroDead": Offset("HeroDead", 0x231, note="dead flag - not confirmed on 22.8910", verified=False),
     "HeroName": Offset("HeroName", 0x3F00, note="champion name string", verified=True),
     "HeroNetworkId": Offset("HeroNetworkId", 0xCC, note="network id", verified=True),
     "HeroIndex": Offset("HeroIndex", 0x20, note="index", verified=True),
 
     # -- stats -------------------------------------------------------------- #
-    "HeroHealth": Offset("HeroHealth", 0x8A0, note="current health", verified=True),
-    "HeroMaxHealth": Offset("HeroMaxHealth", 0x8A4, note="max health", verified=True),
-    "HeroMana": Offset("HeroMana", 0x360, note="current mana", verified=True),
-    "HeroMaxMana": Offset("HeroMaxMana", 0x48, note="max mana", verified=True),
-    "HeroLevel": Offset("HeroLevel", 0x4D58, note="level", verified=True),
+    "HeroHealth": Offset("HeroHealth", 0x45C4, note="current health (position + 0x40)", verified=True),
+    "HeroMaxHealth": Offset("HeroMaxHealth", 0x45C8, note="max health (position + 0x44)", verified=True),
+    "HeroAttackRange": Offset("HeroAttackRange", 0x30B0, note="attack range, read 700.0 live", verified=True),
+    "HeroMana": Offset("HeroMana", 0x360, note="current mana - not confirmed on 22.8910", verified=False),
+    "HeroMaxMana": Offset("HeroMaxMana", 0x48, note="max mana - not confirmed on 22.8910", verified=False),
+    "HeroLevel": Offset("HeroLevel", 0x4D58, note="level - not confirmed on 22.8910", verified=False),
     "HeroArmor": Offset("HeroArmor", 0x2E8, note="armor (inside stats block)", verified=False),
     "HeroMoveSpeed": Offset("HeroMoveSpeed", 0x500C, note="move speed", verified=False),
 

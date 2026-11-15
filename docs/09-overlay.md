@@ -56,15 +56,17 @@ The CLI form blocks until F9, because the render thread dies with the process.
 | Element | Meaning |
 |---------|---------|
 | green box + `YOU hp/maxhp` | you |
-| cyan ring around you | your attack range (550 units) |
+| cyan ring around you | your attack range, read live from the hero (700 on this build) — drawn on the radar while the view matrix is missing |
 | blue box | ally hero |
 | red box | enemy hero |
 | health bar above each box | current health fraction |
-| `name Llevel distance` above each box | identity and range |
+| `name distance` above each box | identity and range |
 | thin line from you to each hero | who is in range of what |
 | top-left status block | pid, base, fps, hero count, matrix/self state |
 
 If the status block says `matrix MISSING` or `self null`, the overlay is running but the offsets are not resolving — see §6.
+
+While `HAVE_VIEW_MATRIX` is false there are no boxes and no lines: the radar is the whole output. It still draws your attack range, because a world radius is just `range * scale` in radar space — no projection needed. The range comes from the hero itself (`HeroAttackRange`), with the constant only as a fallback when the read misses.
 
 ---
 
@@ -77,7 +79,7 @@ screen.x = (width  / 2) * (1 + clipX / clipW)
 screen.y = (height / 2) * (1 - clipY / clipW)
 ```
 
-Any point with `clipW <= 0` is behind the camera and is dropped, as is any non-finite result. The attack-range ring is 64 points around you in world space, each projected and the valid neighbours joined — so the ring curves correctly in perspective instead of being a circle drawn in screen space.
+Any point with `clipW <= 0` is behind the camera and is dropped, as is any non-finite result. In the projection path the attack-range ring is 64 points around you in world space, each projected and the valid neighbours joined — so the ring curves correctly in perspective instead of being a circle drawn in screen space. The radar path has no perspective to respect, so it draws the same radius as one circle at `range / 20` pixels.
 
 ---
 
@@ -92,6 +94,10 @@ Any point with `clipW <= 0` is behind the camera and is dropped, as is any non-f
 | window appears but is black | DIB creation failed — check the log |
 
 The offsets are duplicated in `loader/overlay.cpp` from `scripts/offsets.py`. **Re-distil both together.** The overlay is a fast, dumb renderer; the Python side is where offsets are tracked and verified.
+
+`scripts/verify_offsets.py` runs the loader's exact walk — same team enum, same two position distances, same validation — against the live process through the device, and prints what would be collected. Run it after any patch before trusting the overlay: a working run lists heroes with positions and health, a broken one lists none. It also tries the DOS path and the `GLOBALROOT` device path, so it doubles as a device check.
+
+Two things about this build worth knowing. The object list is a **null-terminated inline array at the global**, so the local hero is an entry in it and must be skipped by address. And entries do not share one stat-block distance: some arrive 0x100 high, so the position is tried at `0x4584` then `0x4484` and a denormal or origin result is treated as a miss.
 
 ---
 

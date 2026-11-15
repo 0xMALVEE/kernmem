@@ -1,0 +1,175 @@
+// ===================== GLOBAL POINTERS (RVA) =====================
+#define oLocalPlayer            0x1DE1EC0
+#define oHeroList               0x1DA8C78
+#define oHerroList              0x1DA8CD0
+#define oGametime               0x1DB6E70
+#define oMissileList            0x1DACA70
+#define oNavGrid                0x1DAC9E0   // 48 8B 05 ? ? ? ? 0F 28 DA
+#define IssueOrderFlag          0x1D0CF28
+#define CastSpellFlag           0x1D0CEC0   // C6 05 ? ? ? ? ? E8 ? ? ? ? 8B 50 ?
+
+// ===================== GAME OBJECT STRUCT =====================
+#define oObjName                0x68        // char* / std::string - object name
+#define oObjNetId               0xCC        // int32
+#define oDead                   0x250       // byte (1=dead, 0=alive)
+#define oObjPosition            0x25C       // vec3 (X, Y+4, Z+8)
+#define TeamID                  0x259       // byte - team ID
+#define oVisibility             0x300       // byte
+#define oMana                   0x358       // float (LeagueObfuscation<float>)
+#define oMaxMana                0x380       // float (LeagueObfuscation<float>)
+#define oObjRadius              0x6F8       // float
+#define oTargetable             0xED0       // byte (1=targetable)
+// --- Health Stats (LeagueObfuscation<float>, 40-byte entries) ---
+// Found via mHP/mMaxHP replication in sub_2E8F10
+#define oHealth                 0x1080      // float - current HP (mHP)
+#define oMaxHealth              0x10A8      // float - max HP (mMaxHP)
+#define oHPMaxPenalty           0x10D0      // float - HP max penalty
+#define oAllShield              0x1120      // float - total shield
+#define oPhysicalShield         0x1148      // float - physical shield
+#define oMagicalShield          0x1170      // float - magical shield
+#define NamePlayer              0x4328      // std::string (SSO)
+
+// ===================== BASIC ATTACK =====================
+// Chain: obj + oBasicAttackBase -> ptr + oBasicAttackOffset1 -> ptr2 + oBasicAttackOffset2 -> attack data
+#define oBasicAttackBase        0x2C68      // 48 8B 81 ? ? ? ? C3 CC 40 56 48 (old: 0x2C90)
+#define oBasicAttackOffset1     0x2C0       // 5B C3 CC 48 8B 81 ? ? ? ? C3
+#define oBasicAttackOffset2     0x70        // 48 8B 41 ? 48 89 02 4C 89 42 08 F0 41 (old: 0x38)
+#define oObjBasicAttackCastCount 0x4CD8     // int32 - incremented per attack (old: 0x4D44)
+
+// ===================== MINION =====================
+#define LaneMinionArray         0x68        // 48 8B 46 ? 8B 4E ? ? ? ? ? 48 3B C2
+#define LaneMinionCount         0x70        // count following array ptr
+#define LaneMinionType          0x4C71      // 0F B6 81 ? ? ? ? 3C ? 74 ? 2C ? 3C ? 76 (old: 0x4CC9)
+// LaneMinionType values: 4=Melee, 5=Ranged, 6=Cannon, 7=Super
+
+// ===================== SPELLBOOK (from GameObject) =====================
+#define oObjSpellBook           0x30E8
+#define oObjOnCastingSpell      0x3120      // SpellBook + 0x38
+
+// ===================== SPELLBOOK INTERNAL =====================
+#define oObjSpellBookSpellSlot  0xAE0       // Q=0, W=1, E=2, R=3, D=4, F=5
+
+// ===================== SPELLSLOT STRUCT =====================
+#define oSpellSlotLevel         0x28        // int32
+#define oSpellSlotSpellInfo     0x128       // ptr to SpellInfo
+
+// ===================== SPELLINFO / SPELLDATA CHAIN =====================
+#define oSpellInfoSpellData     0x60        // SpellInfo -> SpellData
+#define oSpellDataNameHash      0x24        // int32 FNV hash
+#define oSpellDataResource      0x60        // SpellData -> SpellDataResource
+
+// ===================== BUFF MANAGER =====================
+// BuffManager = obj + oObjBuffManager
+// Iterate: for (ptr = *(BuffMgr+0x18); ptr < *(BuffMgr+0x20); ptr += entrySize)
+#define oObjBuffManager         0x2E40      // 48 8D 8B ? ? ? ? 48 8B D7 E8 (old: 0x2E68)
+#define oBuffManagerArray       0x18        // BuffManager -> array start ptr
+#define oBuffManagerArrayEnd    0x20        // BuffManager -> array end ptr
+// BuffInstance struct:
+#define oBuffInstanceType       0x08        // byte - buff type (24,25,26 = valid)
+#define oBuffInstanceScript     0x10        // ptr -> BuffScript
+#define oBuffInstanceStartTime  0x18        // float - start game time
+#define oBuffInstanceEndTime    0x1C        // float - end game time (25000+ = permanent)
+#define oBuffInstanceStackCount 0x38        // int - instance count (1 = active)
+#define oBuffInstanceCount      0x8C        // int - actual stack count
+// BuffScript struct:
+#define oBuffScriptName         0x08        // char* - buff name string
+
+// ===================== HUD & INPUT =====================
+#define oHudInstance            0x1DA8E18   // 48 8B 0D ? ? ? ? 48 85 c9 74 ? 48 8b 49 ? 48 8d
+#define oHudInstanceCamera      0x18
+#define oHudInstanceInput       0x28
+#define oHudMouseVec3           0x34        // F3 0F 10 4F ? 48 8B BC 24 (world mouse pos)
+#define oHudInstanceUserData    0x60
+#define oHudInstanceSpellInfo   0x68        // 48 8B 48 ? 48 85 C9 74 ? 48 8B 51 ? 48 85 D2 75
+
+// ===================== CHAT SYSTEM =====================
+// ChatUI component (accessed from HUD/GUI system):
+//   chatMode = *(byte*)(ChatUI + oChatOpenFlag)
+//   0 = chat closed (normal game input)
+//   1 = team chat open
+//   2 = all chat open
+//   if (chatMode != 0) → block orbwalker keys
+#define oChatOpenFlag           0x288       // byte - chat mode state in ChatUI component
+
+// ===================== FUNCTION ADDRESSES (RVA) =====================
+#define oIssueOrder             0x2A6460
+#define oCastSpellWrapper       0x5C8CE0    // 48 89 48 ? 55 56 57 41 54 41 55 (old: 0x949DE0)
+#define AttackDelay             0x567E10    // E8 ? ? ? ? 33 C0 F3 0F 11 83 (old: 0x540DB0)
+#define oGetAttackWindup        0x567D10    // 48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 60... (old: 0x540CB0)
+#define oGetBoundingRadius      0x28BBF0
+#define oGetCollisionFlags      0x11C94D0
+#define oGetAiManager           0x28A030
+#define GetPing                 0x692C20    // E8 ? ? ? ? 8B F8 39 03 (old: 0x667DB0)
+#define WorldToScreen           0x12759A0   // E8 ? ? ? ? F3 0F 10 44 24 ? F3 41 0F 11 06 (old: 0x13CF720)
+#define isMinion                0x30E250    // E8 ? ? ? ? 48 8B 0B F3 0F 10 41 (old: 0x301120)
+#define isTurret                0x30E0F0    // 40 53 48 83 EC 20 48 8B D9 48 85 C9 74 27 (old: 0x300FC0)
+#define GetFirstObject          0x532EF0    // 48 83 EC ? 48 8B 51 ? 8B 41 ? 48 8D 0C C2 (old: 0x513E40)
+#define GetNextObject           0x533CD0    // 0F B7 42 ? 44 8B 41 (old: 0x5034B0)
+
+// ===================== MISSILE OBJECT =====================
+#define oMissileSpellCastPtr    0x8         // ptr to external SpellCastInfo
+#define oMissileCastInfo        0x2C0       // embedded CastInfo base
+#define oMissileSpellDataInst   0x2C0       // first QWORD = SpellDataInst ptr
+#define oMissileSpellName       0x2E0       // std::string
+#define oMissileMissileName     0x308       // std::string
+#define oMissileStartPos        0x330       // vec3
+#define oMissileEndPos          0x33C       // vec3
+#define oMissileCastEndPos      0x34C       // vec3
+#define oMissileCasterNetId     0x358       // int32
+#define oMissileNetworkId       0x364       // int32
+#define oMissilePosition        0x25C       // vec3 (current, inherited)
+
+// ===================== AI MANAGER =====================
+// AiManager* = *(obj + oObjAiManager)
+// All offsets below are relative to AiManager pointer
+// Fields are XOR-encrypted (use LeagueObfuscation Decrypt<T>)
+#define oObjAiManager               0x4028  // ptr (old: 0x41A8)
+
+// --- AiManager Internal ---
+#define oAiManagerNavPathPtr        0x30    // ptr to NavigationPath (returned by GetAiManager)
+#define oAiManagerRefCount          0x1F0   // int32
+
+// --- Movement Data (relative to AiManager) ---
+// All patterns VERIFIED in binary via byte scan
+#define oAiManagerVelocity          0x318   // float (movement speed scalar)
+#define oAiManagerIsMoving          0x31C   // float/bool
+#define oAiManagerCurrentSegment    0x320   // int32
+
+// --- Path Data ---
+#define oAiManagerStartPath         0x330   // vec3 (X, Y+4, Z+8) - path start position
+#define oAiManagerEndPath           0x33C   // vec3 (X, Y+4, Z+8) - path end position
+#define oAiManagerTargetPosition    0x33C   // = oAiManagerStartPath + 0xC
+
+// --- Navigation ---
+#define oAiManagerNavArray          0x348   // ptr to waypoints vec3 array
+#define oAiManagerSegmentsCount     0x350   // int32
+
+// --- Dash ---
+#define oAiManagerDashSpeed         0x360   // float
+#define oAiManagerIsDashing         0x384   // byte/bool
+
+// --- Server Position ---
+#define oAiManagerServerPos         0x474   // vec3 (X, Y+4, Z+8)
+
+// --- Derived ---
+#define oAiManagerMoveVec3          0x480   // vec3 (oAiManagerStartPath + 0x150)
+#define oAiManagerHasPath           0x350   // SegmentsCount > 0
+
+// ===================== NAV GRID =====================
+// NavGrid* = *(oNavGrid)
+// NavGridManager* = *(NavGrid + 0x8)
+// Used for: IsWall check, IsBush check, pathfinding collision
+#define oNavGridManager             0x8     // ptr to NavGridManager from NavGrid global
+#define oNavGridWidth               0x708   // int32 - grid width (cells)
+#define oNavGridHeight              0x70C   // int32 - grid height (cells)
+#define oNavGridScale               0x714   // float - cell scale factor
+#define oNavGridMinX                0xEC    // float - world min X coordinate
+#define oNavGridMinZ                0xF4    // float - world min Z coordinate
+#define oNavGridData                0x150   // ptr to byte[] - cell flags array
+// IsWall/IsBush check:
+//   cellX = (int)((posX - minX) * scale)
+//   cellZ = (int)((posZ - minZ) * scale)
+//   index = cellZ * width + cellX
+//   flags = *(gridData + index)
+//   isBush = (flags != 0)
+//   isWall = check collision flags via oGetCollisionFlags

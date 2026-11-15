@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdarg>
+#include <fcntl.h>
 #include <io.h>
 
 namespace
@@ -61,7 +62,30 @@ namespace vgb_log
         if (g_file)
             return;
 
-        _wfopen_s(&g_file, path.c_str(), L"w");
+        /*
+         * _wfopen_s opens with no sharing at all, so a running log could not be
+         * read while the process was alive - which is exactly when it matters.
+         * Open a share-read handle and wrap it in a FILE* instead.
+         */
+        HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (handle == INVALID_HANDLE_VALUE)
+            return;
+
+        const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_APPEND);
+
+        if (fd == -1)
+        {
+            CloseHandle(handle);
+            return;
+        }
+
+        g_file = _fdopen(fd, "a");
+
+        if (!g_file)
+            _close(fd);
     }
 
     void CloseFile()
