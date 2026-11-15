@@ -1,0 +1,19 @@
+# Build output
+/build/
+/loader/res/
+
+# Python
+__pycache__/
+*.pyc
+
+# Third-party reference dump (the docs cite the sources, not the bytes)
+research/kdm.zip
+research/kdm_src/
+research/kdmapper/
+
+# IDE / OS
+.vs/
+*.user
+Thumbs.db
+desktop.ini
+*.obj
