@@ -22,3 +22,4 @@ debugger/ui/dist/
 *.user
 Thumbs.db
 desktop.ini
+debugger/vite.log
