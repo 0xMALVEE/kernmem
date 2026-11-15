@@ -29,6 +29,7 @@ flowchart LR
 | 07 | [Production checklist](07-production-checklist.md) | What is done, what is genuinely still missing, and in what order |
 | 08 | [Scripting](08-scripting.md) | How a script reads memory without a handle, and how offsets are managed |
 | 09 | [Overlay](09-overlay.md) | The in-game renderer: what it draws, how projection works, when it draws nothing |
+| 10 | [Crash debugging](10-crash-debugging.md) | Where the crash log is, how to read the bugcheck code, and which faults are already fixed |
 
 ---
 
