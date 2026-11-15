@@ -27,6 +27,8 @@ PROTOCOL_VERSION = 3
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ = 0x1
+FILE_SHARE_WRITE = 0x2
 OPEN_EXISTING = 3
 FILE_ATTRIBUTE_NORMAL = 0x80
 INVALID_HANDLE_VALUE = wt.HANDLE(-1).value
@@ -121,7 +123,8 @@ class Client:
     def open(self):
         self.close()
         self._handle = _kernel32.CreateFileW(
-            self._path, GENERIC_READ | GENERIC_WRITE, 0, None,
+            self._path, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, None,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
         if self._handle == INVALID_HANDLE_VALUE:
             raise VgbError("driver is not loaded (device missing)")

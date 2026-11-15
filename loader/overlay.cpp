@@ -414,22 +414,45 @@ namespace
         return FALSE;
     }
 
+    /*
+     * Re-resolves the target pid and image base.
+     *
+     * The game relaunches for every match, so a pid captured once goes stale - and
+     * the window does not exist yet during the loading screen, which is exactly
+     * when the loader reaches this point. Both are handled by re-resolving here
+     * instead of failing.
+     */
+    bool RefreshTarget()
+    {
+        struct { uint32_t pid; uint32_t pad; wchar_t name[VGB_MAX_NAME_CHARS]; } request = { 0 };
+        struct { uint32_t pid; uint32_t pad; } reply = { 0 };
+        DWORD returned = 0;
+
+        wcsncpy_s(request.name, VGB_MAX_NAME_CHARS, L"League of Legends.exe",
+                  VGB_MAX_NAME_CHARS - 1);
+
+        if (!DeviceIoControl(g_device, IOCTL_VGB_GET_PID_BY_NAME, &request, sizeof(request),
+                             &reply, sizeof(reply), &returned, nullptr) || !reply.pid)
+            return false;
+
+        uint64_t base = 0;
+        struct { uint32_t pid; uint32_t pad; } baseRequest = { reply.pid, 0 };
+
+        if (!DeviceIoControl(g_device, IOCTL_VGB_GET_MAIN_BASE, &baseRequest, sizeof(baseRequest),
+                             &base, sizeof(base), &returned, nullptr) || !base)
+            return false;
+
+        g_pid = reply.pid;
+        g_base = base;
+        return true;
+    }
+
     DWORD WINAPI ThreadProc(void*)
     {
         g_threadId = GetCurrentThreadId();
 
-        FindContext context = { g_pid, nullptr };
-        EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&context));
-
-        HWND game = context.result;
-
-        if (!game)
-        {
-            vgb_log::Error("overlay: game window not found - start a match first");
-            InterlockedExchange(&g_running, 0);
-            return 0;
-        }
-
+        /* The overlay window is created before the game window is known, so the
+         * hotkey and the message pump are alive while waiting. */
         WNDCLASSEXW windowClass = { 0 };
         windowClass.cbSize = sizeof(windowClass);
         windowClass.lpfnWndProc = WndProc;
@@ -456,11 +479,16 @@ namespace
         g_memDc = CreateCompatibleDC(screen);
 
         ULONGLONG last = GetTickCount64();
+        ULONGLONG lastSearch = 0;
         int frames = 0;
+        int searches = 0;
         float fps = 0.0f;
         bool running = true;
+        HWND game = nullptr;
 
-        while (running && InterlockedCompareExchange(&g_running, 1, 1) && IsWindow(game))
+        vgb_log::Info("overlay: waiting for the game window");
+
+        while (running && InterlockedCompareExchange(&g_running, 1, 1))
         {
             MSG message;
 
@@ -479,9 +507,47 @@ namespace
             if (!running)
                 break;
 
+            /* (Re)acquire the game window: absent during loading, and it can be
+             * destroyed between matches. Search once a second and stay alive
+             * indefinitely rather than exiting. */
+            if (!game || !IsWindow(game))
+            {
+                game = nullptr;
+
+                const ULONGLONG now = GetTickCount64();
+
+                if (now - lastSearch >= 1000)
+                {
+                    lastSearch = now;
+                    RefreshTarget();
+
+                    FindContext context = { g_pid, nullptr };
+                    EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&context));
+                    game = context.result;
+
+                    if (game)
+                    {
+                        vgb_log::Good("overlay: game window found");
+                    }
+                    else if (++searches % 10 == 0)
+                    {
+                        vgb_log::Step("overlay: still waiting for the game window");
+                    }
+                }
+
+                if (!game)
+                {
+                    Sleep(200);
+                    continue;
+                }
+            }
+
             RECT rect = { 0 };
             if (!GetClientRect(game, &rect))
-                break;
+            {
+                game = nullptr;
+                continue;
+            }
 
             POINT topLeft = { 0, 0 };
             ClientToScreen(game, &topLeft);
@@ -605,7 +671,8 @@ namespace overlay
         if (!pid)
             return false;
 
-        g_device = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        g_device = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
         if (g_device == INVALID_HANDLE_VALUE)

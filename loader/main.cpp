@@ -120,7 +120,8 @@ namespace
         if (g_device != INVALID_HANDLE_VALUE && g_device)
             return true;
 
-        g_device = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        g_device = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
         return g_device != INVALID_HANDLE_VALUE;

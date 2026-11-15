@@ -55,7 +55,8 @@ namespace vgb
         {
             Close();
 
-            device_ = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            device_ = CreateFileW(VGB_WIN32_NAME, GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
             return device_ != INVALID_HANDLE_VALUE;
