@@ -27,10 +27,12 @@ Full explanation, with diagrams: [`docs/README.md`](docs/README.md).
  driver/    kernel driver — the bypass
  loader/    user-mode mapper, loads vgb.sys through the signed Intel NAL driver
  sdk/       client library (C++ header, Python ctypes binding)
+ scripts/   game reader and offset table (what an actual script is built on)
  client/    example client and smoke test
  dist/      shippable output
  docs/      engineering documentation
  tools/     maintenance utilities
+ research/  primary sources; research/unknowncheats/ holds offset material
 ```
 
 ---
@@ -69,6 +71,22 @@ with vgb.Client() as c:
     pid = c.pid_by_name("League of Legends.exe")
     print(hex(c.main_base(pid)))
 ```
+
+---
+
+## Scripting
+
+A script never calls `ReadProcessMemory` — it goes through the driver, so handle stripping never applies to it.
+
+```python
+from reader import Game
+
+with Game() as game:
+    for hero in game.heroes():
+        print(hero.name, hero.level, hero.health, hero.visible)
+```
+
+Offsets are patch-stamped and refuse to run against a different client patch. See [docs/08-scripting.md](docs/08-scripting.md).
 
 ---
 

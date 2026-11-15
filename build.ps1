@@ -116,7 +116,7 @@ if ($LASTEXITCODE -ne 0) { throw 'example client build failed' }
 Copy-Item (Join-Path $buildDir 'vgb-loader.exe') $distDir -Force
 Copy-Item (Join-Path $buildDir 'vgb-example.exe') $distDir -Force
 
-foreach ($d in @('docs', 'sdk', 'client')) {
+foreach ($d in @('docs', 'sdk', 'client', 'scripts')) {
     $src = Join-Path $root $d
     if (Test-Path $src) {
         $target = Join-Path $distDir $d

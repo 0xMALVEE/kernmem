@@ -10,7 +10,7 @@ Thread of record: `league-of-legends/310587-league-legends-reversal-structs-offs
 ## Layout
 
 ```
-archives/  one archive file per thread — what tempermonkey/post-download.js writes
+posts/     one archive file per thread — what tempermonkey/post-download.js writes
 notes/     distilled offsets per patch, human-written
 session/   cookies, plus a saved copy of the Cloudflare interstitial for reference
 ```
@@ -48,12 +48,12 @@ as `.html` instead.
 
 ## After scraping
 
-Move the downloaded file into `archives/` and rename it to
-`<thread-id>_<YYYY-MM-DD>.<md|html>` so the thread id is preserved even when the
+Move the downloaded file into `posts/` and rename it to
+`<thread-id>_<slug>_<YYYY-MM-DD>.<md|html>` so the thread id survives even when the
 title-derived name is vague:
 
 ```
-archives/310587_2026-11-15.md
+posts/310587_reversal-structs-offsets_2026-11-15.md
 ```
 
 Then distil into `notes/` using `TEMPLATE.md`. For each offset record name, offset,
@@ -104,7 +104,7 @@ fresh authenticated request. They are live session tokens — disposable, not du
 
 ## Pipeline
 
-1. Scrape with the userscript → move into `archives/`, renamed with the thread id.
+1. Scrape with the userscript → move into `posts/`, renamed with the thread id.
 2. Distil into `notes/` with the table in `TEMPLATE.md`.
 3. Update `scripts/offsets.py` from the newest note only, and bump its patch stamp.
 4. Commit archives and notes together so a value always traces back to its post.

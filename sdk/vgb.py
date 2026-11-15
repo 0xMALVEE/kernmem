@@ -32,6 +32,27 @@ FILE_ATTRIBUTE_NORMAL = 0x80
 INVALID_HANDLE_VALUE = wt.HANDLE(-1).value
 
 
+# Win32 signatures must be declared explicitly. Without this, ctypes assumes a
+# 32-bit int return and truncates the 64-bit device handle on x64, which then
+# makes every DeviceIoControl fail with ERROR_INVALID_HANDLE (6).
+_kernel32 = ctypes.windll.kernel32
+
+_kernel32.CreateFileW.restype = wt.HANDLE
+_kernel32.CreateFileW.argtypes = [
+    wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p,
+    wt.DWORD, wt.DWORD, wt.HANDLE,
+]
+
+_kernel32.CloseHandle.restype = wt.BOOL
+_kernel32.CloseHandle.argtypes = [wt.HANDLE]
+
+_kernel32.DeviceIoControl.restype = wt.BOOL
+_kernel32.DeviceIoControl.argtypes = [
+    wt.HANDLE, wt.DWORD, ctypes.c_void_p, wt.DWORD,
+    ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
+]
+
+
 def _ctl(fn):
     return (DEVICE_TYPE << 16) | (FILE_ANY_ACCESS << 14) | (fn << 2) | METHOD_BUFFERED
 
@@ -99,7 +120,7 @@ class Client:
 
     def open(self):
         self.close()
-        self._handle = ctypes.windll.kernel32.CreateFileW(
+        self._handle = _kernel32.CreateFileW(
             self._path, GENERIC_READ | GENERIC_WRITE, 0, None,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
         if self._handle == INVALID_HANDLE_VALUE:
@@ -107,7 +128,7 @@ class Client:
 
     def close(self):
         if self._handle != INVALID_HANDLE_VALUE:
-            ctypes.windll.kernel32.CloseHandle(self._handle)
+            _kernel32.CloseHandle(self._handle)
             self._handle = INVALID_HANDLE_VALUE
 
     def _call(self, code, in_buf, in_size, out_buf, out_size):
@@ -115,13 +136,13 @@ class Client:
             raise VgbError("device is not open")
 
         returned = wt.DWORD(0)
-        ok = ctypes.windll.kernel32.DeviceIoControl(
+        ok = _kernel32.DeviceIoControl(
             self._handle, code, in_buf, in_size, out_buf, out_size,
             ctypes.byref(returned), None)
 
         if not ok:
-            self.last_status = ctypes.get_last_error()
-            raise VgbError(ctypes.get_last_error())
+            self.last_status = _kernel32.GetLastError()
+            raise VgbError(self.last_status)
 
         return returned.value
 
