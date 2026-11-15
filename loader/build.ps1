@@ -54,7 +54,7 @@ if (Test-Path $builtDriver) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $exe = Join-Path $OutDir 'vgb-loader.exe'
 
-$sources = @('main.cpp', 'nal.cpp', 'nt.cpp', 'service.cpp', 'log.cpp', 'pe.cpp', 'mapper.cpp') |
+$sources = @('main.cpp', 'nal.cpp', 'nt.cpp', 'service.cpp', 'log.cpp', 'pe.cpp', 'mapper.cpp', 'overlay.cpp') |
            ForEach-Object { "`"$PSScriptRoot\$_`"" }
 
 $cl = @(
@@ -63,13 +63,13 @@ $cl = @(
     "/Fo`"$OutDir\\`""
 ) + $sources
 
-$objs = @('main.obj', 'nal.obj', 'nt.obj', 'service.obj', 'log.obj', 'pe.obj', 'mapper.obj') |
+$objs = @('main.obj', 'nal.obj', 'nt.obj', 'service.obj', 'log.obj', 'pe.obj', 'mapper.obj', 'overlay.obj') |
         ForEach-Object { "`"$OutDir\$_`"" }
 
 $link = @(
     '/nologo', '/SUBSYSTEM:CONSOLE', '/MACHINE:X64', '/OPT:REF', '/OPT:ICF',
     "/OUT:`"$exe`"", "/LIBPATH:`"$umLib`""
-) + $objs + @('ntdll.lib', 'advapi32.lib')
+) + $objs + @('ntdll.lib', 'advapi32.lib', 'gdi32.lib', 'user32.lib')
 
 $cmd = "call `"$vcvars`" >nul 2>&1 && cl $($cl -join ' ') && link $($link -join ' ')"
 cmd /c $cmd

@@ -28,6 +28,7 @@ flowchart LR
 | 06 | [Troubleshooting](06-troubleshooting.md) | Decision trees for each failure mode |
 | 07 | [Production checklist](07-production-checklist.md) | What is done, what is genuinely still missing, and in what order |
 | 08 | [Scripting](08-scripting.md) | How a script reads memory without a handle, and how offsets are managed |
+| 09 | [Overlay](09-overlay.md) | The in-game renderer: what it draws, how projection works, when it draws nothing |
 
 ---
 

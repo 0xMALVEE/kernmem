@@ -12,6 +12,7 @@
  *   read <pid> <addr> <size>  hex dump
  *   write <pid> <addr> <hex>  write bytes
  *   attach <pid>              register a client pid for handle restore
+ *   overlay <pid>             toggle the in-game overlay (F9 stops it)
  */
 #include <windows.h>
 
@@ -29,6 +30,7 @@
 #include "mapper.h"
 #include "nal.h"
 #include "nt.h"
+#include "overlay.h"
 #include "vgb_shared_loader.h"
 
 #include "res/vgb_sys.h"
@@ -496,6 +498,34 @@ namespace
         vgb_log::Good("client pid %u registered for handle restoration", pid);
         return 0;
     }
+
+    int CmdOverlay(uint32_t pid)
+    {
+        if (overlay::IsRunning())
+        {
+            overlay::Stop();
+            vgb_log::Good("overlay stopped");
+            return 0;
+        }
+
+        if (!OpenDevice())
+        {
+            vgb_log::Error("driver is not loaded - load it first");
+            return 1;
+        }
+
+        if (!pid)
+        {
+            vgb_log::Error("usage: overlay <pid>");
+            return 1;
+        }
+
+        if (!overlay::Start(pid))
+            return 1;
+
+        vgb_log::Good("overlay running over pid %u - F9 stops it", pid);
+        return 0;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -701,6 +731,15 @@ namespace
                       (unsigned long long)base);
     }
 
+    void UiOverlay()
+    {
+        const uint32_t pid = ResolveGame();
+        if (!pid)
+            return;
+
+        CmdOverlay(pid);
+    }
+
     int RunUi()
     {
         wchar_t line[64] = { 0 };
@@ -717,6 +756,7 @@ namespace
             printf("  7) unhide module\n");
             printf("  8) status\n");
             printf("  9) unload driver\n");
+            printf("  o) toggle overlay\n");
             printf("  0) quit\n");
             printf("\n  choice: ");
 
@@ -735,7 +775,15 @@ namespace
             case L'6': UiHide(true); break;
             case L'7': UiHide(false); break;
             case L'8': CmdStatus(); break;
-            case L'9': CmdUnload(); g_sessionPid = 0; break;
+            case L'9':
+                overlay::Stop();
+                CmdUnload();
+                g_sessionPid = 0;
+                break;
+            case L'o':
+            case L'O':
+                UiOverlay();
+                break;
             case L'0': return 0;
             default: vgb_log::Warn("unknown choice"); break;
             }
@@ -804,6 +852,15 @@ int wmain(int argc, wchar_t** argv)
     else if (verb == L"attach" && argc >= 3)
     {
         result = CmdAttach((uint32_t)_wtoi(argv[2]));
+    }
+    else if (verb == L"overlay" && argc >= 3)
+    {
+        result = CmdOverlay((uint32_t)_wtoi(argv[2]));
+
+        /* The render thread dies with this process, so the CLI form has to stay
+         * resident. F9 (handled inside the overlay) ends it. */
+        while (result == 0 && overlay::IsRunning())
+            Sleep(100);
     }
     else
     {

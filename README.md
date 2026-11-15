@@ -59,9 +59,16 @@ Elevation is required to load (it needs `SeLoadDriverPrivilege`), not to use.
 .\dist\vgb-loader.exe status
 .\dist\vgb-loader.exe load --client <your pid>
 .\dist\vgb-loader.exe pid League of Legends.exe
+.\dist\vgb-loader.exe overlay <pid>          # draws in game, F9 stops
 .\dist\vgb-loader.exe read <pid> <address> 64
 .\dist\vgb-loader.exe unload
 ```
+
+### Overlay
+
+`overlay <pid>` puts a click-through window over the game that draws your box, your attack range and every visible enemy with health and distance. It reads through the driver, so nothing is injected and the game is untouched. F9 stops it. It is also the fastest way to see whether the offsets still resolve — the status block reports `matrix` and `self` state.
+
+See [docs/09-overlay.md](docs/09-overlay.md).
 
 ```python
 import vgb

@@ -30,6 +30,7 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 | `client/` example | proof it works end to end | **done** |
 | Elevated-launch helper | `load` is useless without it | **done** (UI shows elevation state) |
 | `status` / `unload` verbs | operator sanity and clean teardown | **done** |
+| `loader/overlay.cpp` | visible proof the chain works; draws self, range, enemies | **done, builds** |
 | Live smoke test | nothing has run in a kernel yet | **outstanding** |
 
 ### Tier 2 — needed to *sell* it
