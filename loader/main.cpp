@@ -15,6 +15,7 @@
  *   overlay <pid>             toggle the in-game overlay (F9 stops it)
  */
 #include <windows.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cctype>
@@ -633,6 +634,173 @@ namespace
         CmdLoad(GetCurrentProcessId());
     }
 
+    /*
+     * Relaunches this executable elevated. Returns true when the caller may carry
+     * on; false means a new elevated instance took over (or UAC was declined) and
+     * this one should exit.
+     */
+    bool SelfElevate(wchar_t* const* argv)
+    {
+        if (Elevated())
+            return true;
+
+        wchar_t path[MAX_PATH] = { 0 };
+
+        if (!GetModuleFileNameW(nullptr, path, MAX_PATH))
+            return false;
+
+        std::wstring arguments;
+
+        for (int i = 1; argv[i]; ++i)
+        {
+            arguments += L"\"";
+            arguments += argv[i];
+            arguments += L"\" ";
+        }
+
+        SHELLEXECUTEINFOW info = { 0 };
+        info.cbSize = sizeof(info);
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = L"runas";
+        info.lpFile = path;
+        info.lpParameters = arguments.empty() ? nullptr : arguments.c_str();
+        info.nShow = SW_SHOWNORMAL;
+
+        if (!ShellExecuteExW(&info))
+        {
+            vgb_log::Error("elevation failed or was declined (0x%08X)", GetLastError());
+            vgb_log::Info("right-click the exe and choose Run as administrator");
+            return false;
+        }
+
+        if (info.hProcess)
+            CloseHandle(info.hProcess);
+
+        return false;
+    }
+
+    bool FileExists(const wchar_t* path)
+    {
+        return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    }
+
+    /* Starts the Riot client if it is installed at a known path. Best effort. */
+    bool LaunchClient()
+    {
+        static const wchar_t* candidates[] =
+        {
+            L"C:\\Riot Games\\Riot Client\\RiotClientServices.exe",
+            L"C:\\Program Files\\Riot Games\\Riot Client\\RiotClientServices.exe",
+        };
+
+        for (const wchar_t* candidate : candidates)
+        {
+            if (!FileExists(candidate))
+                continue;
+
+            if (ShellExecuteW(nullptr, L"open", candidate,
+                              L"--launch-product=league_of_legends --launch-patchline=live",
+                              nullptr, SW_SHOWNORMAL))
+                return true;
+        }
+
+        return false;
+    }
+
+    /*
+     * Waits for the game process. League of Legends.exe only exists inside a match,
+     * so the wait is bounded and reports progress instead of hanging silently.
+     */
+    uint32_t WaitForGame(int seconds)
+    {
+        const int ticks = seconds * 10;
+
+        for (int i = 0; i < ticks; ++i)
+        {
+            const uint32_t pid = LookupPid(L"League of Legends.exe");
+
+            if (pid)
+                return pid;
+
+            if (i % 50 == 0)
+                vgb_log::Step("waiting for the game%s", i ? "" : " - enter a match");
+
+            Sleep(100);
+        }
+
+        return 0;
+    }
+
+    /*
+     * The product path: double-click the exe, everything else happens here.
+     * Elevate, load, find or start the game, attach, draw.
+     */
+    int RunOneClick()
+    {
+        printf("\n  VanguardBypass\n");
+        printf("  ==============================================\n\n");
+
+        if (OpenDevice())
+        {
+            vgb_log::Good("driver already loaded");
+        }
+        else
+        {
+            vgb_log::Step("loading the driver");
+
+            if (CmdLoad(GetCurrentProcessId()) != 0)
+            {
+                vgb_log::Error("driver load failed - see above");
+                Pause();
+                return 1;
+            }
+        }
+
+        uint32_t pid = LookupPid(L"League of Legends.exe");
+
+        if (!pid)
+        {
+            if (LaunchClient())
+                vgb_log::Info("starting the Riot client - log in and enter a match");
+            else
+                vgb_log::Info("open League of Legends and enter a match");
+
+            pid = WaitForGame(300);
+        }
+
+        if (!pid)
+        {
+            vgb_log::Error("no game process found - is League of Legends installed?");
+            Pause();
+            return 1;
+        }
+
+        g_sessionPid = pid;
+        vgb_log::Good("game pid %u", pid);
+
+        /* Lets this process use plain ReadProcessMemory too. */
+        CmdAttach(GetCurrentProcessId());
+
+        if (!overlay::Start(pid))
+        {
+            vgb_log::Error("the overlay did not start");
+            Pause();
+            return 1;
+        }
+
+        vgb_log::Good("overlay running");
+        vgb_log::Info("F9 stops it. Close this window when done.");
+        vgb_log::Info("nothing is drawn until you are in a match.");
+
+        /* Keep the process - and with it the render thread - alive. */
+        while (overlay::IsRunning())
+            Sleep(200);
+
+        vgb_log::Info("overlay stopped");
+        Pause();
+        return 0;
+    }
+
     void UiAttach()
     {
         const uint32_t pid = ResolveGame();
@@ -797,8 +965,20 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc < 2 || std::wstring(argv[1]) == L"ui")
+    /* No arguments at all is the product: one click, everything automatic. */
+    if (argc < 2)
     {
+        if (!SelfElevate(argv))
+            return 0;
+
+        return RunOneClick();
+    }
+
+    if (std::wstring(argv[1]) == L"ui")
+    {
+        if (!SelfElevate(argv))
+            return 0;
+
         return RunUi();
     }
 
@@ -808,6 +988,13 @@ int wmain(int argc, wchar_t** argv)
     if (verb == L"status")
     {
         result = CmdStatus();
+    }
+    else if (verb == L"auto")
+    {
+        if (SelfElevate(argv))
+            result = RunOneClick();
+        else
+            result = 0;
     }
     else if (verb == L"load")
     {

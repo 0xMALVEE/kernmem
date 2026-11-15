@@ -62,6 +62,7 @@ static ULONG          g_ClientPid = 0;
 static PVOID          g_ObRegistration = NULL;
 static BOOLEAN        g_ObRegistered = FALSE;
 static KSPIN_LOCK     g_HiddenLock;
+static volatile LONG  g_Unloading = 0;
 static VGB_HIDDEN_ENTRY g_Hidden[VGB_MAX_HIDDEN];
 
 /* ------------------------------------------------------------------ */
@@ -493,6 +494,34 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
     if (!base)
         return STATUS_INVALID_PARAMETER;
 
+    /*
+     * Balance the hidden record against repeats. A second hide would run
+     * RemoveEntryList on entries that are already self-linked (harmless) but
+     * then add a second record, after which unhide inserts the same entry into
+     * three lists twice - list corruption, then a bugcheck on the next walk.
+     */
+    {
+        KIRQL irql;
+        ULONG i;
+        BOOLEAN known = FALSE;
+
+        KeAcquireSpinLock(&g_HiddenLock, &irql);
+        for (i = 0; i < VGB_MAX_HIDDEN; ++i)
+        {
+            if (g_Hidden[i].Entry && g_Hidden[i].DllBase == (void*)base && g_Hidden[i].Pid == pid)
+            {
+                known = TRUE;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_HiddenLock, irql);
+
+        if (hide && known)
+            return STATUS_SUCCESS;
+        if (!hide && !known)
+            return STATUS_NOT_FOUND;
+    }
+
     proc = VgbReferenceProcess(pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
@@ -655,6 +684,16 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
 
     UNREFERENCED_PARAMETER(device);
 
+    /* The loader unmaps and frees this image right after DriverUnload returns;
+     * an IRP arriving after that would dispatch into freed pool. */
+    if (InterlockedCompareExchange(&g_Unloading, 1, 1) != 0)
+    {
+        irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return STATUS_DELETE_PENDING;
+    }
+
     stack = IoGetCurrentIrpStackLocation(irp);
     code = stack->Parameters.DeviceIoControl.IoControlCode;
     inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
@@ -792,9 +831,30 @@ static NTSTATUS VgbCreateClose(PDEVICE_OBJECT device, PIRP irp)
     return STATUS_SUCCESS;
 }
 
+/*
+ * Default handler for every major function we do not implement.
+ *
+ * This is the single biggest crash risk in the whole driver. NtLoadDriver fills
+ * the unset MajorFunction slots with IopInvalidDeviceRequest, but a manually
+ * mapped image never goes through it, so those slots stay NULL. Windows still
+ * sends IRP_MJ_CLEANUP when the last handle closes, IRP_MJ_SHUTDOWN on power
+ * events and IRP_MJ_SYSTEM_CONTROL for WMI - each of which would dispatch to
+ * address 0 and bugcheck with 0x8E/0x7E.
+ */
+static NTSTATUS VgbDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
+{
+    UNREFERENCED_PARAMETER(device);
+    irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
 static VOID VgbUnload(PDRIVER_OBJECT driver)
 {
     UNICODE_STRING symlink;
+
+    InterlockedExchange(&g_Unloading, 1);
 
     if (g_ObRegistered && g_ObRegistration)
     {
@@ -831,7 +891,13 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     KeInitializeSpinLock(&g_HiddenLock);
 
     driver->DriverUnload = VgbUnload;
+
+    /* Every slot gets a real handler first; see VgbDefaultDispatch. */
+    for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; ++i)
+        driver->MajorFunction[i] = VgbDefaultDispatch;
+
     driver->MajorFunction[IRP_MJ_CREATE] = VgbCreateClose;
+    driver->MajorFunction[IRP_MJ_CLEANUP] = VgbCreateClose;
     driver->MajorFunction[IRP_MJ_CLOSE] = VgbCreateClose;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = VgbDispatch;
 

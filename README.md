@@ -53,7 +53,9 @@ The build fails if the driver imports anything other than `ntoskrnl.exe`, has no
 
 ## Use
 
-Elevation is required to load (it needs `SeLoadDriverPrivilege`), not to use.
+**Double-click `dist\vgb-loader.exe`. That is it.** It asks for admin once, loads the driver, starts the Riot client if needed, waits for you to enter a match, attaches, and draws. Nothing else is required and Python is optional.
+
+Manual control, if you want it:
 
 ```powershell
 .\dist\vgb-loader.exe status
