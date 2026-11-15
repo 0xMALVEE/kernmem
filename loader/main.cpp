@@ -3,6 +3,7 @@
  *
  * Verbs:
  *   status                    device and version probe
+ *   kbase                     resolve the kernel base without loading
  *   load [--client <pid>]     map vgb.sys through the NAL driver
  *   unload                    unmap the driver and release NAL
  *   pid <image name>          resolve a pid by image name
@@ -195,6 +196,95 @@ namespace
     uint64_t ParseAddress(const wchar_t* text)
     {
         return _wcstoui64(text, nullptr, 0);
+    }
+
+    /*
+     * SEH verification of a kernel base.
+     *
+     * Kept in its own function with no C++ objects: MSVC refuses `__try` in a
+     * function that needs object unwinding (C2712), and the caller holds a
+     * std::wstring.
+     */
+    void VerifyKernelBase(uint64_t base)
+    {
+        __try
+        {
+            const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            {
+                vgb_log::Warn("base does not start with MZ (0x%04X)", dos->e_magic);
+                return;
+            }
+
+            const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+                base + dos->e_lfanew);
+
+            if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+            {
+                vgb_log::Warn("base has no NT signature");
+                return;
+            }
+
+            vgb_log::Good("kernel PE header valid, image size 0x%X",
+                          ntHeaders->OptionalHeader.SizeOfImage);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            /* User mode cannot read supervisor pages, so a fault here is expected
+             * and says nothing about whether the base is correct. */
+            vgb_log::Warn("base not directly readable from user mode (0x%08X) - expected",
+                          GetExceptionCode());
+        }
+    }
+
+    /*
+     * Resolves and prints the kernel image base, then tears the mapping host down
+     * again. Needs elevation because the scan route reads kernel memory.
+     */
+    int CmdKernelBase()
+    {
+        if (!Elevated())
+        {
+            vgb_log::Error("elevated shell required - the scan reads kernel memory");
+            return 1;
+        }
+
+        /*
+         * The scan route reads through the vulnerable driver, so it has to be up.
+         * `kbase` therefore loads it, resolves, and unloads again - proving the
+         * resolver without mapping our own driver at all.
+         */
+        const bool alreadyUp = nal::IsRunning();
+        const std::wstring statePath = nt::GetFullTempPath() + L"\\vgb-nal.state";
+        nal::SetStatePath(statePath);
+
+        if (!alreadyUp && !nal::Load(nullptr))
+        {
+            vgb_log::Error("could not bring up the mapping host");
+            return 1;
+        }
+
+        const uint64_t base = nal::ResolveKernelBase();
+
+        if (!alreadyUp)
+        {
+            nal::Unload();
+            vgb_log::Line("*", "mapping host released");
+        }
+
+        if (!base)
+        {
+            vgb_log::Error("kernel base unresolved on every route");
+            return 1;
+        }
+
+        vgb_log::Good("kernel base 0x%llX", (unsigned long long)base);
+
+        /* Prove the base is really an image, not a stray MZ in some other page. */
+        VerifyKernelBase(base);
+
+        return 0;
     }
 
     int CmdStatus()
@@ -988,6 +1078,10 @@ int wmain(int argc, wchar_t** argv)
     if (verb == L"status")
     {
         result = CmdStatus();
+    }
+    else if (verb == L"kbase")
+    {
+        result = CmdKernelBase();
     }
     else if (verb == L"auto")
     {

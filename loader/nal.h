@@ -49,6 +49,10 @@ namespace nal
     uint64_t AllocatePool(uint64_t size);
     bool     FreePool(uint64_t address);
 
+    /* Resolves the kernel image base, trying the module APIs then an IDT-anchored
+     * scan. Requires the device to be open for the scan route. */
+    uint64_t ResolveKernelBase();
+
     uint64_t GetKernelModuleBase(const char* moduleName);
     uint64_t GetKernelModuleExport(uint64_t moduleBase, const std::string& functionName);
 

@@ -102,9 +102,15 @@ namespace nt
         }
 
         /*
-         * Independent route to the same answer: EnumDeviceDrivers returns loaded
-         * driver bases and the kernel is entry 0. Used when the native query is
-         * refused, which hardened builds can do even for a normal user.
+         * Primary route: EnumDeviceDrivers returns real loaded driver bases.
+         *
+         * It is primary because SystemModuleInformation is unusable on the target
+         * machine - it lists every module with the right name but a zeroed
+         * ImageBase, so matching succeeds and yields 0x0.
+         *
+         * The whole list is scanned, not the first few entries: ordering is not
+         * guaranteed across builds, and an arbitrary cap silently missed the
+         * kernel on a real run.
          */
         uint64_t KernelBaseViaPsapi()
         {
@@ -112,11 +118,29 @@ namespace nt
             DWORD needed = 0;
 
             if (!EnumDeviceDrivers(drivers, sizeof(drivers), &needed) || !needed)
+            {
+                vgb_log::Error("EnumDeviceDrivers failed (0x%08X, needed=%lu)",
+                               GetLastError(), needed);
                 return 0;
+            }
 
             const size_t count = needed / sizeof(LPVOID);
+            const size_t limit = count < _countof(drivers) ? count : _countof(drivers);
 
-            for (size_t i = 0; i < count && i < 8 && i < _countof(drivers); ++i)
+            vgb_log::Line("*", "psapi: count=%zu first=0x%llX", count,
+                          (unsigned long long)reinterpret_cast<uint64_t>(drivers[0]));
+
+            for (size_t i = 0; i < limit && i < 6; ++i)
+            {
+                wchar_t probe[MAX_PATH] = { 0 };
+
+                if (GetDeviceDriverFileNameW(drivers[i], probe, MAX_PATH))
+                    vgb_log::Line("*", "  p[%zu] 0x%llX %ls", i,
+                                  (unsigned long long)reinterpret_cast<uint64_t>(drivers[i]),
+                                  probe);
+            }
+
+            for (size_t i = 0; i < limit; ++i)
             {
                 wchar_t path[MAX_PATH] = { 0 };
 
@@ -178,8 +202,25 @@ namespace nt
 
     uint64_t GetKernelBase()
     {
-        /* ntkrnlmp.exe is the real x64 name; the rest are historical, kept so a
-         * different build cannot silently regress this to zero again. */
+        /*
+         * EnumDeviceDrivers is the PRIMARY source, not a fallback.
+         *
+         * Measured on the target machine: SystemModuleInformation returns all 215
+         * modules with correct names but a zeroed ImageBase on every entry, so
+         * matching succeeds and then yields 0x0. EnumDeviceDrivers returns real
+         * addresses for the same list. The module query stays as a secondary route
+         * because other builds are the other way round.
+         */
+        const uint64_t viaPsapi = KernelBaseViaPsapi();
+
+        if (PlausibleKernelBase(viaPsapi))
+        {
+            vgb_log::Step("kernel base from EnumDeviceDrivers (0x%llX)",
+                          (unsigned long long)viaPsapi);
+            return viaPsapi;
+        }
+
+        /* ntkrnlmp.exe is the real x64 name; the rest are historical. */
         static const char* names[] =
         {
             "ntoskrnl.exe",
@@ -192,13 +233,8 @@ namespace nt
 
         if (!modules)
         {
-            const uint64_t fallback = KernelBaseViaPsapi();
-
-            if (fallback)
-                vgb_log::Step("kernel base taken from EnumDeviceDrivers (0x%llX)",
-                              (unsigned long long)fallback);
-
-            return fallback;
+            vgb_log::Error("both kernel-base routes failed");
+            return 0;
         }
 
         uint64_t result = 0;
@@ -224,7 +260,16 @@ namespace nt
 
         VirtualFree(modules, 0, MEM_RELEASE);
 
-        return PlausibleKernelBase(result) ? result : 0;
+        if (!PlausibleKernelBase(result))
+        {
+            vgb_log::Error("module-list base 0x%llX failed the kernel-range test",
+                           (unsigned long long)result);
+            return 0;
+        }
+
+        vgb_log::Step("kernel base from SystemModuleInformation (0x%llX)",
+                      (unsigned long long)result);
+        return result;
     }
 
     BOOLEAN bDataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)

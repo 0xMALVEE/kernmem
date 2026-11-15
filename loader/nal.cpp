@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+
+#include <intrin.h>
 #include <fstream>
 #include <vector>
 
@@ -125,14 +127,82 @@ namespace nal
     HANDLE  hDevice = INVALID_HANDLE_VALUE;
     ULONG64 ntoskrnlBase = 0;
 
-    /* Resolves the kernel base on demand. Cheap enough to call defensively, so a
-     * base that failed to resolve during Load cannot brick every later call. */
+    /*
+     * Third route, and the only one that does not depend on a masked API.
+     *
+     * On the target machine both SystemModuleInformation and EnumDeviceDrivers
+     * report every kernel base as 0x0. The IDT is still a real kernel address, and
+     * it lives inside ntoskrnl - so the image base is found by scanning outwards
+     * from the IDT for an MZ/PE header. The scan is bounded and reads through the
+     * driver, so unmapped pages simply fail and are skipped.
+     */
+    static uint64_t KernelBaseFromIdt()
+    {
+        struct { unsigned short limit; unsigned long long base; } idtr = { 0 };
+
+        __sidt(&idtr);
+
+        if (idtr.base < 0xFFFF800000000000ULL)
+            return 0;
+
+        vgb_log::Line("*", "idt base 0x%llX", idtr.base);
+
+        const uint64_t anchor = idtr.base & ~0xFFFULL;
+        uint8_t page[0x1000];
+
+        for (int direction = 0; direction < 2; ++direction)
+        {
+            /* The IDT lives inside ntoskrnl and the image is at most ~16 MB, so
+             * the base is BELOW it. Downward is the useful direction; upward is
+             * only a shallow sanity sweep. Scanning 64 MB both ways costs ~65k
+             * IOCTLs, which is seconds of stall for no benefit. */
+            const uint64_t span = direction == 0 ? 0x1000000ULL : 0x100000ULL;
+
+            for (uint64_t offset = 0; offset <= span; offset += 0x1000)
+            {
+                const uint64_t candidate = direction == 0 ? anchor - offset : anchor + offset;
+
+                if (candidate < 0xFFFF800000000000ULL)
+                    continue;
+
+                if (!ReadMemory(candidate, page, sizeof(page)))
+                    continue;
+
+                if (page[0] != 'M' || page[1] != 'Z')
+                    continue;
+
+                const int32_t lfanew = *reinterpret_cast<int32_t*>(page + 0x3C);
+
+                if (lfanew <= 0 || lfanew > 0x400)
+                    continue;
+
+                uint8_t pePage[0x200];
+
+                if (!ReadMemory(candidate + (uint64_t)lfanew, pePage, sizeof(pePage)))
+                    continue;
+
+                if (pePage[0] != 'P' || pePage[1] != 'E' || pePage[2] != 0 || pePage[3] != 0)
+                    continue;
+
+                vgb_log::Step("kernel image found by IDT scan at 0x%llX",
+                              (unsigned long long)candidate);
+                return candidate;
+            }
+        }
+
+        return 0;
+    }
+
+    /* Resolves the kernel base on demand, trying every route in cost order. */
     static bool EnsureKernelBase()
     {
         if (ntoskrnlBase)
             return true;
 
         ntoskrnlBase = nt::GetKernelBase();
+
+        if (!ntoskrnlBase && hDevice != INVALID_HANDLE_VALUE)
+            ntoskrnlBase = KernelBaseFromIdt();
 
         if (!ntoskrnlBase)
             vgb_log::Error("kernel base unresolved - export resolution is impossible");
@@ -143,6 +213,19 @@ namespace nal
     void SetStatePath(const std::wstring& path)
     {
         g_statePath = path;
+    }
+
+    uint64_t ResolveKernelBase()
+    {
+        if (ntoskrnlBase)
+            return ntoskrnlBase;
+
+        ntoskrnlBase = nt::GetKernelBase();
+
+        if (!ntoskrnlBase && hDevice != INVALID_HANDLE_VALUE)
+            ntoskrnlBase = KernelBaseFromIdt();
+
+        return ntoskrnlBase;
     }
 
     /*
@@ -261,13 +344,17 @@ namespace nal
 
         ntoskrnlBase = nt::GetKernelBase();
 
+        /* Both module APIs report 0x0 here, so fall back to the IDT scan. */
+        if (!ntoskrnlBase)
+            ntoskrnlBase = KernelBaseFromIdt();
+
         if (!ntoskrnlBase)
         {
             /* Fatal, not a warning: with no kernel base there is no export
              * resolution, so mapping cannot proceed. Saying so here stops it
              * surfacing later as a bare "allocation failed". */
             vgb_log::Error("could not resolve the kernel image base");
-            vgb_log::Info("SystemModuleInformation was unreadable - is this a normal Windows x64 install?");
+            vgb_log::Info("both kernel-base routes failed - run `vgb-loader.exe kbase` for detail");
 
             CloseHandle(hDevice);
             hDevice = INVALID_HANDLE_VALUE;
