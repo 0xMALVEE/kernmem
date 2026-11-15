@@ -618,6 +618,40 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
 /* IOCTL dispatch                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * MmCopyVirtualMemory decides which side of the copy is user memory by
+ * comparing against MmHighestUserAddress. An address above it is treated as
+ * kernel memory and copied with a plain memcpy - no user probe, no fault
+ * handling. A bogus pointer in that range therefore does not come back as
+ * STATUS_PARTIAL_COPY, it bugchecks 0x50 inside nt!memcpy.
+ *
+ * Every pointer the overlay reads comes out of game data, so one stale object
+ * field is enough to reach that path with garbage such as 0xfffffff8000001ec.
+ * Screen the range ourselves first and refuse it while a status is still
+ * possible.
+ */
+static BOOLEAN VgbAddressCopyable(ULONG_PTR address, ULONG size)
+{
+    ULONG_PTR last;
+
+    if (!address)
+        return FALSE;
+
+    last = address + size - 1;
+
+    /* Wrapped the address space. */
+    if (last < address)
+        return FALSE;
+
+    if (address <= (ULONG_PTR)MmHighestUserAddress)
+        return TRUE;
+
+    if (!MmIsAddressValid((PVOID)address) || !MmIsAddressValid((PVOID)last))
+        return FALSE;
+
+    return TRUE;
+}
+
 static NTSTATUS VgbHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PULONG_PTR written)
 {
     VGB_MEM_REQ* req = (VGB_MEM_REQ*)in;
@@ -635,6 +669,9 @@ static NTSTATUS VgbHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PU
         size = outLen;
     if (!size)
         return STATUS_INVALID_PARAMETER;
+
+    if (!VgbAddressCopyable((ULONG_PTR)req->Address, size))
+        return STATUS_PARTIAL_COPY;
 
     proc = VgbReferenceProcess(req->Pid);
     if (!proc)
@@ -676,6 +713,9 @@ static NTSTATUS VgbHandleWrite(PVOID in, ULONG inLen, PULONG_PTR written)
         return STATUS_BUFFER_TOO_SMALL;
 
     data = (PVOID)((PUCHAR)in + sizeof(VGB_MEM_REQ));
+
+    if (!VgbAddressCopyable((ULONG_PTR)req->Address, size))
+        return STATUS_PARTIAL_COPY;
 
     proc = VgbReferenceProcess(req->Pid);
     if (!proc)

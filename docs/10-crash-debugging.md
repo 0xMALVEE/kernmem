@@ -14,7 +14,7 @@ Every run of `vgb-loader.exe` writes a line-flushed log to:
 
 The path is printed as the first line of output, so you never have to hunt for it.
 
-**Every line is `fflush`ed immediately.** That is the whole point: when the machine bugchecks, the buffer is lost, but the lines already written are on disk. The last line in the file is the step that was executing.
+**Every line is `fflush`ed and then `FlushFileBuffers`ed immediately.** That is the whole point: when the machine bugchecks, the CRT buffer and the OS cache are both lost, so only a forced disk write keeps the lines that were already produced. The last line in the file is the step that was executing. A log that is the right size but all zero bytes means the flush did not reach the disk.
 
 ### What gets logged
 
@@ -84,6 +84,8 @@ Each of these was a real crash cause found by reading, and each is closed:
 | Image freed the instant `DriverUnload` returned | in-flight IRPs still executed inside it |
 | Double hide of the same module | second record, then a triple insert — list corruption |
 | Copy handlers unguarded | a bad address could raise in kernel; now SEH-wrapped |
+| Garbage address above `MmHighestUserAddress` | `MmCopyVirtualMemory` treats it as kernel memory and plain-copies it with no fault handling, so a stale game pointer bugchecked `0x50` in `nt!memcpy`; the range is now screened with `MmIsAddressValid` and refused as `STATUS_PARTIAL_COPY` |
+| `OBJECT_HEADER.TypeIndex` written raw | the kernel decodes it as `stored ^ ObHeaderCookie ^ (Header >> 8)`, so a raw index resolved to a NULL object type and the first reference bugchecked `0x18`; the loader now recovers the cookie from a live object header and stores the encoded byte |
 
 ---
 
