@@ -10,6 +10,10 @@
 
 # Python
 __pycache__/
+
+# Debugger
+node_modules/
+debugger/ui/dist/
 *.pyc
 *.obj
 

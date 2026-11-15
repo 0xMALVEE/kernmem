@@ -1,0 +1,174 @@
+html, body, #root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: #06080b;
+  color: #c7d2df;
+  font: 13px/1.45 -apple-system, 'Segoe UI', sans-serif;
+}
+
+.mono {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.dim {
+  color: #61708a;
+}
+
+.bad {
+  color: #ff6b6b;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #16202d;
+  background: #0a0e14;
+  flex-wrap: wrap;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pill.ok {
+  background: #10331d;
+  color: #6fe39a;
+}
+
+.pill.warn {
+  background: #33280f;
+  color: #e8bd63;
+}
+
+.pill.bad {
+  background: #331414;
+  color: #ff8080;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) 1fr;
+  gap: 12px;
+  padding: 12px;
+  overflow: auto;
+  align-items: start;
+}
+
+.panel {
+  border: 1px solid #16202d;
+  background: #0a0e14;
+  padding: 10px;
+}
+
+h2 {
+  margin: 14px 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #7f92ad;
+}
+
+h2:first-child {
+  margin-top: 0;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 2px 8px;
+  margin: 0;
+}
+
+.kv dt {
+  color: #6d7f99;
+}
+
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.table th {
+  text-align: left;
+  color: #6d7f99;
+  font-weight: 500;
+  border-bottom: 1px solid #16202d;
+  padding: 2px 4px;
+}
+
+.table td {
+  padding: 2px 4px;
+  border-bottom: 1px solid #0f1620;
+  overflow-wrap: anywhere;
+}
+
+.table tr.me td {
+  color: #8fe0a8;
+}
+
+.btn {
+  margin-top: 10px;
+  padding: 6px 10px;
+  background: #14202e;
+  color: #b9d4ef;
+  border: 1px solid #23384f;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.view {
+  margin: 0;
+  border: 1px solid #16202d;
+  background: #0a0e14;
+  padding: 6px;
+}
+
+.view figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 4px;
+  font-size: 11px;
+}
+
+.screen {
+  display: block;
+}
