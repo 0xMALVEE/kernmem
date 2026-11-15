@@ -411,8 +411,27 @@ namespace
 
         nal::SetStatePath(nt::GetFullTempPath() + L"\\vgb-nal.state");
 
+        /*
+         * Ask the driver for its own mapping first. The state file is only a
+         * fallback: when it was missing, unmap was skipped entirely and the image
+         * leaked in pool for good (the device kept answering after "unload").
+         */
         MAP_STATE state = { 0 };
-        if (LoadMapState(&state))
+        VGB_INFO info = { 0 };
+
+        if (Ioctl(IOCTL_VGB_GET_INFO, nullptr, 0, &info, sizeof(info), nullptr))
+        {
+            state.imageBase = info.ImageBase;
+            state.imageSize = info.ImageSize;
+            state.driverObject = info.DriverObject;
+        }
+
+        CloseDevice();
+
+        if (!state.imageBase)
+            LoadMapState(&state);
+
+        if (state.imageBase)
         {
             /* Unmap reads kernel memory, so the host has to be open first. Without
              * this the reads failed, DriverUnload was skipped, and the image was
@@ -437,7 +456,7 @@ namespace
         }
         else
         {
-            vgb_log::Warn("no mapping state found - skipping unmap");
+            vgb_log::Warn("driver is not mapped - skipping unmap");
         }
         nal::Unload();
         vgb_log::Good("mapping host released");

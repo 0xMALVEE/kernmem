@@ -65,6 +65,12 @@ static KSPIN_LOCK     g_HiddenLock;
 static volatile LONG  g_Unloading = 0;
 static VGB_HIDDEN_ENTRY g_Hidden[VGB_MAX_HIDDEN];
 
+/* Own mapping, reported to the loader so unload can free it without a state
+ * file. Populated from the init block at entry. */
+static unsigned __int64 g_ImageBase = 0;
+static unsigned __int64 g_ImageSize = 0;
+static PVOID            g_DriverObject = NULL;
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -733,6 +739,25 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
+    else if (code == IOCTL_VGB_GET_INFO)
+    {
+        /* Teardown reads this: the loader may have lost its state file, and the
+         * only reliable record of the mapping lives here. */
+        if (outLen >= sizeof(VGB_INFO))
+        {
+            VGB_INFO* info = (VGB_INFO*)out;
+
+            info->ImageBase = g_ImageBase;
+            info->ImageSize = g_ImageSize;
+            info->DriverObject = (unsigned __int64)g_DriverObject;
+            written = sizeof(VGB_INFO);
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+    }
     else if (code == IOCTL_VGB_SET_CLIENT_PID)
     {
         if (inLen >= sizeof(VGB_PID_REQ))
@@ -954,6 +979,10 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
 
                 driver->DriverStart = (void*)params->ImageBase;
                 driver->DriverSize = (ULONG)params->ImageSize;
+
+                g_ImageBase = params->ImageBase;
+                g_ImageSize = params->ImageSize;
+                g_DriverObject = driver;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)

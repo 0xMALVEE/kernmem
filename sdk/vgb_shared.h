@@ -20,7 +20,7 @@
 
 #define VGB_DEVICE_TYPE      0x8000
 
-#define VGB_PROTOCOL_VERSION 3
+#define VGB_PROTOCOL_VERSION 4
 
 #define VGB_INIT_MAGIC       0x42475631
 
@@ -40,6 +40,7 @@
 #define IOCTL_VGB_HIDE_MODULE      VGB_IOCTL(0x807)
 #define IOCTL_VGB_UNHIDE_MODULE    VGB_IOCTL(0x808)
 #define IOCTL_VGB_GET_MAIN_BASE    VGB_IOCTL(0x809)
+#define IOCTL_VGB_GET_INFO         VGB_IOCTL(0x80A)
 
 typedef struct _VGB_INIT_PARAMS
 {
@@ -48,6 +49,15 @@ typedef struct _VGB_INIT_PARAMS
     unsigned __int64 ImageBase;
     unsigned __int64 ImageSize;
 } VGB_INIT_PARAMS;
+
+/* What the driver reports about its own mapping, so teardown needs no state
+ * file on disk. Without this a lost file meant the image was never freed. */
+typedef struct _VGB_INFO
+{
+    unsigned __int64 ImageBase;
+    unsigned __int64 ImageSize;
+    unsigned __int64 DriverObject;
+} VGB_INFO;
 
 typedef struct _VGB_MEM_REQ
 {
