@@ -4,30 +4,61 @@ Drop folder for the offset/struct thread and anything else pulled from UnknownCh
 This is **source material**, not code. It feeds `scripts/offsets.py`.
 
 Thread of record: `league-of-legends/310587-league-legends-reversal-structs-offsets`
-(the thread is paginated and long — the tail is the only part that is current).
 
 ---
 
 ## Layout
 
 ```
-pages/     raw saved HTML, one file per page
+archives/  one archive file per thread — what tempermonkey/post-download.js writes
 notes/     distilled offsets per patch, human-written
-session/   cookies used for the authenticated scrape
+session/   cookies, plus a saved copy of the Cloudflare interstitial for reference
 ```
 
-## Naming — pages
+## How the archiver actually behaves
+
+`tempermonkey/post-download.js` (v2.1) is a userscript, run from the browser while
+logged in. It is not a per-page downloader:
+
+- It fetches a **page range** with a worker pool (1–8 workers, default 3) and a
+delay between requests (default 1200 ms).
+- It writes **one combined file for the whole thread**, not one file per page.
+- Format is `.md` (default) or `.html`, chosen in the panel.
+- The filename is derived from the thread title —
+`threadTitle.replace(/[^\w\-. ]+/g, '_').slice(0, 80)` — e.g.
+`League_of_Legends_Reversal_Structs_Offsets.md`.
+- The output header records `Pages saved: <lo>–<hi>` and, if any page failed,
+a `Missing pages (n): …` line. Check that line before trusting an archive.
+- Resume is an **IndexedDB** cache (`ucarch` / `pages`, keyed per thread) with a
+reuse prompt and a clear button. It is per browser profile, not per file.
+- Buttons: go / stop / save / clear. `stop` aborts mid-run and still offers save.
+
+### Caveats worth knowing before you rely on an archive
+
+| Caveat | Consequence |
+|--------|-------------|
+| Filename comes from the title | Two threads with similar titles collide and overwrite silently |
+| Re-running a range overwrites | The previous archive is replaced, not appended |
+| IndexedDB resume is profile-bound | Clearing site data loses the resume cache |
+| `.md` strips most formatting | Quotes, code blocks and links survive; tables and nested markup do not |
+| Failures are recorded, not retried forever | Four attempts per page, then the page lands in `Missing pages` |
+
+If you need a faithful copy of a post with tables or formatting, archive that thread
+as `.html` instead.
+
+## After scraping
+
+Move the downloaded file into `archives/` and rename it to
+`<thread-id>_<YYYY-MM-DD>.<md|html>` so the thread id is preserved even when the
+title-derived name is vague:
 
 ```
-<thread-id>_p<NN>_<YYYY-MM-DD>.html
-
-310587_p01_2026-11-15.html
-310587_p42_2026-11-15.html
+archives/310587_2026-11-15.md
 ```
 
-Zero-pad the page number so lexical sort is page order. Keep the thread id first so
-two threads never collide. Never rename to something descriptive only — the id is what
-makes a page traceable back to its post.
+Then distil into `notes/` using `TEMPLATE.md`. For each offset record name, offset,
+module, **chain**, source post and confidence. An offset with no chain and no
+confidence is a rumour.
 
 ## Naming — notes
 
@@ -37,65 +68,43 @@ makes a page traceable back to its post.
 2026-11-15_14.23.md
 ```
 
-One file per patch. **Offsets drift every patch**, so a note without a patch number is
+One file per patch. Offsets drift every patch, so a note without a patch number is
 almost worthless.
-
----
-
-## What is worth saving
-
-Save the whole page. Do not cherry-pick while scraping — you cannot tell which post
-matters until you have read it, and the surrounding replies are what tell you whether an
-offset was confirmed or corrected two posts later.
-
-When distilling into `notes/`, record for each offset:
-
-| Field | Why |
-|-------|-----|
-| name | what it is (`LocalPlayer`, `HeroList`, `Camera`) |
-| offset | the value, as given |
-| module | which module it is relative to — usually `League of Legends.exe` |
-| chain | the dereference path, not just the final offset |
-| post | link or post number it came from |
-| confidence | confirmed / unconfirmed / disputed |
-
-An offset with no chain and no confidence is a rumour.
-
----
 
 ## Reality check on this thread
 
-The thread starts in 2018. Most of the early pages describe structures that have been
-rebuilt several times since. Treat anything older than the current patch as a **hint about
-shape**, not as a value to hardcode.
+The thread starts in 2018. Most early pages describe structures rebuilt several times
+since. Treat anything older than the current patch as a hint about **shape**, not a value
+to hardcode.
 
 Reversal threads also routinely contain:
 
 - offsets valid for exactly one patch, unmarked
 - two people posting contradictory values for the same field
-- encodings that changed (the game moved object layout repeatedly)
-- posts that are correct but about a *different* game mode or the PBE build
+- posts that are correct but about a different game mode or the PBE build
+- layout encodings that changed when the game rebuilt its object model
 
 So: every offset gets verified against a live process before it reaches a script.
 
----
+## Cloudflare, and why curl failed here
+
+`cf_clearance` is bound to the browser's TLS fingerprint. Copying the cookie into
+`curl` produces a 403 interstitial (`Just a moment...`) even though the cookie is valid
+and present — a real browser engine is required. The userscript handles this natively: it
+detects the interstitial text, backs off 10 s and retries, and backs off 8 s on 429/503.
+
+`session/cloudflare_challenge_sample.html` is a saved copy of that interstitial, kept so
+the detection pattern can be checked without hitting the site.
 
 ## Session cookies
 
-`session/cookies.txt` holds the `cf_clearance` / `bbuserid` / `bbsessionhash` triple.
+`session/cookies.txt` holds `cf_clearance` / `bbuserid` / `bbsessionhash`. All three
+expire; when the scrape starts returning the interstitial repeatedly, re-copy them from a
+fresh authenticated request. They are live session tokens — disposable, not durable.
 
-- `cf_clearance` is bound to the browser's TLS fingerprint, which is why `curl` with
-  copied cookies gets a 403 while the real browser does not. Scrape from the browser.
-- All three expire. When the scrape starts returning the Cloudflare interstitial
-  (`Just a moment...`), re-copy them from a fresh authenticated request.
-- The account is not privileged, so nothing here is secret, but they are live session
-  tokens — treat them as disposable rather than durable.
+## Pipeline
 
----
-
-## After scraping
-
-1. Distil into `notes/` with the table above.
-2. Update `scripts/offsets.py` from the newest note only.
-3. Bump the patch stamp in that file — the script warns when it is stale.
-4. Commit. Raw pages and notes go in together so a value can always be traced back.
+1. Scrape with the userscript → move into `archives/`, renamed with the thread id.
+2. Distil into `notes/` with the table in `TEMPLATE.md`.
+3. Update `scripts/offsets.py` from the newest note only, and bump its patch stamp.
+4. Commit archives and notes together so a value always traces back to its post.
