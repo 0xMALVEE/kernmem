@@ -19,9 +19,14 @@ if ($bytes.Length -eq 0) { throw "input is empty: $InputFile" }
 $outDir = Split-Path -Parent $OutputFile
 if ($outDir) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 
+# The source hash is stamped into the header so a committed copy can be proven
+# to match the file it was generated from, without relying on timestamps.
+$sourceHash = (Get-FileHash $InputFile -Algorithm SHA256).Hash
+
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('#pragma once')
 [void]$sb.AppendLine("/* generated from $(Split-Path -Leaf $InputFile) - do not edit */")
+[void]$sb.AppendLine("#define ${Symbol}_SHA256 `"$sourceHash`"")
 [void]$sb.AppendLine("static const unsigned char ${Symbol}[] = {")
 
 for ($i = 0; $i -lt $bytes.Length; $i += 16) {

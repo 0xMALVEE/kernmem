@@ -29,15 +29,26 @@ foreach ($h in @('vgb_sys.h', 'iqvw_sys.h')) {
 }
 
 # The res headers are committed so a clone builds, which means they can go
-# stale. Refuse to link an embedded driver older than the driver sources.
-$embedded = Get-Item (Join-Path $resDir 'vgb_sys.h')
-$driverSources = Get-ChildItem (Join-Path $PSScriptRoot '../driver') -File |
-                 Where-Object { $_.Extension -in @('.c', '.h') }
+# stale. Timestamps are useless here (a clone stamps every file with clone
+# time), so the hash stamped by tools/embed.ps1 is compared instead. The check
+# is skipped when build/vgb.sys is absent, which is exactly the fresh-clone case.
+$builtDriver = Join-Path $PSScriptRoot '../build/vgb.sys'
 
-foreach ($source in $driverSources) {
-    if ($source.LastWriteTime -gt $embedded.LastWriteTime) {
-        throw "$($source.Name) is newer than loader/res/vgb_sys.h - run build.ps1 from the repo root so the embedded driver is regenerated"
+if (Test-Path $builtDriver) {
+    $declared = (Select-String -Path (Join-Path $resDir 'vgb_sys.h') `
+                 -Pattern '^#define vgb_sys_SHA256 "([0-9A-Fa-f]{64})"').Matches
+
+    if (-not $declared.Count) {
+        throw 'loader/res/vgb_sys.h carries no source hash - re-run build.ps1 from the repo root'
     }
+
+    $actual = (Get-FileHash $builtDriver -Algorithm SHA256).Hash
+
+    if ($declared[0].Groups[1].Value.ToUpperInvariant() -ne $actual) {
+        throw 'loader/res/vgb_sys.h embeds a different driver than build/vgb.sys - re-run build.ps1 from the repo root'
+    }
+
+    Write-Host 'embedded driver matches build/vgb.sys'
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
