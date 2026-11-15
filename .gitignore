@@ -1,19 +1,15 @@
-# Build output
+# Compiler output only - loader/res/ is committed on purpose because
+# loader/build.ps1 needs those headers to compile, and a fresh clone must be
+# able to build without first running the driver stage.
 /build/
-/loader/res/
 
 # Python
 __pycache__/
 *.pyc
-
-# Third-party reference dump (the docs cite the sources, not the bytes)
-research/kdm.zip
-research/kdm_src/
-research/kdmapper/
+*.obj
 
 # IDE / OS
 .vs/
 *.user
 Thumbs.db
 desktop.ini
-*.obj
