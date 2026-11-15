@@ -634,7 +634,18 @@ static NTSTATUS VgbHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PU
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
-    status = VgbCopyFromProcess(proc, (void*)req->Address, out, size);
+    /* MmCopyVirtualMemory normally reports a bad address as STATUS_PARTIAL_COPY,
+     * but a probe can still raise on some builds. SEH turns that into a status
+     * instead of a bugcheck the user has to reboot from. */
+    __try
+    {
+        status = VgbCopyFromProcess(proc, (void*)req->Address, out, size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = STATUS_PARTIAL_COPY;
+    }
+
     ObDereferenceObject(proc);
 
     *written = NT_SUCCESS(status) ? size : 0;
@@ -664,7 +675,15 @@ static NTSTATUS VgbHandleWrite(PVOID in, ULONG inLen, PULONG_PTR written)
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
-    status = VgbCopyToProcess(proc, (void*)req->Address, data, size);
+    __try
+    {
+        status = VgbCopyToProcess(proc, (void*)req->Address, data, size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = STATUS_PARTIAL_COPY;
+    }
+
     ObDereferenceObject(proc);
 
     *written = NT_SUCCESS(status) ? size : 0;

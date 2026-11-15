@@ -145,6 +145,22 @@ namespace nal
         g_statePath = path;
     }
 
+    /*
+     * Service names and paths written to the state file are ASCII, so a direct
+     * narrowing is safe - but building the string from wchar_t iterators is not,
+     * because that assigns wide units into chars and warns. Narrow explicitly.
+     */
+    std::string Narrow(const std::wstring& text)
+    {
+        std::string out;
+        out.reserve(text.size());
+
+        for (wchar_t character : text)
+            out.push_back(static_cast<char>(character & 0xFF));
+
+        return out;
+    }
+
     bool SaveState()
     {
         if (g_statePath.empty() || g_serviceName.empty())
@@ -154,8 +170,8 @@ namespace nal
         if (!out)
             return false;
 
-        const std::string service(g_serviceName.begin(), g_serviceName.end());
-        const std::string path(g_driverPath.begin(), g_driverPath.end());
+        const std::string service = Narrow(g_serviceName);
+        const std::string path = Narrow(g_driverPath);
 
         out << service << "\n" << path << "\n";
         return out.good();
