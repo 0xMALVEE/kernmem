@@ -32,33 +32,44 @@ namespace
      */
     constexpr bool     HAVE_VIEW_MATRIX   = true;
 
-    constexpr uint64_t OFF_LOCAL_PLAYER   = 0x1CBB810;
-    constexpr uint64_t OFF_OBJECT_MANAGER = 0x1CBB7F8;
-    constexpr uint64_t OFF_OBJ_BEGIN      = 0x0;
-    constexpr uint64_t OFF_OBJ_END        = 0x8;
-    constexpr uint64_t OFF_OBJ_STRIDE     = 0x8;
+    /*
+     * Every value below was recovered by running the patterns in
+     * research/older_projects/ls-bp-n-main/.../pattern-league.txt against the live
+     * image, then confirmed against real data on six heroes at once.
+     *
+     * The patterns are the source of truth, not these numbers: re-run them after a
+     * patch (scripts/patterns.py) and update this block.
+     */
+    constexpr uint64_t OFF_LOCAL_PLAYER = 0x1CFA7B0;
+
+    /*
+     * The hero list is a struct, not a bare array: +0x8 is the array and +0x10 the
+     * count. Walking it directly is what makes all ten champions visible - the old
+     * object list only ever held two.
+     */
+    constexpr uint64_t OFF_HERO_LIST       = 0x1CB8550;
+    constexpr uint64_t OFF_HERO_LIST_ARRAY = 0x8;
+    constexpr uint64_t OFF_HERO_LIST_COUNT = 0x10;
+
     constexpr uint64_t OFF_VIEW_MATRIX     = 0x1D7CC60;
     constexpr uint64_t OFF_VIEW_PROJECTION = 0x40;
 
-    constexpr uint64_t OFF_HERO_TEAM     = 0x1638;
-    constexpr uint64_t OFF_HERO_NAME     = 0x3F00;
+    /* Team is a byte, 1 = own side, 2 = enemy. */
+    constexpr uint64_t OFF_HERO_TEAM = 0x164;
 
-    /*
-     * The position is not inline. Each object carries a pointer at one of a few
-     * class-specific distances and the position sits 0x2E4 into whatever that
-     * pointer targets - the local hero uses 0x5BA8, another class 0x1790. All known
-     * distances are tried and every result is validated, so a miss is skipped
-     * instead of drawn.
-     */
-    constexpr uint64_t OFF_HERO_POS_CHAIN = 0x2E4;
+    /* Champion name is ASCII, not UTF-16. */
+    constexpr uint64_t OFF_HERO_NAME = 0x3890;
 
-    /* Health and max health sit 0x98 and 0x9C after the position itself. */
-    constexpr uint64_t OFF_HERO_HP_FROM_POS    = 0x98;
-    constexpr uint64_t OFF_HERO_MAXHP_FROM_POS = 0x9C;
+    /* World position, inline. */
+    constexpr uint64_t OFF_HERO_POS = 0xA0;
 
-    /* Own attack range, read from the local hero; the second is the older offset. */
-    constexpr uint64_t OFF_HERO_ATTACK_RANGE     = 0x3E30;
-    constexpr uint64_t OFF_HERO_ATTACK_RANGE_ALT = 0x30B0;
+    /* Max health sits before the position and current health just behind it. */
+    constexpr int64_t OFF_HERO_HP_FROM_POS    = -4;
+    constexpr int64_t OFF_HERO_MAXHP_FROM_POS = -8;
+
+    /* Own attack range; the pattern-derived offset first, then older fallbacks. */
+    constexpr uint64_t OFF_HERO_ATTACK_RANGE     = 0x17080;
+    constexpr uint64_t OFF_HERO_ATTACK_RANGE_ALT = 0x3E30;
 
     constexpr int32_t TEAM_OWN   = 1;
     constexpr int32_t TEAM_ENEMY = 2;
@@ -91,7 +102,7 @@ namespace
         float    health;
         float    maxHealth;
         Vec3     position;
-        wchar_t  name[48];
+        char     name[32];
     };
 
     /* ---- device ------------------------------------------------------- */
@@ -112,9 +123,12 @@ namespace
     bool ReadI32(uint64_t address, int32_t* out) { return Read(address, out, 4); }
     bool ReadF32(uint64_t address, float* out) { return Read(address, out, 4); }
 
-    bool ReadName(uint64_t address, wchar_t* out, size_t chars)
+    bool ReadU8(uint64_t address, uint8_t* out) { return Read(address, out, 1); }
+
+    /* Champion names are plain ASCII, so they are read and drawn as narrow chars. */
+    bool ReadName(uint64_t address, char* out, size_t chars)
     {
-        if (!Read(address, out, (uint32_t)(chars * sizeof(wchar_t))))
+        if (!Read(address, out, (uint32_t)chars))
             return false;
 
         out[chars - 1] = 0;
@@ -357,83 +371,68 @@ namespace
     /* ---- scene -------------------------------------------------------- */
 
     /*
-     * Reads a hero's world position through its chain.
-     *
-     * The pointer must look like pool memory (not an image address, not a small
-     * scalar such as the 0x100000001 that sits at the same distance on some
-     * objects), and the triple must be finite world coordinates rather than a
-     * denormal or the map origin. A wrong distance therefore fails validation
-     * instead of putting a hero at (0, 0, 0).
+     * Reads a hero's world position. It is inline, so this is one read plus
+     * validation: the triple must be finite world coordinates rather than a
+     * denormal or the map origin, so a half-built object is skipped instead of
+     * being drawn at (0, 0, 0).
      */
     bool ReadHeroPosition(uint64_t object, Vec3* out, uint64_t* posAddress)
     {
-        static const uint64_t kChainOffsets[] = { 0x5BA8, 0x1790, 0x2AD0, 0x3098 };
+        const uint64_t address = object + OFF_HERO_POS;
 
-        for (uint64_t chainOffset : kChainOffsets)
-        {
-            uint64_t target = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
 
-            if (!ReadU64(object + chainOffset, &target))
-                continue;
+        if (!ReadF32(address, &x) || !ReadF32(address + 4, &y) || !ReadF32(address + 8, &z))
+            return false;
 
-            if (target < 0x10000000000ULL || target > 0x7FFFFFFFFFFFULL)
-                continue;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+            return false;
 
-            if (target >= g_base && target < g_base + 0x4000000ULL)
-                continue;
+        if (fabsf(x) < 1.0f || fabsf(y) < 1.0f)
+            return false;
 
-            const uint64_t address = target + OFF_HERO_POS_CHAIN;
+        if (fabsf(x) > 20000.0f || fabsf(y) > 20000.0f || fabsf(z) > 3000.0f)
+            return false;
 
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
+        out->x = x;
+        out->y = y;
+        out->z = z;
 
-            if (!ReadF32(address, &x) || !ReadF32(address + 4, &y) || !ReadF32(address + 8, &z))
-                continue;
+        if (posAddress)
+            *posAddress = address;
 
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
-                continue;
-
-            if (fabsf(x) < 200.0f || fabsf(y) < 200.0f)
-                continue;
-
-            if (fabsf(x) > 20000.0f || fabsf(y) > 20000.0f || fabsf(z) > 3000.0f)
-                continue;
-
-            out->x = x;
-            out->y = y;
-            out->z = z;
-
-            if (posAddress)
-                *posAddress = address;
-
-            return true;
-        }
-
-        return false;
+        return true;
     }
 
+    /*
+     * Walks the hero list. It is a struct holding the array pointer and a count, so
+     * all ten champions are reachable - the general object list only ever contained
+     * two of them.
+     */
     bool CollectHeroes(uint64_t localAddress, std::vector<Hero>* out)
     {
-        uint64_t manager = 0;
-        if (!ReadU64(g_base + OFF_OBJECT_MANAGER, &manager) || !manager)
+        uint64_t list = 0;
+        if (!ReadU64(g_base + OFF_HERO_LIST, &list) || !list)
             return false;
 
-        uint64_t begin = 0;
-        uint64_t end = 0;
+        uint64_t array = 0;
+        int32_t count = 0;
 
-        if (!ReadU64(manager + OFF_OBJ_BEGIN, &begin) || !ReadU64(manager + OFF_OBJ_END, &end))
+        if (!ReadU64(list + OFF_HERO_LIST_ARRAY, &array) || !array)
             return false;
 
-        if (!begin || !end || end <= begin)
+        if (!ReadI32(list + OFF_HERO_LIST_COUNT, &count) || count < 1)
             return false;
 
-        const uint64_t count = (end - begin) / OFF_OBJ_STRIDE;
+        if (count > (int32_t)MAX_OBJECTS)
+            count = (int32_t)MAX_OBJECTS;
 
-        for (uint64_t i = 0; i < count && i < MAX_OBJECTS; ++i)
+        for (int32_t i = 0; i < count; ++i)
         {
             uint64_t object = 0;
-            if (!ReadU64(begin + i * OFF_OBJ_STRIDE, &object) || !object)
+            if (!ReadU64(array + (uint64_t)i * 8, &object) || !object)
                 continue;
 
             if (object == localAddress)
@@ -441,8 +440,11 @@ namespace
 
             Hero hero = {};
 
-            if (!ReadI32(object + OFF_HERO_TEAM, &hero.team))
+            uint8_t team = 0;
+            if (!ReadU8(object + OFF_HERO_TEAM, &team))
                 continue;
+
+            hero.team = team;
 
             if (hero.team != TEAM_OWN && hero.team != TEAM_ENEMY)
                 continue;
@@ -452,11 +454,11 @@ namespace
             if (!ReadHeroPosition(object, &hero.position, &posAddress))
                 continue;
 
-            ReadF32(posAddress + OFF_HERO_HP_FROM_POS, &hero.health);
-            ReadF32(posAddress + OFF_HERO_MAXHP_FROM_POS, &hero.maxHealth);
+            ReadF32((uint64_t)((int64_t)posAddress + OFF_HERO_HP_FROM_POS), &hero.health);
+            ReadF32((uint64_t)((int64_t)posAddress + OFF_HERO_MAXHP_FROM_POS), &hero.maxHealth);
             ReadName(object + OFF_HERO_NAME, hero.name, _countof(hero.name));
 
-            /* The visible/dead flags are not identified on this build, so they stay
+            /* Visible/dead flags are not identified on this build, so they stay
              * false and the draw path filters on health alone. */
             hero.address = object;
 
@@ -538,11 +540,14 @@ namespace
 
             if (hasLocal)
             {
-                ReadF32(posAddress + OFF_HERO_HP_FROM_POS, &localHp);
-                ReadF32(posAddress + OFF_HERO_MAXHP_FROM_POS, &localMaxHp);
+                ReadF32((uint64_t)((int64_t)posAddress + OFF_HERO_HP_FROM_POS), &localHp);
+                ReadF32((uint64_t)((int64_t)posAddress + OFF_HERO_MAXHP_FROM_POS), &localMaxHp);
             }
 
-            ReadI32(local + OFF_HERO_TEAM, &localTeam);
+            uint8_t team = 0;
+
+            if (ReadU8(local + OFF_HERO_TEAM, &team))
+                localTeam = team;
 
             /* The real range is on the hero; the constant is only a fallback for
              * when the read misses. */
@@ -658,7 +663,7 @@ namespace
             const float dy = hero.position.y - localPos.y;
             const float distance = sqrtf(dx * dx + dy * dy);
 
-            Text(dc, left, top - 26, colour, L"%ls %.0f", hero.name, distance);
+            Text(dc, left, top - 26, colour, L"%hs %.0f", hero.name, distance);
 
             if (hasLocal)
             {

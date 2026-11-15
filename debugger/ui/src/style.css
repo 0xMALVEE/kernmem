@@ -148,6 +148,37 @@ h2:first-child {
   cursor: default;
 }
 
+.roster {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+}
+
+.roster li {
+  margin: 2px 0;
+}
+
+.roster li.me {
+  color: #8fe0a8;
+}
+
+.roster li.enemy {
+  color: #ff9b9b;
+}
+
+.json-panel {
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.json {
+  margin: 0;
+  font: 11px/1.4 ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #9fb6cf;
+}
+
 .views {
   display: flex;
   flex-wrap: wrap;

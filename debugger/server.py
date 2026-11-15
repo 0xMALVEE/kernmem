@@ -24,15 +24,26 @@ IOCTL_GET_PID = 0x80002008
 IOCTL_READ = 0x80002010
 IOCTL_GET_BASE = 0x80002024
 
-OFF_LOCAL = 0x1CBB810
+# Every value below came from running leagueOffsetDump/pattern-league.txt against
+# the live image, then confirming it on six heroes at once. Re-run
+# scripts/patterns.py after a patch and update this block.
+OFF_LOCAL = 0x1CFA7B0
+
+# Hero list is a struct: +0x8 array pointer, +0x10 count.
+OFF_HERO_LIST = 0x1CB8550
+OFF_HERO_LIST_ARRAY = 0x8
+OFF_HERO_LIST_COUNT = 0x10
+
+OFF_TEAM = 0x164          # byte, 1 = own side, 2 = enemy
+OFF_NAME = 0x3890         # ASCII, not UTF-16
+OFF_POS = 0xA0            # inline world position
+OFF_HP_FROM_POS = -4      # current health
+OFF_MAXHP_FROM_POS = -8   # max health
+OFF_RANGE = 0x17080
+OFF_RANGE_ALT = 0x3E30
+
+# Older layout, kept so a regression is visible rather than silent.
 OFF_ARRAY = 0x1CBB7F8
-OFF_TEAM = 0x1638
-OFF_NAME = 0x3F00
-OFF_RANGE = 0x30B0
-OFF_AI_MANAGER = 0x44A0
-OFF_AI_POSITION = 0x25C
-OFF_POS_CHAIN = 0x2E4
-POS_CHAINS = (0x5BA8, 0x1790, 0x2AD0, 0x3098)
 POS_CANDIDATES = (0x4584, 0x4484)
 
 SIG = b'\x48\x8D\x0D\x00\x00\x00\x00\x0F\x10\x00'
@@ -123,6 +134,16 @@ class Session:
     def f32(self, address):
         raw = self.read(address, 4)
         return struct.unpack('<f', raw)[0] if raw and len(raw) == 4 else None
+
+    def u8(self, address):
+        raw = self.read(address, 1)
+        return raw[0] if raw else None
+
+    def text(self, address, size):
+        raw = self.read(address, size)
+        if not raw:
+            return ''
+        return raw.split(b'\x00')[0].decode('ascii', 'replace')
 
     def f3(self, address):
         raw = self.read(address, 12)
@@ -237,20 +258,17 @@ def position_candidates(session, obj):
     where the older project's dump put it, which is why the inline guesses read
     denormals on an unpopulated graph."""
     found = []
-    for chain in POS_CHAINS:
-        target = session.u64(obj + chain)
-        if not target or target < 0x10000000000 or target > 0x7FFFFFFFFFFF:
-            continue
-        if session.base <= target < session.base + 0x4000000:
-            continue
-        address = target + OFF_POS_CHAIN
-        point = session.f3(address)
-        found.append({'offset': chain, 'chain': OFF_POS_CHAIN, 'address': address,
-                      'value': list(point) if point else None})
+
+    address = obj + OFF_POS
+    point = session.f3(address)
+    found.append({'offset': OFF_POS, 'chain': None, 'address': address,
+                  'value': list(point) if point else None, 'primary': True})
+
     for off in POS_CANDIDATES:
-        point = session.f3(obj + off)
-        found.append({'offset': off, 'chain': None, 'address': obj + off,
-                      'value': list(point) if point else None})
+        address = obj + off
+        point = session.f3(address)
+        found.append({'offset': off, 'chain': None, 'address': address,
+                      'value': list(point) if point else None, 'primary': False})
     return found
 
 
@@ -289,40 +307,60 @@ def poll_once():
         'heroes': [],
         'positions': [],
         'conventions': [],
+        'name': '',
+        'team': None,
+        'hp': None,
+        'maxHp': None,
+        'localPosition': [],
+        'heroListCount': 0,
         'error': None,
     }
 
     if local:
         state['positions'] = position_candidates(SESSION, local)
-        state['team'] = SESSION.i32(local + OFF_TEAM)
-        state['range'] = SESSION.f32(local + OFF_RANGE)
+        state['team'] = SESSION.u8(local + OFF_TEAM)
+        state['name'] = SESSION.text(local + OFF_NAME, 32)
+        state['localPosition'] = list(SESSION.f3(local + OFF_POS) or [])
+        state['hp'] = SESSION.f32(local + OFF_POS + OFF_HP_FROM_POS)
+        state['maxHp'] = SESSION.f32(local + OFF_POS + OFF_MAXHP_FROM_POS)
 
-    for i in range(16):
-        obj = SESSION.u64(base + OFF_ARRAY + i * 8)
+        measured = SESSION.f32(local + OFF_RANGE)
+        if not (isinstance(measured, float) and 100.0 < measured < 1500.0):
+            measured = SESSION.f32(local + OFF_RANGE_ALT)
+        state['range'] = measured
+
+    list_ptr = SESSION.u64(base + OFF_HERO_LIST)
+    array = SESSION.u64(list_ptr + OFF_HERO_LIST_ARRAY) if list_ptr else None
+    count = SESSION.i32(list_ptr + OFF_HERO_LIST_COUNT) if list_ptr else 0
+    state['heroListCount'] = count or 0
+
+    for i in range(min(count or 0, 16)):
+        obj = SESSION.u64(array + i * 8) if array else None
         if not obj:
             continue
-        team = SESSION.i32(obj + OFF_TEAM)
+
+        team = SESSION.u8(obj + OFF_TEAM)
         if team not in (1, 2):
             continue
-        name = SESSION.read(obj + OFF_NAME, 40)
-        pos = None
-        for candidate in position_candidates(SESSION, obj):
-            value = candidate['value']
-            if value and abs(value[0]) >= 1.0 and abs(value[1]) >= 1.0:
-                pos = candidate
-                break
+
+        position = SESSION.f3(obj + OFF_POS)
+        if position and (abs(position[0]) < 1.0 or abs(position[1]) < 1.0):
+            position = None
+
         state['heroes'].append({
             'index': i,
             'address': obj - base,
             'team': team,
-            'name': name.decode('utf-16-le', 'replace').split('\x00')[0] if name else '',
-            'position': pos,
+            'name': SESSION.text(obj + OFF_NAME, 32),
+            'hp': SESSION.f32(obj + OFF_POS + OFF_HP_FROM_POS),
+            'maxHp': SESSION.f32(obj + OFF_POS + OFF_MAXHP_FROM_POS),
+            'position': {'offset': OFF_POS, 'value': list(position)} if position else None,
             'isLocal': obj == local,
         })
 
     if camera and local:
         raw = SESSION.read(camera, 0x80)
-        local_pos = SESSION.f3(local + 0x4584)
+        local_pos = SESSION.f3(local + OFF_POS)
         if raw and local_pos:
             view = list(struct.unpack_from('<16f', raw, 0))
             proj = list(struct.unpack_from('<16f', raw, 0x40))

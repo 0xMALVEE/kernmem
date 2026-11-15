@@ -13,6 +13,26 @@ function hex(v) {
   return typeof v === 'number' ? '0x' + v.toString(16).toUpperCase() : '—'
 }
 
+function vec(p) {
+  if (!p) return '—'
+  const v = Array.isArray(p) ? p : p.value
+  if (!Array.isArray(v)) return '—'
+  return v.map((n) => num(n, 1)).join(', ')
+}
+
+function distance(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length < 2 || b.length < 2) return null
+  const dx = a[0] - b[0]
+  const dy = a[1] - b[1]
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+function teamLabel(team) {
+  if (team === 1) return 'ally'
+  if (team === 2) return 'enemy'
+  return 'team ' + team
+}
+
 function Screen({ conv, client }) {
   const ref = useRef(null)
 
@@ -65,9 +85,9 @@ function Screen({ conv, client }) {
       if (!hero.screen) return
       const x = hero.screen[0] * scale
       const y = hero.screen[1] * scale
-      ctx.strokeStyle = '#ff5a5a'
+      ctx.strokeStyle = hero.team === 2 ? '#ff5a5a' : '#7fb4ff'
       ctx.strokeRect(x - 4, y - 7, 8, 14)
-      ctx.fillStyle = '#ffb4b4'
+      ctx.fillStyle = '#ffd2d2'
       ctx.fillText(hero.name || '?', x + 6, y)
     })
   }, [conv, client])
@@ -116,6 +136,7 @@ function App() {
   const positions = (state && state.positions) || []
   const heroes = (state && state.heroes) || []
   const signature = (state && state.signature) || []
+  const localPos = (state && state.localPosition) || []
 
   return (
     <div className="app">
@@ -131,6 +152,41 @@ function App() {
 
       <div className="grid">
         <section className="panel">
+          <h2>plain</h2>
+          <dl className="kv">
+            <dt>you</dt>
+            <dd>{state && state.name ? state.name : '—'}</dd>
+            <dt>team</dt>
+            <dd>{state && state.team != null ? teamLabel(state.team) : '—'}</dd>
+            <dt>health</dt>
+            <dd>{state ? num(state.hp, 0) + ' / ' + num(state.maxHp, 0) : '—'}</dd>
+            <dt>position</dt>
+            <dd className="mono">{vec(localPos)}</dd>
+            <dt>attack range</dt>
+            <dd>{state ? num(state.range, 0) : '—'}</dd>
+            <dt>roster</dt>
+            <dd>
+              {heroes.length} drawn · {state ? state.heroListCount : '—'} in list
+            </dd>
+          </dl>
+
+          <h2>champions</h2>
+          <ul className="roster">
+            {heroes.map((h) => {
+              const d = distance(h.position && h.position.value, localPos)
+              return (
+                <li key={h.index} className={h.isLocal ? 'me' : h.team === 2 ? 'enemy' : ''}>
+                  <span className="mono dim">{h.index}</span> {h.name || '(no name)'}
+                  {' · '}{teamLabel(h.team)}
+                  {' · '}{num(h.hp, 0)}/{num(h.maxHp, 0)} hp
+                  {' · '}{vec(h.position)}
+                  {d != null ? ' · ' + num(d, 0) + ' away' : ''}
+                </li>
+              )
+            })}
+            {!heroes.length && <li className="dim">none collected</li>}
+          </ul>
+
           <h2>raw</h2>
           <dl className="kv">
             <dt>device</dt>
@@ -139,10 +195,8 @@ function App() {
             <dd className="mono">{client ? client[0] + ' x ' + client[1] : '—'}</dd>
             <dt>local player</dt>
             <dd className="mono">{state ? hex(state.local) : '—'}</dd>
-            <dt>team</dt>
-            <dd className="mono">{state ? String(state.team) : '—'}</dd>
-            <dt>attack range</dt>
-            <dd className="mono">{state ? num(state.range, 1) : '—'}</dd>
+            <dt>team byte</dt>
+            <dd className="mono">{state && state.team != null ? String(state.team) : '—'}</dd>
             <dt>camera offset</dt>
             <dd className="mono">{state && state.camera != null ? hex(state.camera) : '—'}</dd>
             <dt>view crc</dt>
@@ -163,8 +217,8 @@ function App() {
             </thead>
             <tbody>
               {positions.map((p) => (
-                <tr key={p.offset}>
-                  <td className="mono">{hex(p.offset)}</td>
+                <tr key={p.offset} className={p.primary ? 'me' : ''}>
+                  <td className="mono">{hex(p.offset)}{p.primary ? ' *' : ''}</td>
                   <td className="mono">{p.value ? num(p.value[0]) : '—'}</td>
                   <td className="mono">{p.value ? num(p.value[1]) : '—'}</td>
                   <td className="mono">{p.value ? num(p.value[2]) : '—'}</td>
@@ -173,37 +227,6 @@ function App() {
               {!positions.length && (
                 <tr>
                   <td colSpan="4" className="dim">no local player</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-
-          <h2>heroes ({heroes.length})</h2>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>idx</th>
-                <th>team</th>
-                <th>name</th>
-                <th>position</th>
-              </tr>
-            </thead>
-            <tbody>
-              {heroes.map((h) => (
-                <tr key={h.index} className={h.isLocal ? 'me' : ''}>
-                  <td className="mono">{h.index}</td>
-                  <td className="mono">{h.team}</td>
-                  <td>{h.name}</td>
-                  <td className="mono">
-                    {h.position
-                      ? hex(h.position.offset) + ' ' + h.position.value.map((v) => num(v, 1)).join(', ')
-                      : 'no position'}
-                  </td>
-                </tr>
-              ))}
-              {!heroes.length && (
-                <tr>
-                  <td colSpan="4" className="dim">none collected</td>
                 </tr>
               )}
             </tbody>
@@ -236,6 +259,11 @@ function App() {
             </table>
           )}
           {scan && scan.error && <p className="bad mono">{scan.error}</p>}
+        </section>
+
+        <section className="panel json-panel">
+          <h2>json</h2>
+          <pre className="json">{JSON.stringify(state, null, 2)}</pre>
         </section>
 
         <section className="views">
