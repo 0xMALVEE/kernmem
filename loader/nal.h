@@ -29,6 +29,11 @@ namespace nal
     /* Registers + starts iqvw64e.sys as a kernel service and opens the device. */
     bool Load(const wchar_t* driverPath);
 
+    /* Opens an ALREADY running host and resolves the kernel base, without
+     * registering a service. Needed by teardown: a fresh process has no handle, so
+     * every kernel read in the unmap path would fail. */
+    bool Attach();
+
     /* Stops the service, deletes the service key and the dropped driver file. */
     bool Unload();
 

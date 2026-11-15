@@ -325,7 +325,18 @@ namespace
 
         if (OpenDevice())
         {
-            vgb_log::Warn("device already present - unload first");
+            /* A live device is a success, not an error: the one-click path checks
+             * this too, and a dangling one still answers protocol 3. */
+            ULONG existing = 0;
+
+            if (Ioctl(IOCTL_VGB_GET_VERSION, nullptr, 0, &existing, sizeof(existing), nullptr) &&
+                existing == VGB_PROTOCOL_VERSION)
+            {
+                vgb_log::Good("device already present, protocol %u - reusing it", existing);
+                return 0;
+            }
+
+            vgb_log::Error("device present but not answering - unload first");
             return 1;
         }
 
@@ -398,12 +409,29 @@ namespace
 
         CloseDevice();
 
+        nal::SetStatePath(nt::GetFullTempPath() + L"\\vgb-nal.state");
+
         MAP_STATE state = { 0 };
         if (LoadMapState(&state))
         {
+            /* Unmap reads kernel memory, so the host has to be open first. Without
+             * this the reads failed, DriverUnload was skipped, and the image was
+             * freed while the device was still live. */
+            if (!nal::Attach())
+            {
+                vgb_log::Error("cannot open the mapping host - driver NOT unmapped");
+                return 1;
+            }
+
             mapper::MAP_RESULT result = { state.imageBase, state.imageSize, state.driverObject,
                                           state.entryPoint, STATUS_SUCCESS };
-            mapper::Unmap(result);
+
+            if (!mapper::Unmap(result))
+            {
+                vgb_log::Error("unmap failed - state kept, retry unload");
+                return 1;
+            }
+
             ClearMapState();
             vgb_log::Good("driver unmapped");
         }
@@ -411,8 +439,6 @@ namespace
         {
             vgb_log::Warn("no mapping state found - skipping unmap");
         }
-
-        nal::SetStatePath(nt::GetFullTempPath() + L"\\vgb-nal.state");
         nal::Unload();
         vgb_log::Good("mapping host released");
 

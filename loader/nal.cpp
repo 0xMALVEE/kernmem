@@ -284,7 +284,8 @@ namespace nal
 
     bool IsRunning()
     {
-        const HANDLE probe = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS, 0, nullptr,
+        const HANDLE probe = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (probe != INVALID_HANDLE_VALUE)
         {
@@ -292,6 +293,30 @@ namespace nal
             return true;
         }
         return false;
+    }
+
+    bool Attach()
+    {
+        LoadState();
+
+        hDevice = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (hDevice == INVALID_HANDLE_VALUE)
+        {
+            vgb_log::Error("mapping host is not running - nothing to attach to");
+            return false;
+        }
+
+        if (!EnsureKernelBase())
+        {
+            CloseHandle(hDevice);
+            hDevice = INVALID_HANDLE_VALUE;
+            return false;
+        }
+
+        return true;
     }
 
     bool Load(const wchar_t* driverPath)

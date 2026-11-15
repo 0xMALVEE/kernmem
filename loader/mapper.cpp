@@ -217,18 +217,33 @@ namespace mapper
         if (!result.imageBase)
             return false;
 
-        /* Call DriverUnload if the driver registered one. */
+        /*
+         * DriverUnload MUST run before the image is freed, otherwise the device
+         * object is left dangling inside freed pool and any later open dispatches
+         * into garbage. It was previously skipped silently whenever the kernel read
+         * failed - which is exactly what happens in a fresh process that never
+         * opened the host - so the free is now conditional on having read it.
+         */
         if (result.driverObject)
         {
             uint64_t unload = 0;
-            if (ReadFromKernel(result.driverObject + kDriverUnloadOffset, &unload, sizeof(unload)) &&
-                unload)
+
+            if (!ReadFromKernel(result.driverObject + kDriverUnloadOffset, &unload, sizeof(unload)))
+            {
+                vgb_log::Error("cannot read DriverUnload - image NOT freed, retry unload");
+                return false;
+            }
+
+            if (unload)
             {
                 vgb_log::Step("calling DriverUnload at 0x%llX", (unsigned long long)unload);
                 const uint64_t args[4] = { result.driverObject, 0, 0, 0 };
 
                 if (!nal::CallKernelFunctionRaw(nullptr, unload, args, 1))
-                    vgb_log::Error("DriverUnload call failed");
+                {
+                    vgb_log::Error("DriverUnload call failed - image NOT freed");
+                    return false;
+                }
 
                 vgb_log::Step("DriverUnload returned, draining IRPs");
             }
