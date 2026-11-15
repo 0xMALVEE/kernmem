@@ -29,6 +29,8 @@ OFF_ARRAY = 0x1CBB7F8
 OFF_TEAM = 0x128
 OFF_NAME = 0x3F00
 OFF_RANGE = 0x30B0
+OFF_AI_MANAGER = 0x44A0
+OFF_AI_POSITION = 0x25C
 POS_CANDIDATES = (0x4584, 0x4484)
 
 SIG = b'\x48\x8D\x0D\x00\x00\x00\x00\x0F\x10\x00'
@@ -217,6 +219,24 @@ def ring_points(center, radius, plane):
     return pts
 
 
+def position_candidates(session, obj):
+    """Every place a position might live. The AI-manager chain goes first: that is
+    where the older project's dump put it, which is why the inline guesses read
+    denormals on an unpopulated graph."""
+    found = []
+    manager = session.u64(obj + OFF_AI_MANAGER)
+    if manager:
+        chain = session.f3(manager + OFF_AI_POSITION)
+        if chain:
+            found.append({'offset': OFF_AI_MANAGER, 'chain': OFF_AI_POSITION,
+                          'address': manager, 'value': list(chain)})
+    for off in POS_CANDIDATES:
+        point = session.f3(obj + off)
+        found.append({'offset': off, 'chain': None, 'address': obj + off,
+                      'value': list(point) if point else None})
+    return found
+
+
 def snapshot():
     with STATE_LOCK:
         return dict(STATE)
@@ -246,6 +266,7 @@ def poll_once():
         'client': [width, height],
         'focused': u32.GetForegroundWindow() == hwnd,
         'local': local,
+        'readable': local is not None,
         'signature': [t - base for t in targets],
         'camera': (camera - base) if camera else None,
         'heroes': [],
@@ -255,9 +276,7 @@ def poll_once():
     }
 
     if local:
-        for off in POS_CANDIDATES:
-            p = SESSION.f3(local + off)
-            state['positions'].append({'offset': off, 'value': list(p) if p else None})
+        state['positions'] = position_candidates(SESSION, local)
         state['team'] = SESSION.i32(local + OFF_TEAM)
         state['range'] = SESSION.f32(local + OFF_RANGE)
 
@@ -270,10 +289,10 @@ def poll_once():
             continue
         name = SESSION.read(obj + OFF_NAME, 40)
         pos = None
-        for off in POS_CANDIDATES:
-            p = SESSION.f3(obj + off)
-            if p and abs(p[0]) >= 1.0 and abs(p[1]) >= 1.0:
-                pos = {'offset': off, 'value': list(p)}
+        for candidate in position_candidates(SESSION, obj):
+            value = candidate['value']
+            if value and abs(value[0]) >= 1.0 and abs(value[1]) >= 1.0:
+                pos = candidate
                 break
         state['heroes'].append({
             'index': i,
