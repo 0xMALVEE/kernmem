@@ -56,6 +56,17 @@ u32.FindWindowW.argtypes = [w.LPCWSTR, w.LPCWSTR]
 u32.GetClientRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
 u32.GetForegroundWindow.restype = w.HWND
 
+# The game window is 4K at 150% here; an unaware process is handed 2545x1354 for a
+# 3840x2160 window and every reported coordinate is wrong by the scale factor.
+# Opt in before any window call.
+try:
+    u32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+except Exception:
+    try:
+        ctypes.WinDLL('shcore').SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except Exception:
+        u32.SetProcessDPIAware()
+
 STATE_LOCK = threading.Lock()
 STATE = {'ts': 0.0, 'error': 'starting'}
 
@@ -309,7 +320,8 @@ def poll_once():
         if raw and local_pos:
             view = list(struct.unpack_from('<16f', raw, 0))
             proj = list(struct.unpack_from('<16f', raw, 0x40))
-            radius = state.get('range') or 700.0
+            measured = state.get('range')
+            radius = measured if (isinstance(measured, (int, float)) and 100.0 < measured < 1500.0) else 700.0
             state['view'] = view
             state['projection'] = proj
             state['viewCrc'] = sum(raw) % 0xFFFFFFFF

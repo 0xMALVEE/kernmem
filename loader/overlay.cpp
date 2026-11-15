@@ -126,13 +126,18 @@ namespace
     {
         float view[16];
         float projection[16];
+        float matrix[16];   /* view * projection, composed once per read */
     };
 
     /*
      * Reads the camera. Both matrices sit back to back in the image and neither is
-     * behind a pointer. They are kept apart instead of being multiplied into one
-     * 4x4: composing them loses the depth the projection needs, while applying them
-     * one after the other reproduces the true camera depth exactly.
+     * behind a pointer. They are composed here, once, so Project stays a single
+     * multiply against a finished matrix.
+     *
+     * The composition and the apply must agree on handedness. Composed this way and
+     * applied as a column vector, the local hero lands on screen centre - which is
+     * what the camera does, since it follows the player. The row-vector apply of the
+     * same data put the hero 867 px off on a 3818x2032 client.
      */
     bool ReadMatrix(Camera* camera)
     {
@@ -157,25 +162,38 @@ namespace
                 return false;
         }
 
+        /* matrix = view * projection, row-major flat. */
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int column = 0; column < 4; ++column)
+            {
+                float sum = 0.0f;
+
+                for (int k = 0; k < 4; ++k)
+                    sum += camera->view[row * 4 + k] * camera->projection[k * 4 + column];
+
+                camera->matrix[row * 4 + column] = sum;
+            }
+        }
+
+        for (int i = 0; i < 16; ++i)
+        {
+            if (!std::isfinite(camera->matrix[i]))
+                return false;
+        }
+
         return true;
     }
 
     bool Project(const Camera& camera, const Vec3& world, float* sx, float* sy)
     {
-        /* World -> view -> clip, each a strided multiply against a row vector. */
-        const float viewX = world.x * camera.view[0] + world.y * camera.view[4] +
-                            world.z * camera.view[8] + camera.view[12];
-        const float viewY = world.x * camera.view[1] + world.y * camera.view[5] +
-                            world.z * camera.view[9] + camera.view[13];
-        const float viewZ = world.x * camera.view[2] + world.y * camera.view[6] +
-                            world.z * camera.view[10] + camera.view[14];
-
-        const float clipX = viewX * camera.projection[0] + viewY * camera.projection[4] +
-                            viewZ * camera.projection[8] + camera.projection[12];
-        const float clipY = viewX * camera.projection[1] + viewY * camera.projection[5] +
-                            viewZ * camera.projection[9] + camera.projection[13];
-        const float clipW = viewX * camera.projection[3] + viewY * camera.projection[7] +
-                            viewZ * camera.projection[11] + camera.projection[15];
+        /* Column vector: clip[r] = sum_c M[r][c] * v[c], strided on the flat array. */
+        const float clipX = world.x * camera.matrix[0] + world.y * camera.matrix[1] +
+                            world.z * camera.matrix[2] + camera.matrix[3];
+        const float clipY = world.x * camera.matrix[4] + world.y * camera.matrix[5] +
+                            world.z * camera.matrix[6] + camera.matrix[7];
+        const float clipW = world.x * camera.matrix[12] + world.y * camera.matrix[13] +
+                            world.z * camera.matrix[14] + camera.matrix[15];
 
         /* The camera looks down -Z, so anything in front has a negative w and only
          * a w of (near) zero is degenerate. Testing w > 0 here would reject the

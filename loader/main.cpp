@@ -1134,8 +1134,53 @@ namespace
     }
 }
 
+/*
+ * Windows virtualises coordinates for a DPI-unaware process: on a 4K panel at 150%
+ * GetClientRect reports 2545x1354 for a 3840x2160 game window, the overlay draws
+ * into that smaller surface, and the compositor then stretches it back up. Every
+ * drawn pixel therefore lands about 1.5x too far from the origin, and the surface
+ * does not even cover the window.
+ *
+ * Opt into per-monitor awareness before any window or DC exists, newest API first
+ * so a mixed-DPI setup is handled correctly rather than clamped to one scale.
+ */
+static void BecomeDpiAware()
+{
+    /* Per-monitor v2: 26200. */
+    typedef BOOL (WINAPI* SetContextFn)(HANDLE);
+
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll"))
+    {
+        if (auto setContext = reinterpret_cast<SetContextFn>(
+                GetProcAddress(user32, "SetProcessDpiAwarenessContext")))
+        {
+            /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+            if (setContext(reinterpret_cast<HANDLE>(-4)))
+                return;
+        }
+    }
+
+    /* Shcore fallback: PROCESS_PER_MONITOR_DPI_AWARE. */
+    if (HMODULE shcore = LoadLibraryW(L"shcore.dll"))
+    {
+        typedef HRESULT (WINAPI* SetAwarenessFn)(int);
+
+        if (auto setAwareness = reinterpret_cast<SetAwarenessFn>(
+                GetProcAddress(shcore, "SetProcessDpiAwareness")))
+        {
+            if (SUCCEEDED(setAwareness(2)))
+                return;
+        }
+    }
+
+    /* Last resort: system-wide awareness, which at least stops the stretching. */
+    SetProcessDPIAware();
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+    BecomeDpiAware();
+
     /*
      * Crash log first, before anything can fault. The file is flushed per line, so
      * after a bugcheck the last entry names the step that was running. The path is
