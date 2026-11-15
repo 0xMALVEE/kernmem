@@ -77,6 +77,8 @@ class Offset:
     @property
     def label(self) -> str:
         if self.constant:
+            if isinstance(self.offset, float):
+                return f"constant {self.offset:g}"
             return f"constant {self.offset:#x}"
 
         return f"{self.module}+{self.offset:#x}" + (
