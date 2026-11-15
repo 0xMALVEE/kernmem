@@ -28,6 +28,18 @@ foreach ($h in @('vgb_sys.h', 'iqvw_sys.h')) {
     if (-not (Test-Path $p)) { throw "missing embedded resource: $p (run build.ps1 from the repo root)" }
 }
 
+# The res headers are committed so a clone builds, which means they can go
+# stale. Refuse to link an embedded driver older than the driver sources.
+$embedded = Get-Item (Join-Path $resDir 'vgb_sys.h')
+$driverSources = Get-ChildItem (Join-Path $PSScriptRoot '../driver') -File |
+                 Where-Object { $_.Extension -in @('.c', '.h') }
+
+foreach ($source in $driverSources) {
+    if ($source.LastWriteTime -gt $embedded.LastWriteTime) {
+        throw "$($source.Name) is newer than loader/res/vgb_sys.h - run build.ps1 from the repo root so the embedded driver is regenerated"
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $exe = Join-Path $OutDir 'vgb-loader.exe'
 
