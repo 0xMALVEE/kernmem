@@ -17,6 +17,11 @@ import ctypes.wintypes as wt
 
 DEVICE_PATH = r"\\.\VanguardBypass"
 
+#: The DOS symlink can be gone while the driver is still answering - an unload
+#: that deleted the link but left the device pinned by an open handle leaves the
+#: NT path as the only way through, so it is always tried second.
+NT_DEVICE_PATH = r"\\?\GLOBALROOT\Device\VanguardBypass"
+
 DEVICE_TYPE = 0x8000
 METHOD_BUFFERED = 0
 FILE_ANY_ACCESS = 0
@@ -122,12 +127,16 @@ class Client:
 
     def open(self):
         self.close()
-        self._handle = _kernel32.CreateFileW(
-            self._path, GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, None,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
-        if self._handle == INVALID_HANDLE_VALUE:
-            raise VgbError("driver is not loaded (device missing)")
+
+        for path in (self._path, NT_DEVICE_PATH):
+            self._handle = _kernel32.CreateFileW(
+                path, GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+            if self._handle != INVALID_HANDLE_VALUE:
+                return
+
+        raise VgbError("driver is not loaded (device missing)")
 
     def close(self):
         if self._handle != INVALID_HANDLE_VALUE:

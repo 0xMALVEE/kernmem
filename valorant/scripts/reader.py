@@ -125,7 +125,8 @@ _k32.QueryFullProcessImageNameW.argtypes = [
 
 
 class _VersionInfo(ctypes.Structure):
-    _fields_ = [("signature", wt.DWORD), ("struc_version", wt.DWORD)]
+    _fields_ = [("signature", wt.DWORD), ("struc_version", wt.DWORD),
+                ("version_ms", wt.DWORD), ("version_ls", wt.DWORD)]
 
 
 def _image_path(pid: int) -> Optional[str]:
@@ -170,7 +171,7 @@ def client_patch(pid: int) -> Optional[str]:
         return None
 
     info = ctypes.cast(pointer, ctypes.POINTER(_VersionInfo)).contents
-    major, minor = info.signature, info.struc_version
+    major, minor = info.version_ms >> 16, info.version_ms & 0xFFFF
 
     return f"{major}.{minor}" if major else None
 

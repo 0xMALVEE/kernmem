@@ -111,11 +111,11 @@ OFFSETS: dict[str, Offset] = {
         note="UWorld -> UGameInstance", verified=False,
     ),
     "LocalPlayers": Offset(
-        "LocalPlayers", 0x0038,
+        "LocalPlayers", 0x0040,
         note="UGameInstance -> TArray<ULocalPlayer>", verified=False,
     ),
     "PlayerController": Offset(
-        "PlayerController", 0x0030,
+        "PlayerController", 0x0038,
         note="ULocalPlayer -> APlayerController", verified=False,
     ),
     "AcknowledgedPawn": Offset(
@@ -129,7 +129,7 @@ OFFSETS: dict[str, Offset] = {
 
     # -- camera ------------------------------------------------------------- #
     "CameraCachePriv": Offset(
-        "CameraCachePriv", 0x20A0,
+        "CameraCachePriv", 0x17B0,
         note="APlayerCameraManager -> FCameraCacheEntry (0x2630 + 0x10 on newer builds)",
         verified=False,
     ),
@@ -164,7 +164,7 @@ OFFSETS: dict[str, Offset] = {
         note="APlayerState -> FString display name", verified=False,
     ),
     "TeamComponent": Offset(
-        "TeamComponent", 0x06A0,
+        "TeamComponent", 0x06A8,
         note="APawn -> team component", verified=True,
     ),
     "TeamId": Offset(
@@ -173,7 +173,7 @@ OFFSETS: dict[str, Offset] = {
         verified=False,
     ),
     "DamageHandler": Offset(
-        "DamageHandler", 0x0C68,
+        "DamageHandler", 0x0C50,
         note="APawn -> damage handler; health and alive flag live under it", verified=True,
     ),
     "CachedLife": Offset(
@@ -191,9 +191,25 @@ OFFSETS: dict[str, Offset] = {
 
     # -- player array layout (relative to GameState) ------------------------ #
     "PlayerArray": Offset(
-        "PlayerArray", 0x02B0,
-        note="AGameStateBase -> TArray<APlayerState*>; Data, then Num, then Max",
-        verified=False,
+        "PlayerArray", 0x00A0,
+        note="ULevel -> TArray<AActor*>; Data, then Num, then Max. Reached through "
+             "UWorld->PersistentLevel, not through GameState",
+        verified=True,
+    ),
+    "Dormant": Offset(
+        "Dormant", 0x0101,
+        note="AActor -> byte; non-zero means not currently replicated",
+        verified=True,
+    ),
+    "LastRenderTime": Offset(
+        "LastRenderTime", 0x047C,
+        note="AActor -> float; a zero value means the actor is not being drawn",
+        verified=True,
+    ),
+    "ComponentToWorld": Offset(
+        "ComponentToWorld", 0x02D0,
+        note="USceneComponent -> FTransform; alternative to RelativeLocation",
+        verified=True,
     ),
     "ArrayCount": Offset(
         "ArrayCount", 0x0008,
