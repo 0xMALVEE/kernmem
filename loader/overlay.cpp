@@ -63,9 +63,9 @@ namespace
     /* World position, inline. */
     constexpr uint64_t OFF_HERO_POS = 0xA0;
 
-    /* Max health sits before the position and current health just behind it. */
-    constexpr int64_t OFF_HERO_HP_FROM_POS    = -4;
-    constexpr int64_t OFF_HERO_MAXHP_FROM_POS = -8;
+    /* Current health then max health, 0x64 and 0x68 into the stat block. */
+    constexpr int64_t OFF_HERO_HP_FROM_POS    = 0x64;
+    constexpr int64_t OFF_HERO_MAXHP_FROM_POS = 0x68;
 
     /* Own attack range; the pattern-derived offset first, then older fallbacks. */
     constexpr uint64_t OFF_HERO_ATTACK_RANGE     = 0x17080;

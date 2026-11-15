@@ -33,6 +33,117 @@ function teamLabel(team) {
   return 'team ' + team
 }
 
+function Map({ heroes, localPos }) {
+  const ref = useRef(null)
+
+  useEffect(() => {
+    const canvas = ref.current
+    if (!canvas) return
+
+    const size = 340
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = Math.round(size * dpr)
+    canvas.height = Math.round(size * dpr)
+    canvas.style.width = size + 'px'
+    canvas.style.height = size + 'px'
+
+    const ctx = canvas.getContext('2d')
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.fillStyle = '#080b10'
+    ctx.fillRect(0, 0, size, size)
+
+    ctx.strokeStyle = '#131b26'
+    for (let g = 0; g <= size; g += size / 8) {
+      ctx.beginPath()
+      ctx.moveTo(g, 0)
+      ctx.lineTo(g, size)
+      ctx.moveTo(0, g)
+      ctx.lineTo(size, g)
+      ctx.stroke()
+    }
+
+    const placed = heroes.filter((h) => h.position && Array.isArray(h.position.value))
+    const all = (localPos && localPos.length ? [localPos] : []).concat(placed.map((h) => h.position.value))
+    if (!all.length) return
+
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    all.forEach((p) => {
+      minX = Math.min(minX, p[0])
+      maxX = Math.max(maxX, p[0])
+      minY = Math.min(minY, p[1])
+      maxY = Math.max(maxY, p[1])
+    })
+
+    const pad = Math.max(maxX - minX, maxY - minY, 500) * 0.15
+    minX -= pad
+    maxX += pad
+    minY -= pad
+    maxY += pad
+    const span = Math.max(maxX - minX, maxY - minY, 1)
+
+    const toPx = (p) => [
+      ((p[0] - minX) / span) * size,
+      size - ((p[1] - minY) / span) * size,
+    ]
+
+    if (localPos && localPos.length) {
+      const [lx, ly] = toPx(localPos)
+      ctx.strokeStyle = '#7dff7d'
+      ctx.lineWidth = 1.2
+      ctx.beginPath()
+      ctx.arc(lx, ly, 7, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.fillStyle = '#7dff7d'
+      ctx.beginPath()
+      ctx.arc(lx, ly, 2.5, 0, Math.PI * 2)
+      ctx.fill()
+    }
+
+    ctx.font = '10px ui-monospace, monospace'
+    placed.forEach((h) => {
+      const [x, y] = toPx(h.position.value)
+      ctx.fillStyle = h.team === 2 ? '#ff5a5a' : '#7fb4ff'
+      ctx.beginPath()
+      ctx.arc(x, y, 4, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.fillStyle = '#d6e2f0'
+      ctx.fillText(h.name || '?', x + 6, y + 3)
+    })
+  }, [heroes, localPos])
+
+  return <canvas ref={ref} className="map" />
+}
+
+function Cards({ heroes, localPos }) {
+  return (
+    <div className="cards">
+      {heroes.map((h) => {
+        const pct = h.maxHp > 0 ? Math.max(0, Math.min(100, (h.hp / h.maxHp) * 100)) : 0
+        const d = distance(h.position && h.position.value, localPos)
+        return (
+          <div key={h.index} className={'card ' + (h.team === 2 ? 'enemy' : 'ally')}>
+            <div className="card-top">
+              <span className="card-name">{h.name || '(no name)'}</span>
+              <span className="mono dim">{teamLabel(h.team)}</span>
+            </div>
+            <div className="bar">
+              <span style={{ width: pct + '%' }} />
+            </div>
+            <div className="mono dim card-meta">
+              {num(h.hp, 0)}/{num(h.maxHp, 0)} hp
+              {d != null ? ' · ' + num(d, 0) + ' away' : ''}
+            </div>
+          </div>
+        )
+      })}
+      {!heroes.length && <p className="dim">no champions collected</p>}
+    </div>
+  )
+}
+
 function Screen({ conv, client }) {
   const ref = useRef(null)
 
@@ -259,6 +370,13 @@ function App() {
             </table>
           )}
           {scan && scan.error && <p className="bad mono">{scan.error}</p>}
+        </section>
+
+        <section className="panel map-panel">
+          <h2>map</h2>
+          <Map heroes={heroes} localPos={localPos} />
+          <h2>champions</h2>
+          <Cards heroes={heroes} localPos={localPos} />
         </section>
 
         <section className="panel json-panel">

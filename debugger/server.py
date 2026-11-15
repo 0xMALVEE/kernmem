@@ -37,8 +37,8 @@ OFF_HERO_LIST_COUNT = 0x10
 OFF_TEAM = 0x164          # byte, 1 = own side, 2 = enemy
 OFF_NAME = 0x3890         # ASCII, not UTF-16
 OFF_POS = 0xA0            # inline world position
-OFF_HP_FROM_POS = -4      # current health
-OFF_MAXHP_FROM_POS = -8   # max health
+OFF_HP_FROM_POS = 0x64    # current health
+OFF_MAXHP_FROM_POS = 0x68 # max health
 OFF_RANGE = 0x17080
 OFF_RANGE_ALT = 0x3E30
 
