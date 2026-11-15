@@ -1,12 +1,13 @@
 """
 Valorant smoke test - proves the chain without drawing anything.
 
-Resolves the client, decrypts UWorld, reads the camera and lists every player
-with name, team, health and position. Run it in a match with the driver loaded.
+Resolves the client, walks the actor array and prints position, health, team and
+name for every actor, plus which one is local. Run it in a match with the driver
+loaded.
 
     python demo.py
-    python demo.py --allow-stale      # build does not match the offset stamp
-    python demo.py --offsets          # print the table and exit
+    python demo.py --allow-stale
+    python demo.py --offsets
 """
 
 from __future__ import annotations
@@ -22,72 +23,50 @@ import offsets  # noqa: E402
 import reader  # noqa: E402
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Valorant chain smoke test")
-    parser.add_argument(
-        "--allow-stale", action="store_true",
-        help="continue even when the build does not match the offset stamp",
-    )
-    parser.add_argument(
-        "--offsets", action="store_true",
-        help="print the offset table with its provenance and exit",
-    )
+def main(argv: list) -> int:
+    parser = argparse.ArgumentParser(description='Valorant chain smoke test')
+    parser.add_argument('--allow-stale', action='store_true')
+    parser.add_argument('--offsets', action='store_true')
     options = parser.parse_args(argv)
 
     if options.offsets:
         print(offsets.summary())
         stale = offsets.unverified()
-        print(f"\n{len(stale)} entries are unverified: {', '.join(stale)}")
+        print(f'\n{len(stale)} unverified: {", ".join(stale)}')
         return 0
 
     try:
         game = reader.Game(allow_stale=options.allow_stale)
         game.open()
     except Exception as error:  # noqa: BLE001
-        print(f"open failed: {error}")
+        print(f'open failed: {error}')
         return 1
 
     with game:
-        print(f"pid        {game.pid}")
-        print(f"base       {game.base:#x}")
-        print(f"patch      {game.patch or 'unreadable'} (table stamped {offsets.PATCH})")
+        print(f'pid {game.pid}  base {game.base:#x}  patch {game.patch}')
 
-        world = game.uworld()
-        print(f"uworld     {world:#x}" if world else "uworld     0 (decrypt failed)")
+        actors = list(game.actors())
+        print(f'{len(actors)} actors')
 
-        camera = game.camera()
-        if camera is None:
-            print("camera     unresolved - check CameraCachePriv")
-        else:
-            location, rotation, fov = camera
-            print(
-                "camera     "
-                f"({location[0]:.1f}, {location[1]:.1f}, {location[2]:.1f}) "
-                f"pitch {rotation[0]:.1f} yaw {rotation[1]:.1f} roll {rotation[2]:.1f} "
-                f"fov {fov:.1f}"
-            )
+        local = game.local()
+        print(f'local: {local.address:#x}' if local else 'local: unresolved')
 
-        local = game.local_pawn()
-        print(f"local pawn {local:#x}" if local else "local pawn 0 (chain unresolved)")
-
+        origin = local.position if local else None
         print()
-        print(f"{'address':<18}{'team':<6}{'hp':<12}{'dist':<8}name")
-        count = 0
+        print(f'{"address":<20}{"team":<6}{"hp":<14}{"dist":<9}name')
 
-        for player in game.players():
-            distance = math.dist(camera[0], player.position) / 100.0 if camera else 0.0
-            flag = " <- local" if player.address == local else ""
+        for actor in actors:
+            distance = math.dist(origin, actor.position) / 100.0 if origin else 0.0
+            flag = ' <- local' if local and actor.address == local.address else ''
+            where = f'{actor.position[0]:.0f},{actor.position[1]:.0f}'
             print(
-                f"{player.address:#018x}{player.team:<6}"
-                f"{player.health:>5.0f}/{player.max_health:<5.0f}"
-                f"{distance:>6.0f}m  {player.name}{flag}"
+                f'{actor.address:#018x}{actor.team:<6}'
+                f'{actor.health:>5.0f}/{actor.max_health:<5.0f}'
+                f'{distance:>7.0f}m  {actor.name or "?"}  {where}{flag}'
             )
-            count += 1
-
-        print(f"\n{count} players")
 
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main(sys.argv[1:]))

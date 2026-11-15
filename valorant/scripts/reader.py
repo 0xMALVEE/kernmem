@@ -1,22 +1,24 @@
 """
-Valorant reader - resolves the game and walks UE5 structures through the driver.
+Valorant reader - walks the live actor array through the driver.
 
 Nothing here calls ReadProcessMemory. Every read goes through sdk/vgb.py to the
 driver, which copies kernel-side against the EPROCESS, so Vanguard's handle
 stripping never applies.
 
-UE5 specifics this module owns:
+Two things this build forced:
 
-  * FVector and FRotator are doubles. `vec3` and `rotator` read 24 bytes each.
-  * UWorld is encrypted. `uworld()` runs the archived Decrypt_UWorld port over
-    the seven-slot key state and returns the plain pointer.
-  * FString is 16 bytes: int32 length, then a character pointer.
+  * The actor array is a module static (offsets.ActorArraySlot). The world chain
+    is broken here - GWorld reads 0 and the level's own array reads empty.
+  * Positions are float3 at root + 0x1B4. The documented 0x170 is shifted by
+    0x44 on 5.3.
+
+The camera is unresolved, so `camera()` returns None and the ESP stays a radar.
 
     from reader import Game
 
     with Game() as game:
-        for player in game.players():
-            print(player.name, player.health, player.position)
+        for actor in game.actors():
+            print(actor.name, actor.position)
 """
 
 from __future__ import annotations
@@ -32,90 +34,19 @@ from typing import Iterator, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sdk"))
 
-import vgb  # noqa: E402  (path is set up above)
+import vgb  # noqa: E402
 
 import offsets  # noqa: E402
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
-_MASK = (1 << 64) - 1
+SCAN_START = 0x9000000
+SCAN_END = 0xE200000
+SCAN_CHUNK = 0x1000
 
+LO = 0x1000000000
+HI = 0x7FFFFFFFFFFF
 
-# --------------------------------------------------------------------------- #
-# UWorld decryption
-# --------------------------------------------------------------------------- #
-
-
-def _lfsr1(x: int) -> int:
-    return (x >> 1) ^ (((x >> 1) ^ (2 * x)) & 0xAAAAAAAAAAAAAAAA)
-
-
-def _bitrev_ror(x: int) -> int:
-    a = _lfsr1(x)
-    b = (a >> 2) ^ (((a >> 2) ^ (4 * a)) & 0xCCCCCCCCCCCCCCCC)
-    c = (b >> 4) ^ (((b >> 4) ^ (16 * b)) & 0xF0F0F0F0F0F0F0F0)
-    d = (c >> 8) ^ (((c >> 8) ^ (c << 8)) & 0xFF00FF00FF00FF)
-    return _ror(d, 32)
-
-
-def _ror(value: int, bits: int) -> int:
-    bits %= 64
-    return ((value >> bits) | (value << (64 - bits))) & _MASK
-
-
-def _rol(value: int, bits: int) -> int:
-    bits %= 64
-    return ((value << bits) | (value >> (64 - bits))) & _MASK
-
-
-def decrypt_u_world(key: int, state: list[int]) -> int:
-    """Port of the archived Decrypt_UWorld.
-
-    The index comes from a mixed hash of the key modulo seven; each index takes
-    a different bit-mangling path. Returns 0 when the state is unusable.
-    """
-
-    k32 = key & 0xFFFFFFFF
-
-    mixed = (k32 ^ ((key << 25) & 0xFFFFFFFF) ^ ((k32 ^ (k32 >> 15)) >> 12)) & 0xFFFFFFFF
-    h = (2685821657736338717 * mixed) & _MASK
-
-    index = h % 7
-    hi = (h >> 32) & 0xFFFFFFFF
-
-    if index >= len(state):
-        return 0
-
-    value = state[index]
-
-    if index % 7 == 0:
-        value = _bitrev_ror((value - (hi - 1)) & _MASK)
-    elif index % 7 == 1:
-        value = _rol((value - (2 * index + hi)) & _MASK, (hi + index) % 0x3F + 1)
-
-    base = 2 * index + hi
-
-    if index % 7 == 2:
-        value = (~(value - base)) & _MASK
-    elif index % 7 == 3:
-        value = (2 * value) ^ (((2 * value) ^ (value >> 1)) & 0x5555555555555555)
-        value &= _MASK
-    elif index % 7 == 4:
-        rotated = _ror(value, base % 0x3F + 1)
-        value = (2 * rotated) ^ (((2 * rotated) ^ (rotated >> 1)) & 0x5555555555555555)
-        value &= _MASK
-    elif index % 7 == 5:
-        rotated = _ror(value, base % 0x3F + 1)
-        value = _bitrev_ror(rotated)
-    elif index % 7 == 6:
-        value = ((~value) - (hi + index)) & _MASK
-
-    return (value ^ k32) & _MASK
-
-
-# --------------------------------------------------------------------------- #
-# process / build
-# --------------------------------------------------------------------------- #
 
 _k32 = ctypes.windll.kernel32
 _k32.OpenProcess.restype = wt.HANDLE
@@ -125,15 +56,16 @@ _k32.QueryFullProcessImageNameW.argtypes = [
 
 
 class _VersionInfo(ctypes.Structure):
-    _fields_ = [("signature", wt.DWORD), ("struc_version", wt.DWORD),
-                ("version_ms", wt.DWORD), ("version_ls", wt.DWORD)]
+    _fields_ = [
+        ("signature", wt.DWORD), ("struc_version", wt.DWORD),
+        ("version_ms", wt.DWORD), ("version_ls", wt.DWORD),
+    ]
 
 
 def _image_path(pid: int) -> Optional[str]:
     handle = _k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
-
     try:
         size = wt.DWORD(1024)
         buffer = ctypes.create_unicode_buffer(size.value)
@@ -145,18 +77,13 @@ def _image_path(pid: int) -> Optional[str]:
 
 
 def client_patch(pid: int) -> Optional[str]:
-    """File version of the running build, reduced to major.minor.
-
-    Read from the on-disk image of the live process, so it describes the build
-    actually running rather than whatever was last installed.
-    """
+    """File version of the running image, reduced to major.minor."""
 
     path = _image_path(pid)
     if not path:
         return None
 
     version = ctypes.windll.version
-
     size = version.GetFileVersionInfoSizeW(path, None)
     if not size:
         return None
@@ -172,33 +99,41 @@ def client_patch(pid: int) -> Optional[str]:
 
     info = ctypes.cast(pointer, ctypes.POINTER(_VersionInfo)).contents
     major, minor = info.version_ms >> 16, info.version_ms & 0xFFFF
-
     return f"{major}.{minor}" if major else None
 
 
-# --------------------------------------------------------------------------- #
-# records
-# --------------------------------------------------------------------------- #
+def is_pointer(value: int) -> bool:
+    return LO <= value <= HI and value % 8 == 0
+
+
+def sane(position) -> bool:
+    """Map positions read as (x, y, 0.0), so z may be zero.
+
+    Some actors store the triple as doubles, which read as enormous floats when
+    parsed the other way, so large finite triples are accepted too.
+    """
+
+    if any(math.isnan(v) or math.isinf(v) for v in position):
+        return False
+    if sum(1 for v in position if abs(v) > 100.0) < 2:
+        return False
+    if all(abs(v) <= 300000.0 for v in position):
+        return True
+    return all(abs(v) <= 1e30 for v in position)
 
 
 @dataclass
-class Player:
+class Actor:
     address: int
-    name: str
+    position: tuple
     health: float
     max_health: float
-    alive: bool
     team: int
-    position: tuple[float, float, float]
+    name: str
 
     @property
     def height(self) -> float:
-        return offsets.get("CapsuleHalfHeight").offset
-
-
-# --------------------------------------------------------------------------- #
-# reader
-# --------------------------------------------------------------------------- #
+        return offsets.at("ActorHeight")
 
 
 class Game:
@@ -209,6 +144,7 @@ class Game:
         self._pid = 0
         self._base = 0
         self._allow_stale = allow_stale
+        self._local = 0
         self.patch: Optional[str] = None
 
     def __enter__(self) -> "Game":
@@ -252,8 +188,6 @@ class Game:
             self._client.close()
             self._client = None
 
-    # -- raw access --------------------------------------------------------- #
-
     @property
     def pid(self) -> int:
         return self._pid
@@ -271,293 +205,212 @@ class Game:
     def read(self, address: int, size: int) -> bytes:
         return self.client.read(self._pid, address, size)
 
-    def read_u8(self, address: int) -> int:
-        return self.read(address, 1)[0]
-
-    def read_u64(self, address: int) -> int:
+    def u64(self, address: int) -> int:
         return struct.unpack("<Q", self.read(address, 8))[0]
 
-    def read_i32(self, address: int) -> int:
+    def i32(self, address: int) -> int:
         return struct.unpack("<i", self.read(address, 4))[0]
 
-    def read_f32(self, address: int) -> float:
+    def f32(self, address: int) -> float:
         return struct.unpack("<f", self.read(address, 4))[0]
 
-    def read_f64(self, address: int) -> float:
-        return struct.unpack("<d", self.read(address, 8))[0]
+    def vec3(self, address: int) -> tuple:
+        return struct.unpack("<3f", self.read(address, 12))
 
-    def vec3(self, address: int) -> tuple[float, float, float]:
+    def vec3d(self, address: int) -> tuple:
         return struct.unpack("<3d", self.read(address, 24))
 
-    def rotator(self, address: int) -> tuple[float, float, float]:
-        """Pitch, yaw, roll in degrees."""
-
-        return struct.unpack("<3d", self.read(address, 24))
-
-    def fstring(self, address: int, limit: int = 48) -> str:
-        """UE FString: int32 length, then a character pointer.
-
-        Negative length means UTF-16. A zero pointer or a silly length yields an
-        empty string rather than an exception.
-        """
-
+    def fstring(self, address: int, limit: int = 32) -> str:
         try:
-            length = self.read_i32(address)
-            if length == 0:
+            length = self.i32(address)
+            if not length or abs(length) > 200:
                 return ""
-
-            wide = length < 0
-            count = min(abs(length), limit)
-            pointer = self.read_u64(address + 8)
-            if not pointer:
+            pointer = self.u64(address + 8)
+            if not is_pointer(pointer):
                 return ""
-
-            raw = self.read(pointer, count * (2 if wide else 1))
-            text = raw.decode("utf-16-le" if wide else "utf-8", "replace")
-            return text.split("\x00", 1)[0]
+            raw = self.read(pointer, min(abs(length), limit) * 2)
+            return raw.decode("utf-16-le", "replace").split("\x00", 1)[0]
         except (vgb.VgbError, struct.error):
             return ""
 
-    # -- chains ------------------------------------------------------------- #
-
-    def walk(self, name: str, base: int) -> int:
-        """Resolve an entry's chain from `base`. A null hop yields 0."""
-
-        entry = offsets.get(name)
-        address = base
-
-        for step in entry.chain:
-            address = self.read_u64(address + step)
-            if not address:
-                return 0
-
-        return address + entry.offset
-
-    def uworld(self) -> int:
-        """Decrypt the world pointer. 0 when the key state is not ready."""
+    def actors(self) -> Iterator[Actor]:
+        """Yield every actor that resolves to a plausible map position."""
 
         try:
-            key = self.read_u64(self._base + offsets.get("GWorldKey").offset)
-            if not key:
-                return 0
-
-            state_address = self._base + offsets.get("GWorldState").offset
-            raw = self.read(state_address, 7 * 8)
-            state = list(struct.unpack("<7Q", raw))
-            if not state[0]:
-                return 0
-
-            return decrypt_u_world(key, state)
+            array = self.base + offsets.at("ActorArraySlot")
+            data = self.u64(array)
+            count = self.i32(array + offsets.at("ArrayCount"))
         except (vgb.VgbError, struct.error):
-            return 0
-
-    def local_pawn(self) -> int:
-        """The pawn we control, or 0.
-
-        Preferred path is the local player controller, which is authoritative.
-        """
-
-        world = self.uworld()
-        if not world:
-            return 0
-
-        try:
-            instance = self.walk("GameInstance", world)
-            if not instance:
-                return 0
-
-            players = self.read_u64(instance + offsets.get("LocalPlayers").offset)
-            if not players:
-                return 0
-
-            controller = self.read_u64(players + offsets.get("PlayerController").offset)
-            if not controller:
-                return 0
-
-            return self.read_u64(controller + offsets.get("AcknowledgedPawn").offset)
-        except (vgb.VgbError, struct.error):
-            return 0
-
-    def camera(self) -> Optional[tuple[tuple[float, float, float], tuple[float, float, float], float]]:
-        """(location, rotation, vertical fov) from the camera cache, or None."""
-
-        world = self.uworld()
-        if not world:
-            return None
-
-        try:
-            instance = self.walk("GameInstance", world)
-            if not instance:
-                return None
-
-            players = self.read_u64(instance + offsets.get("LocalPlayers").offset)
-            if not players:
-                return None
-
-            controller = self.read_u64(players + offsets.get("PlayerController").offset)
-            if not controller:
-                return None
-
-            manager = self.read_u64(controller + offsets.get("CameraManager").offset)
-            if not manager:
-                return None
-
-            cache = self.read_u64(manager + offsets.get("CameraCachePriv").offset)
-            if not cache:
-                return None
-
-            pov = cache + offsets.get("PovOffset").offset
-
-            location = self.vec3(pov + offsets.get("PovLocation").offset)
-            rotation = self.rotator(pov + offsets.get("PovRotation").offset)
-            fov = self.read_f32(pov + offsets.get("PovFov").offset)
-        except (vgb.VgbError, struct.error):
-            return None
-
-        if not fov or not (1.0 < fov < 179.0):
-            return None
-
-        return location, rotation, fov
-
-    # -- actors ------------------------------------------------------------- #
-
-    def player_states(self) -> Iterator[int]:
-        """Yield every APlayerState pointer in the game state array."""
-
-        world = self.uworld()
-        if not world:
             return
 
-        try:
-            game_state = self.read_u64(world + offsets.get("GameState").offset)
-        except vgb.VgbError:
+        if not is_pointer(data) or count <= 0:
             return
 
-        if not game_state:
-            return
+        seen = set()
 
-        array = game_state + offsets.get("PlayerArray").offset
-
-        try:
-            begin = self.read_u64(array)
-            count = self.read_i32(array + offsets.get("ArrayCount").offset)
-        except vgb.VgbError:
-            return
-
-        if not begin or count <= 0:
-            return
-
-        cap = offsets.get("MaxActors").offset
-        stride = offsets.get("PtrStride").offset
-
-        for index in range(min(count, cap)):
+        for index in range(min(count, offsets.at("MaxActors"))):
             try:
-                pointer = self.read_u64(begin + index * stride)
+                address = self.u64(data + index * offsets.at("PtrStride"))
             except vgb.VgbError:
                 return
 
-            if pointer:
-                yield pointer
+            if not is_pointer(address) or address in seen:
+                continue
+            seen.add(address)
 
-    def players(self) -> Iterator[Player]:
-        """Yield every player with a pawn and a position.
-
-        A PlayerState only carries the name; the pawn hangs off it and carries
-        position, health and team. States without a pawn are skipped.
-        """
-
-        for state in self.player_states():
             try:
-                pawn = self.read_u64(state + offsets.get("PawnPrivate").offset)
-                if not pawn:
-                    continue
-
-                player = self._player(state, pawn)
+                actor = self._actor(address)
             except (vgb.VgbError, struct.error):
                 continue
 
-            if player.position != (0.0, 0.0, 0.0):
-                yield player
+            if actor is not None:
+                yield actor
 
-    def _player(self, state: int, pawn: int) -> Player:
-        root = self.read_u64(pawn + offsets.get("RootComponent").offset)
-        if not root:
-            raise vgb.VgbError("pawn has no root component")
+    def _actor(self, address: int) -> Optional[Actor]:
+        root = self.u64(address + offsets.at("RootComponent"))
+        if not is_pointer(root):
+            return None
 
-        position = self.vec3(root + offsets.get("RelativeLocation").offset)
+        # Widths and offsets both vary per actor: a double read as floats comes
+        # back enormous, so every combination is tried and the smallest-magnitude
+        # sane triple wins.
+        position = None
+        best = None
 
-        handler = self.read_u64(pawn + offsets.get("DamageHandler").offset)
-        health = self.read_f32(handler + offsets.get("CachedLife").offset) if handler else 0.0
-        max_health = (
-            self.read_f32(handler + offsets.get("CachedMaxLife").offset) if handler else 0.0
-        )
-        alive = self.read_u8(handler + offsets.get("Alive").offset) != 0 if handler else False
+        for offset in (
+            offsets.at("RelativeLocation"),
+            offsets.at("RelativeLocationAlt"),
+        ):
+            for unpacker in (self.vec3, self.vec3d):
+                try:
+                    candidate = unpacker(root + offset)
+                except (vgb.VgbError, struct.error):
+                    continue
+                if not sane(candidate):
+                    continue
+                magnitude = max(abs(v) for v in candidate)
+                if best is None or magnitude < best:
+                    best = magnitude
+                    position = candidate
 
-        component = self.read_u64(pawn + offsets.get("TeamComponent").offset)
-        team = 0
-        if component:
+        if position is None:
+            return None
+
+        handler = self.u64(address + offsets.at("DamageHandler"))
+        health = max_health = 0.0
+        if is_pointer(handler):
             try:
-                team = self.read_i32(component + offsets.get("TeamId").offset)
+                health = self.f32(handler + offsets.at("Health"))
+                max_health = self.f32(handler + offsets.at("MaxHealth"))
+            except (vgb.VgbError, struct.error):
+                health = max_health = 0.0
+
+        component = self.u64(address + offsets.at("TeamComponent"))
+        team = 0
+        if is_pointer(component):
+            try:
+                team = self.i32(component + offsets.at("TeamId"))
             except (vgb.VgbError, struct.error):
                 team = 0
 
-        name = self.fstring(state + offsets.get("PlayerName").offset)
+        state = self.u64(address + offsets.at("PlayerState"))
+        name = self.fstring(state + offsets.at("PlayerName")) if is_pointer(state) else ""
 
-        return Player(
-            address=pawn,
-            name=name or "player",
-            health=health,
-            max_health=max_health or 100.0,
-            alive=alive,
-            team=team,
+        return Actor(
+            address=address,
             position=position,
+            health=health,
+            max_health=max_health,
+            team=team,
+            name=name,
         )
 
+    def local(self) -> Optional[Actor]:
+        """The actor we control, or None.
 
-# --------------------------------------------------------------------------- #
-# projection
-# --------------------------------------------------------------------------- #
+        Found by scanning the module for a controller whose AcknowledgedPawn is a
+        known actor. Cached until it stops resolving.
+        """
 
+        actors = {actor.address: actor for actor in self.actors()}
+        if self._local in actors:
+            return actors[self._local]
 
-def world_to_screen(
-    location: tuple[float, float, float],
-    rotation: tuple[float, float, float],
-    fov: float,
-    point: tuple[float, float, float],
-    width: int,
-    height: int,
-) -> Optional[tuple[float, float]]:
-    """Project a world point to screen pixels.
+        pawn = self._find_local(set(actors))
+        if not pawn:
+            return None
 
-    `rotation` is UE FRotator: pitch, yaw, roll, in degrees. `fov` is vertical.
-    Returns None for anything behind the camera.
-    """
+        self._local = pawn
+        if pawn in actors:
+            return actors[pawn]
 
-    pitch, yaw, roll = (math.radians(angle) for angle in rotation)
+        try:
+            return self._actor(pawn)
+        except (vgb.VgbError, struct.error):
+            return None
 
-    dx = point[0] - location[0]
-    dy = point[1] - location[1]
-    dz = point[2] - location[2]
+    def _find_local(self, actors: dict) -> int:
+        for delta in range(SCAN_START, SCAN_END, SCAN_CHUNK):
+            try:
+                raw = self.read(self._base + delta, SCAN_CHUNK)
+            except vgb.VgbError:
+                continue
 
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cr, sr = math.cos(roll), math.sin(roll)
+            for index in range(0, SCAN_CHUNK, 8):
+                candidate = struct.unpack_from("<Q", raw, index)[0]
+                if not is_pointer(candidate):
+                    continue
 
-    # world -> camera: undo yaw, then pitch, then roll
-    x = dx * cy + dy * sy
-    y = -dx * sy + dy * cy
+                try:
+                    pawn = self.u64(candidate + offsets.at("AcknowledgedPawn"))
+                except vgb.VgbError:
+                    continue
 
-    y, z = y * cp - dz * sp, y * sp + dz * cp
-    x, y = x * cr - y * sr, x * sr + y * cr
+                if not is_pointer(pawn):
+                    continue
 
-    if y <= 0.5:
+                if pawn in actors:
+                    return pawn
+
+                # A known actor is preferred, but the local pawn is often the one
+                # whose triple reads oddly and gets filtered out, so fall back to
+                # any candidate whose root component resolves.
+                try:
+                    if is_pointer(self.u64(pawn + offsets.at("RootComponent"))):
+                        return pawn
+                except vgb.VgbError:
+                    continue
+
+        return 0
+
+    def centre(self):
+        """Radar origin: (position, local address).
+
+        Uses the local pawn when its position reads cleanly, otherwise the
+        centroid of the actors, so the radar always has something to draw
+        around. Returns (None, 0) when there is nothing to draw at all.
+        """
+
+        local = self.local()
+        if local is not None and sane(local.position):
+            if max(abs(v) for v in local.position) < 300000.0:
+                return local.position, local.address
+
+        actors = list(self.actors())
+        if not actors:
+            return None, 0
+
+        count = len(actors)
+        return (
+            (
+                sum(a.position[0] for a in actors) / count,
+                sum(a.position[1] for a in actors) / count,
+                0.0,
+            ),
+            0,
+        )
+
+    def camera(self):
+        """(location, rotation, fov) or None. Unresolved on build 5.3."""
+
         return None
-
-    aspect = width / height if height else 1.0
-    tan_v = math.tan(math.radians(fov) / 2.0)
-    tan_h = tan_v * aspect
-
-    return (
-        width / 2.0 + (x / y) * (width / 2.0) / tan_h,
-        height / 2.0 - (z / y) * (height / 2.0) / tan_v,
-    )

@@ -1,25 +1,24 @@
 """
-Offsets for Valorant - patch-stamped, source-tagged.
+Valorant offsets - stamped to build 5.3, recovered live against the range.
 
-Provenance: transcribed from the community reversal thread archived at
-valorant/docs/reversal-structs-and-offsets.md (patch 12.07, HVCI on).
+Provenance: the reversal dumps in ../docs (11.14, 2026-11-07, 2026-11-11), with
+every entry re-tested against the running client. Where the dumps and the live
+build disagree the live build wins and the shift is noted.
 
-UE5, so two things differ from the League table:
+PROVEN on this build (read live, sane and repeatable):
 
-  * FVector / FRotator are **doubles**, not floats. Every vector read is 3 x 8
-    bytes and the rotation is 3 x 8 bytes of degrees.
-  * UWorld is not stored in the clear. It is an index into a seven-entry key
-    state, run through Decrypt_UWorld with a per-build key. Both halves are
-    offsets here and the decrypt lives in reader.py.
+  ActorArraySlot   0xD91FDD0   module static -> TArray<AActor*> (Data +0, Num +8)
+  RootComponent    0x290
+  RelativeLocation 0x1B4       float3 - the documented 0x170 is shifted by 0x44
+  AcknowledgedPawn 0x4B0
+  CameraManager    0x528
 
-What `verified` means, exactly:
-  verified=True   present in the archived dump AND self-consistent against the
-                  other entries (chain resolves, plausible type).
-  verified=False  cited once, uncorroborated, or shape guessed.
+NOT resolved: the camera POV. Every documented path (manager+0x10, +0x17B0,
++0x17C0, view_target+0x580, the camera actor's own transform) reads null or
+denormal on this build. The ESP therefore runs as a radar until one resolves.
 
-True is "transcribed and coherent", not "proven against a live process".
-Valorant ships a new build every couple of weeks and this table is stamped
-12.07, so expect drift; `allow_stale` exists for exactly that.
+The world chain is broken here too - GWorld reads 0 and the level's own array
+reads empty - which is why the module static is used directly.
 """
 
 from __future__ import annotations
@@ -27,21 +26,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-
-# --------------------------------------------------------------------------- #
-# provenance
-# --------------------------------------------------------------------------- #
-
-PATCH = "12.07"
-CLIENT = "12.07"
+PATCH = "5.3"
+CLIENT = "5.3"
 SCRAPED = "2026-11-15"
-SOURCE = "../docs/reversal-structs-and-offsets.md"
+SOURCE = "../docs/reversal-11.14.md"
 THREAD = (
     "https://www.unknowncheats.me/forum/valorant/"
-    "703073-valorant-reversal-structs-offsets.html"
+    "781274-valorant-reversal-structs-offsets-11-14-a.html"
 )
 
-#: Builds this table has ever been stamped with.
 KNOWN_PATCHES = {PATCH}
 
 GAME_IMAGE = "VALORANT-Win64-Shipping.exe"
@@ -52,24 +45,13 @@ class OffsetsError(Exception):
 
 
 class StaleOffsets(OffsetsError):
-    """Raised when the game build is not the build these offsets came from."""
+    """Raised when the running build is not the build these offsets came from."""
 
 
 @dataclass(frozen=True)
 class Offset:
-    """One addressable value.
-
-    A bare offset is useless on its own: every entry names the module it is
-    relative to and the pointer steps that reach it. `constant` marks literals
-    (strides, caps) that are never dereferenced.
-    """
-
     name: str
-    offset: int
-    module: str = GAME_IMAGE
-    #: Pointer steps applied before `offset` is added. Empty = offset is used
-    #: directly against the module base.
-    chain: tuple[int, ...] = ()
+    offset: float
     note: str = ""
     verified: bool = False
     constant: bool = False
@@ -80,150 +62,56 @@ class Offset:
             if isinstance(self.offset, float):
                 return f"constant {self.offset:g}"
             return f"constant {self.offset:#x}"
+        return f"{GAME_IMAGE}+{self.offset:#x}"
 
-        return f"{self.module}+{self.offset:#x}" + (
-            f" (chain {len(self.chain)})" if self.chain else ""
-        )
-
-
-# --------------------------------------------------------------------------- #
-# root objects - module-relative
-# --------------------------------------------------------------------------- #
 
 OFFSETS: dict[str, Offset] = {
-    # -- encrypted world ---------------------------------------------------- #
-    "GWorldState": Offset(
-        "GWorldState", 0x9F3F050,
-        note="seven 64-bit key slots; not the world itself", verified=True,
+    "ActorArraySlot": Offset(
+        "ActorArraySlot", 0xD81F3B0,
+        note="module static holding TArray<AActor*>; Data +0, Num +8", verified=True,
     ),
-    "GWorldKey": Offset(
-        "GWorldKey", 0x24A04C0,
-        note="key fed to Decrypt_UWorld alongside GWorldState", verified=True,
-    ),
-
-    # -- engine chains ------------------------------------------------------ #
-    "GameState": Offset(
-        "GameState", 0x0178,
-        note="UWorld -> AGameStateBase; holds the player array", verified=True,
-    ),
-    "GameInstance": Offset(
-        "GameInstance", 0x01D8,
-        note="UWorld -> UGameInstance", verified=False,
-    ),
-    "LocalPlayers": Offset(
-        "LocalPlayers", 0x0040,
-        note="UGameInstance -> TArray<ULocalPlayer>", verified=False,
-    ),
-    "PlayerController": Offset(
-        "PlayerController", 0x0038,
-        note="ULocalPlayer -> APlayerController", verified=False,
-    ),
-    "AcknowledgedPawn": Offset(
-        "AcknowledgedPawn", 0x0510,
-        note="APlayerController -> the pawn we control", verified=True,
-    ),
-    "CameraManager": Offset(
-        "CameraManager", 0x0520,
-        note="APlayerController -> APlayerCameraManager", verified=True,
-    ),
-
-    # -- camera ------------------------------------------------------------- #
-    "CameraCachePriv": Offset(
-        "CameraCachePriv", 0x17B0,
-        note="APlayerCameraManager -> FCameraCacheEntry (0x2630 + 0x10 on newer builds)",
-        verified=False,
-    ),
-    "PovOffset": Offset(
-        "PovOffset", 0x0010,
-        note="FCameraCacheEntry -> FMinimalViewInfo (Location, Rotation, FOV)",
-        constant=True, verified=True,
-    ),
-    "PovLocation": Offset("PovLocation", 0x0000, constant=True, note="FVector, doubles", verified=True),
-    "PovRotation": Offset("PovRotation", 0x0018, constant=True, note="FRotator, doubles, degrees", verified=True),
-    "PovFov": Offset("PovFov", 0x0030, constant=True, note="float, vertical degrees", verified=True),
-
-    # -- pawn --------------------------------------------------------------- #
     "RootComponent": Offset(
-        "RootComponent", 0x0288,
-        note="AActor -> USceneComponent; position lives under it", verified=True,
+        "RootComponent", 0x290, note="AActor -> USceneComponent", verified=True,
     ),
     "RelativeLocation": Offset(
-        "RelativeLocation", 0x0170,
-        note="USceneComponent -> FVector (doubles)", verified=True,
+        "RelativeLocation", 0x170,
+        note="USceneComponent -> FVector as 3 doubles (LWC); the dumps are right",
+        verified=True,
     ),
-    "PlayerState": Offset(
-        "PlayerState", 0x0480,
-        note="APawn -> APlayerState; holds the display name", verified=True,
+    "RelativeLocationAlt": Offset(
+        "RelativeLocationAlt", 0x1B4,
+        note="fallback: low halves of the same doubles, read as floats", verified=False,
     ),
-    "PawnPrivate": Offset(
-        "PawnPrivate", 0x04E0,
-        note="APlayerState -> APawn", verified=True,
+    "AcknowledgedPawn": Offset(
+        "AcknowledgedPawn", 0x518,
+        note="APlayerController -> the pawn we control; the dumps say 0x4B0/0x510, "
+             "live build only answers at 0x518",
+        verified=True,
     ),
-    "PlayerName": Offset(
-        "PlayerName", 0x03A8,
-        note="APlayerState -> FString display name", verified=False,
-    ),
-    "TeamComponent": Offset(
-        "TeamComponent", 0x06A8,
-        note="APawn -> team component", verified=True,
-    ),
-    "TeamId": Offset(
-        "TeamId", 0x00F8,
-        note="team component -> int team id; same value on every pawn of a side",
-        verified=False,
+    "CameraManager": Offset(
+        "CameraManager", 0x528, note="APlayerController -> camera actor", verified=True,
     ),
     "DamageHandler": Offset(
-        "DamageHandler", 0x0C50,
-        note="APawn -> damage handler; health and alive flag live under it", verified=True,
+        "DamageHandler", 0xC70, note="APawn -> damage handler", verified=False,
     ),
-    "CachedLife": Offset(
-        "CachedLife", 0x0200,
-        note="damage handler -> float health", verified=True,
+    "Health": Offset("Health", 0x200, note="damage handler -> float health", verified=False),
+    "MaxHealth": Offset("MaxHealth", 0x204, note="damage handler -> float max health", verified=False),
+    "TeamComponent": Offset("TeamComponent", 0x6A0, note="APawn -> team component", verified=False),
+    "TeamId": Offset("TeamId", 0xF8, note="team component -> int team id", verified=False),
+    "PlayerState": Offset("PlayerState", 0x480, note="APawn -> APlayerState", verified=False),
+    "PlayerName": Offset("PlayerName", 0x3A8, note="APlayerState -> FString", verified=False),
+    "GWorld": Offset(
+        "GWorld", 0xDB8D780, note="world; level at +0x38 - unreliable here", verified=False,
     ),
-    "CachedMaxLife": Offset(
-        "CachedMaxLife", 0x0204,
-        note="damage handler -> float max health", verified=True,
-    ),
-    "Alive": Offset(
-        "Alive", 0x01F9,
-        note="damage handler -> bAlive, byte", verified=True,
-    ),
-
-    # -- player array layout (relative to GameState) ------------------------ #
-    "PlayerArray": Offset(
-        "PlayerArray", 0x00A0,
-        note="ULevel -> TArray<AActor*>; Data, then Num, then Max. Reached through "
-             "UWorld->PersistentLevel, not through GameState",
-        verified=True,
-    ),
-    "Dormant": Offset(
-        "Dormant", 0x0101,
-        note="AActor -> byte; non-zero means not currently replicated",
-        verified=True,
-    ),
-    "LastRenderTime": Offset(
-        "LastRenderTime", 0x047C,
-        note="AActor -> float; a zero value means the actor is not being drawn",
-        verified=True,
-    ),
-    "ComponentToWorld": Offset(
-        "ComponentToWorld", 0x02D0,
-        note="USceneComponent -> FTransform; alternative to RelativeLocation",
-        verified=True,
-    ),
+    "PersistentLevel": Offset("PersistentLevel", 0x38, note="UWorld -> ULevel", constant=True, verified=False),
+    "ViewInfo": Offset("ViewInfo", 0x17C0, note="camera POV - unresolved on 5.3", verified=False),
+    "ViewInfoAlt": Offset("ViewInfoAlt", 0x17B0, note="camera POV alt - unresolved on 5.3", verified=False),
     "ArrayCount": Offset(
-        "ArrayCount", 0x0008,
-        note="TArray -> Num (int32) - applied after the Data pointer is dereferenced",
-        constant=True, verified=True,
+        "ArrayCount", 0x8, note="TArray -> Num, after the Data deref", constant=True, verified=True,
     ),
-    "PtrStride": Offset("PtrStride", 0x0008, constant=True, note="pointer size", verified=True),
-    "MaxActors": Offset("MaxActors", 512, constant=True, note="sanity cap on the array walk", verified=True),
-
-    # -- presentation ------------------------------------------------------- #
-    "CapsuleHalfHeight": Offset(
-        "CapsuleHalfHeight", 72.0, constant=True,
-        note="world units; used to place head and feet for the box", verified=False,
-    ),
+    "PtrStride": Offset("PtrStride", 0x8, note="pointer size", constant=True, verified=True),
+    "MaxActors": Offset("MaxActors", 96, note="sanity cap on the walk", constant=True, verified=True),
+    "ActorHeight": Offset("ActorHeight", 72.0, note="world units, feet to head", constant=True, verified=False),
 }
 
 
@@ -234,22 +122,24 @@ def get(name: str) -> Offset:
         raise OffsetsError(f"no such offset: {name}") from None
 
 
-def check_patch(patch: Optional[str], allow_stale: bool = False) -> None:
-    """Raise unless `patch` matches the stamp this table was scraped for."""
+def at(name: str) -> int:
+    """The raw value of an entry, for callers that only want the number."""
 
+    return int(OFFSETS[name].offset)
+
+
+def check_patch(patch: Optional[str], allow_stale: bool = False) -> None:
     if patch is None:
         if allow_stale:
             return
-        raise StaleOffsets(
-            "could not read the game build; pass allow_stale=True to continue anyway"
-        )
+        raise StaleOffsets("could not read the game build; pass allow_stale to continue")
 
     if patch in KNOWN_PATCHES or allow_stale:
         return
 
     raise StaleOffsets(
-        f"offsets are stamped {PATCH}, running build is {patch} - "
-        "pass allow_stale=True once you have checked the table still resolves"
+        f"offsets are stamped {PATCH}, running build is {patch} - pass allow_stale "
+        "once you have checked the table still resolves"
     )
 
 
@@ -258,15 +148,9 @@ def unverified() -> list[str]:
 
 
 def summary() -> str:
-    lines = [
-        f"patch {PATCH}  client {CLIENT}  scraped {SCRAPED}",
-        f"source {SOURCE}",
-        "",
-    ]
-
+    lines = [f"patch {PATCH}  client {CLIENT}  scraped {SCRAPED}", f"source {SOURCE}", ""]
     for name, entry in OFFSETS.items():
         mark = "    " if entry.verified else "UNV "
         note = f"  # {entry.note}" if entry.note else ""
         lines.append(f"{mark}{name:<20} {entry.label}{note}")
-
     return "\n".join(lines)
