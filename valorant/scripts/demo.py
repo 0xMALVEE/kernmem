@@ -51,13 +51,13 @@ def main(argv: list) -> int:
         local = game.local()
         print(f'local: {local.address:#x}' if local else 'local: unresolved')
 
-        origin = local.position if local else None
+        origin, marked = game.centre()
         print()
         print(f'{"address":<20}{"team":<6}{"hp":<14}{"dist":<9}name')
 
         for actor in actors:
             distance = math.dist(origin, actor.position) / 100.0 if origin else 0.0
-            flag = ' <- local' if local and actor.address == local.address else ''
+            flag = ' <- local' if actor.address == marked else ''
             where = f'{actor.position[0]:.0f},{actor.position[1]:.0f}'
             print(
                 f'{actor.address:#018x}{actor.team:<6}'

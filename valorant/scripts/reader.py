@@ -9,10 +9,12 @@ Two things this build forced:
 
   * The actor array is a module static (offsets.ActorArraySlot). The world chain
     is broken here - GWorld reads 0 and the level's own array reads empty.
-  * Positions are float3 at root + 0x1B4. The documented 0x170 is shifted by
-    0x44 on 5.3.
+  * Positions are three doubles at root + 0x170 (UE5 large-world coordinates).
+    The 0x1B4 slot is the same bytes read as floats and is only a fallback.
 
 The camera is unresolved, so `camera()` returns None and the ESP stays a radar.
+`centre()` therefore falls back to the centroid of the actors when the pawn we
+control is not in the array.
 
     from reader import Game
 
@@ -369,17 +371,11 @@ class Game:
                 if not is_pointer(pawn):
                     continue
 
+                # Only an actor from the array counts. Image pointers also answer
+                # 0x518 with plausible-looking values but are not the pawn, so
+                # accepting them puts the radar origin kilometres away.
                 if pawn in actors:
                     return pawn
-
-                # A known actor is preferred, but the local pawn is often the one
-                # whose triple reads oddly and gets filtered out, so fall back to
-                # any candidate whose root component resolves.
-                try:
-                    if is_pointer(self.u64(pawn + offsets.at("RootComponent"))):
-                        return pawn
-                except vgb.VgbError:
-                    continue
 
         return 0
 
