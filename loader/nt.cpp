@@ -5,6 +5,10 @@
 #include <fstream>
 #include <iterator>
 
+#include <psapi.h>
+
+#include "log.h"
+
 namespace nt
 {
     std::wstring GetFullTempPath()
@@ -54,37 +58,88 @@ namespace nt
 
     namespace
     {
-        /* Pulls the module list into a heap buffer; free with VirtualFree. */
+        /*
+         * Pulls the module list into a heap buffer; free with VirtualFree.
+         *
+         * The buffer is allocated up front and grown on ANY failure, not only on
+         * STATUS_INFO_LENGTH_MISMATCH. Starting from a null buffer and a zero
+         * length makes some builds answer STATUS_INVALID_PARAMETER instead, and a
+         * loop that only retries on LENGTH_MISMATCH then gives up on the very
+         * first call - which is exactly how this reported "unreadable" on a
+         * perfectly healthy machine.
+         */
         PRTL_PROCESS_MODULES QueryModules()
         {
-            void* buffer = nullptr;
-            DWORD bufferSize = 0;
+            ULONG bufferSize = 0x10000;
+            NTSTATUS status = STATUS_INFO_LENGTH_MISMATCH;
 
-            NTSTATUS status = NtQuerySystemInformation(
-                (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize, &bufferSize);
-
-            while (status == STATUS_INFO_LENGTH_MISMATCH)
+            for (int attempt = 0; attempt < 8; ++attempt)
             {
-                if (buffer)
-                    VirtualFree(buffer, 0, MEM_RELEASE);
+                auto buffer = static_cast<PRTL_PROCESS_MODULES>(
+                    VirtualAlloc(nullptr, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 
-                buffer = VirtualAlloc(nullptr, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (!buffer)
                     return nullptr;
 
+                ULONG needed = bufferSize;
+
                 status = NtQuerySystemInformation(
-                    (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize,
-                    &bufferSize);
+                    (SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, bufferSize, &needed);
+
+                if (NT_SUCCESS(status))
+                    return buffer;
+
+                VirtualFree(buffer, 0, MEM_RELEASE);
+
+                if (needed > bufferSize)
+                    bufferSize = needed + 0x1000;
+                else
+                    bufferSize *= 2;
             }
 
-            if (!NT_SUCCESS(status) || !buffer)
+            vgb_log::Error("SystemModuleInformation failed (0x%08X)", (unsigned)status);
+            return nullptr;
+        }
+
+        /*
+         * Independent route to the same answer: EnumDeviceDrivers returns loaded
+         * driver bases and the kernel is entry 0. Used when the native query is
+         * refused, which hardened builds can do even for a normal user.
+         */
+        uint64_t KernelBaseViaPsapi()
+        {
+            LPVOID drivers[1024];
+            DWORD needed = 0;
+
+            if (!EnumDeviceDrivers(drivers, sizeof(drivers), &needed) || !needed)
+                return 0;
+
+            const size_t count = needed / sizeof(LPVOID);
+
+            for (size_t i = 0; i < count && i < 8 && i < _countof(drivers); ++i)
             {
-                if (buffer)
-                    VirtualFree(buffer, 0, MEM_RELEASE);
-                return nullptr;
+                wchar_t path[MAX_PATH] = { 0 };
+
+                if (!GetDeviceDriverFileNameW(drivers[i], path, MAX_PATH))
+                    continue;
+
+                const wchar_t* base = wcsrchr(path, L'\\');
+                base = base ? base + 1 : path;
+
+                if (_wcsicmp(base, L"ntoskrnl.exe") == 0 ||
+                    _wcsicmp(base, L"ntkrnlmp.exe") == 0)
+                    return reinterpret_cast<uint64_t>(drivers[i]);
             }
 
-            return static_cast<PRTL_PROCESS_MODULES>(buffer);
+            /* No name match: entry 0 is the kernel on every build seen. The
+             * plausibility test is inlined because this function sits above
+             * PlausibleKernelBase in the file. */
+            const uint64_t first = reinterpret_cast<uint64_t>(drivers[0]);
+
+            if (first < 0xFFFF800000000000ULL || (first & 0xFFF) != 0)
+                return 0;
+
+            return first;
         }
 
         const char* ModuleNameOf(const RTL_PROCESS_MODULE_INFORMATION& module)
@@ -136,7 +191,15 @@ namespace nt
         PRTL_PROCESS_MODULES modules = QueryModules();
 
         if (!modules)
-            return 0;
+        {
+            const uint64_t fallback = KernelBaseViaPsapi();
+
+            if (fallback)
+                vgb_log::Step("kernel base taken from EnumDeviceDrivers (0x%llX)",
+                              (unsigned long long)fallback);
+
+            return fallback;
+        }
 
         uint64_t result = 0;
 
