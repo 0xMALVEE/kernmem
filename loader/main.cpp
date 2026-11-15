@@ -1055,6 +1055,22 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    /*
+     * Crash log first, before anything can fault. The file is flushed per line, so
+     * after a bugcheck the last entry names the step that was running. The path is
+     * printed so it can be found without guessing.
+     */
+    vgb_log::InstallExceptionFilter();
+
+    const std::wstring crashLog = vgb_log::OpenCrashLog();
+
+    if (!crashLog.empty())
+        vgb_log::Info("log: %ls", crashLog.c_str());
+    else
+        printf("[!] could not open a crash log\n");
+
+    vgb_log::Line("*", "vgb-loader started, %d argument(s)", argc - 1);
+
     /* No arguments at all is the product: one click, everything automatic. */
     if (argc < 2)
     {

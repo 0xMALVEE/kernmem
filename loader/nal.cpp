@@ -498,22 +498,47 @@ namespace nal
 
     bool WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size)
     {
-        uint64_t physical = 0;
+        auto source = static_cast<uint8_t*>(buffer);
+        uint32_t done = 0;
 
         if (!address || !buffer || !size)
             return false;
 
-        if (!GetPhysicalAddress(address, &physical))
-            return false;
+        /*
+         * The write is split at page boundaries.
+         *
+         * Translating only the FIRST byte and mapping `size` bytes from there
+         * assumes the physical pages behind a virtual range are contiguous. They
+         * are not. A 12-byte patch that crossed a 4 KB boundary therefore wrote its
+         * tail into whatever physical memory happened to follow, corrupting a
+         * foreign page - and that damage outlives the call and bugchecks later,
+         * somewhere unrelated, which is exactly why it looked random.
+         */
+        while (done < size)
+        {
+            const uint64_t current = address + done;
+            const uint32_t pageLeft = (uint32_t)(0x1000 - (current & 0xFFF));
+            const uint32_t remaining = size - done;
+            const uint32_t chunk = remaining < pageLeft ? remaining : pageLeft;
 
-        const uint64_t mapped = MapIoSpace(physical, size);
-        if (!mapped)
-            return false;
+            uint64_t physical = 0;
+            if (!GetPhysicalAddress(current, &physical))
+                return false;
 
-        const bool ok = MemCopy(mapped, reinterpret_cast<uint64_t>(buffer), size);
-        UnmapIoSpace(mapped, size);
+            const uint64_t mapped = MapIoSpace(physical, chunk);
+            if (!mapped)
+                return false;
 
-        return ok;
+            const bool ok = MemCopy(mapped, reinterpret_cast<uint64_t>(source + done), chunk);
+            UnmapIoSpace(mapped, chunk);
+
+            if (!ok)
+                return false;
+
+            done += chunk;
+        }
+
+        return true;
     }
 
     uint64_t GetKernelModuleBase(const char* moduleName)
@@ -666,6 +691,21 @@ namespace nal
                 return false;
         }
 
+        /* A bad export walk can return a plausible-looking address from anywhere.
+         * Patching outside ntoskrnl would corrupt an unrelated page, so the range
+         * is checked before anything is written. */
+        if (kernelNtAddAtom < ntoskrnlBase ||
+            kernelNtAddAtom > ntoskrnlBase + 0x2000000ULL)
+        {
+            vgb_log::Error("NtAddAtom export 0x%llX is outside ntoskrnl - not patching",
+                           (unsigned long long)kernelNtAddAtom);
+            return false;
+        }
+
+        vgb_log::Step("patching NtAddAtom at 0x%llX (page offset 0x%llX)",
+                      (unsigned long long)kernelNtAddAtom,
+                      (unsigned long long)(kernelNtAddAtom & 0xFFF));
+
         uint8_t original[sizeof(stub)] = { 0 };
         if (!ReadMemory(kernelNtAddAtom, original, sizeof(original)))
             return false;
@@ -691,12 +731,18 @@ namespace nal
         using call4_t = uint64_t(NTAPI*)(uint64_t, uint64_t, uint64_t, uint64_t);
         const auto call = reinterpret_cast<call4_t>(userNtAddAtom);
 
+        vgb_log::Step("entering kernel function 0x%llX with %d arg(s)",
+                      (unsigned long long)kernelFunction, argCount);
+
         const uint64_t result = call(argCount > 0 ? args[0] : 0,
                                      argCount > 1 ? args[1] : 0,
                                      argCount > 2 ? args[2] : 0,
                                      argCount > 3 ? args[3] : 0);
 
-        WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original));
+        vgb_log::Step("kernel function returned 0x%llX", (unsigned long long)result);
+
+        if (!WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original)))
+            vgb_log::Error("NtAddAtom restore failed - the patch is still live");
 
         if (outResult)
             *reinterpret_cast<uint64_t*>(outResult) = result;

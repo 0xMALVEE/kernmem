@@ -30,9 +30,15 @@
 #define PROCESS_SUSPEND_RESUME       0x0800
 #endif
 
-/* Normally supplied by wdm.h next to OB_CALLBACK_REGISTRATION. */
+/*
+ * Normally supplied by wdm.h next to OB_CALLBACK_REGISTRATION.
+ *
+ * This is a VERSION field, not a flag: zero is invalid, so ObRegisterCallbacks
+ * rejects the registration with STATUS_INVALID_PARAMETER and the callback never
+ * installs. The documented value is 1.
+ */
 #ifndef OB_FLUSH_ALL_PREPARE_CALLBACKS
-#define OB_FLUSH_ALL_PREPARE_CALLBACKS 0
+#define OB_FLUSH_ALL_PREPARE_CALLBACKS 1
 #endif
 
 NTKERNELAPI PVOID NTAPI PsGetProcessPeb(_In_ PEPROCESS Process);

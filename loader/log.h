@@ -12,6 +12,14 @@ namespace vgb_log
     void OpenFile(const std::wstring& path);
     void CloseFile();
 
+    /* Opens %TEMP%\vgb-logs\<timestamp>.log and returns its path (empty on
+     * failure). Every line is flushed, so the file survives a bugcheck and the
+     * last line written names the step that killed the machine. */
+    std::wstring OpenCrashLog();
+
+    /* Installs a filter that logs unhandled user-mode exceptions. */
+    void InstallExceptionFilter();
+
     void Line(const char* tag, const char* fmt, ...);
 
     void Info(const char* fmt, ...);

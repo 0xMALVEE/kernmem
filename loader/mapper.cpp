@@ -18,6 +18,10 @@ namespace
     /* Offset of DriverUnload inside DRIVER_OBJECT (x64, stable ABI). */
     constexpr uint64_t kDriverUnloadOffset = 0x68;
 
+    /* DriverExtension pointer (0x30) and the block it must point at. */
+    constexpr uint64_t kDriverExtensionOffset = 0x30;
+    constexpr uint64_t kDriverExtensionSize = 0x40;
+
     bool WriteToKernel(uint64_t destination, const void* source, size_t size)
     {
         return nal::MemCopy(destination, reinterpret_cast<uint64_t>(source), size);
@@ -128,7 +132,12 @@ namespace mapper
 
         /* Minimal DRIVER_OBJECT so the entry point has something to register
          * callbacks on. */
-        const uint64_t driverObject = nal::AllocatePool(kDriverObjectSize);
+        /*
+         * The object block also carries a DRIVER_EXTENSION. A NULL
+         * DriverExtension is dereferenced by several kernel paths, so it has to
+         * point at real storage that itself points back at the object.
+         */
+        const uint64_t driverObject = nal::AllocatePool(kDriverObjectSize + kDriverExtensionSize);
         if (!driverObject)
         {
             vgb_log::Error("driver object allocation failed");
@@ -137,8 +146,14 @@ namespace mapper
             return false;
         }
 
-        uint8_t zeroed[kDriverObjectSize] = { 0 };
+        uint8_t zeroed[kDriverObjectSize + kDriverExtensionSize] = { 0 };
         WriteToKernel(driverObject, zeroed, sizeof(zeroed));
+
+        const uint64_t extension = driverObject + kDriverObjectSize;
+        const uint64_t extensionObject = driverObject;
+
+        WriteToKernel(driverObject + kDriverExtensionOffset, &extension, sizeof(extension));
+        WriteToKernel(extension, &extensionObject, sizeof(extensionObject));
 
         /* Init block: magic + client pid, handed over as DriverEntry arg 2. */
         const uint64_t initBlock = nal::AllocatePool(sizeof(VGB_INIT_PARAMS));
@@ -159,8 +174,9 @@ namespace mapper
         WriteToKernel(initBlock, &params, sizeof(params));
 
         const uint64_t entryPoint = kernelImage + image.entryPoint;
-        vgb_log::Step("calling DriverEntry at 0x%llX (client pid %u)",
-                  (unsigned long long)entryPoint, clientPid);
+        vgb_log::Step("calling DriverEntry at 0x%llX (client pid %u, object 0x%llX)",
+                  (unsigned long long)entryPoint, clientPid,
+                  (unsigned long long)driverObject);
 
         uint64_t entryStatus = 0;
         const uint64_t args[4] = { driverObject, initBlock, 0, 0 };
@@ -210,7 +226,11 @@ namespace mapper
             {
                 vgb_log::Step("calling DriverUnload at 0x%llX", (unsigned long long)unload);
                 const uint64_t args[4] = { result.driverObject, 0, 0, 0 };
-                nal::CallKernelFunctionRaw(nullptr, unload, args, 1);
+
+                if (!nal::CallKernelFunctionRaw(nullptr, unload, args, 1))
+                    vgb_log::Error("DriverUnload call failed");
+
+                vgb_log::Step("DriverUnload returned, draining IRPs");
             }
 
             nal::FreePool(result.driverObject);

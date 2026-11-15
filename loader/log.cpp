@@ -67,6 +67,59 @@ namespace vgb_log
         g_file = nullptr;
     }
 
+    std::wstring OpenCrashLog()
+    {
+        wchar_t temp[MAX_PATH + 1] = { 0 };
+
+        if (!GetTempPathW(MAX_PATH + 1, temp))
+            return L"";
+
+        std::wstring directory = temp;
+
+        if (!directory.empty() && directory.back() == L'\\')
+            directory.pop_back();
+
+        directory += L"\\vgb-logs";
+        CreateDirectoryW(directory.c_str(), nullptr);
+
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+
+        wchar_t name[64] = { 0 };
+        swprintf_s(name, L"\\%04u%02u%02u-%02u%02u%02u.log",
+                   now.wYear, now.wMonth, now.wDay,
+                   now.wHour, now.wMinute, now.wSecond);
+
+        const std::wstring path = directory + name;
+        OpenFile(path);
+
+        return g_file ? path : L"";
+    }
+
+    namespace
+    {
+        LONG WINAPI ExceptionFilter(EXCEPTION_POINTERS* info)
+        {
+            const DWORD code = info && info->ExceptionRecord
+                                   ? info->ExceptionRecord->ExceptionCode
+                                   : 0;
+
+            Line("-", "UNHANDLED EXCEPTION 0x%08X at %p",
+                 code, info && info->ExceptionRecord
+                           ? info->ExceptionRecord->ExceptionAddress
+                           : nullptr);
+
+            CloseFile();
+
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+    }
+
+    void InstallExceptionFilter()
+    {
+        SetUnhandledExceptionFilter(ExceptionFilter);
+    }
+
     void Line(const char* tag, const char* fmt, ...)
     {
         va_list args;
