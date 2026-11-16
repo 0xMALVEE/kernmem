@@ -6,18 +6,18 @@ This is the document that answers the question the rest of the project raises: *
 
 ## 1. The short answer
 
-**A script never calls `ReadProcessMemory`.** It opens `\\.\VanguardBypass` and asks the driver, which copies memory kernel-side against the target `EPROCESS`. No handle to the game is involved, so the access mask Vanguard rewrites is irrelevant.
+**A script never calls `ReadProcessMemory`.** It opens `\\.\Kernmem` and asks the driver, which copies memory kernel-side against the target `EPROCESS`. No handle to the game is involved, so the access mask Vanguard rewrites is irrelevant.
 
 ```mermaid
 flowchart LR
-    S["your script"] -->|"vgb.read(pid, addr, n)"| SD["sdk/vgb.py"]
-    SD -->|"DeviceIoControl"| D["vgb.sys"]
+    S["your script"] -->|"km.read(pid, addr, n)"| SD["sdk/km.py"]
+    SD -->|"DeviceIoControl"| D["km.sys"]
     D -->|"MmCopyVirtualMemory"| G["game memory"]
     V["vgk.sys"] -.->|"strips VM rights from handles"| X["handles"]
     X -.->|"never consulted"| D
 ```
 
-This is why the SDK exists. The `attach` path (handle restoration) is a bonus for tools that insist on the native API — it is not how a script should work.
+This is why the SDK exists. The `attach` path (handle restoration) is a bonus for tools that insist on the native API â€” it is not how a script should work.
 
 ---
 
@@ -25,7 +25,7 @@ This is why the SDK exists. The `attach` path (handle restoration) is a bonus fo
 
 | Layer | File | Role |
 |-------|------|------|
-| transport | `../../sdk/vgb.py` | IOCTL wrapper, chunking, version handshake |
+| transport | `../../sdk/km.py` | IOCTL wrapper, chunking, version handshake |
 | offsets | `offsets.py` | patch-stamped, confidence-tagged value table |
 | reader | `reader.py` | resolves the client, walks chains, typed reads |
 | demo | `demo.py` | `offsets` / `info` / `heroes` |
@@ -46,7 +46,7 @@ with Game() as game:
         print(hero.name, hero.health, hero.visible)
 ```
 
-`Game()` refuses to open when the client patch does not match the table. That is deliberate — see §5.
+`Game()` refuses to open when the client patch does not match the table. That is deliberate â€” see Â§5.
 
 ---
 
@@ -101,13 +101,13 @@ def walk(self, entry, base=None):
     return address + entry.offset if address else 0
 ```
 
-A zero pointer anywhere short-circuits to `0`. Callers treat `0` as "not available yet" instead of faulting — the game nulls most of this graph between matches, and a reader that raises on that is unusable.
+A zero pointer anywhere short-circuits to `0`. Callers treat `0` as "not available yet" instead of faulting â€” the game nulls most of this graph between matches, and a reader that raises on that is unusable.
 
 ---
 
 ## 7. Chunking
 
-The driver caps a transfer at 64 KiB. `../../sdk/vgb.py` loops internally, so `read(pid, addr, 1 << 20)` works. Hand-rolled IOCTL callers must loop themselves.
+The driver caps a transfer at 64 KiB. `../../sdk/km.py` loops internally, so `read(pid, addr, 1 << 20)` works. Hand-rolled IOCTL callers must loop themselves.
 
 ---
 
@@ -119,7 +119,7 @@ The driver caps a transfer at 64 KiB. `../../sdk/vgb.py` loops internally, so `r
 | Match ended mid-run | reads start returning `STATUS_PARTIAL_COPY` |
 | Game crashed | pid becomes stale, `STATUS_INVALID_PARAMETER` |
 | Patch day | `StaleOffsets` |
-| Driver unloaded | device missing, `VgbError` on open |
+| Driver unloaded | device missing, `KmError` on open |
 
 `demo.py` maps each of these to a distinct exit code (2 stale, 3 offsets, 4 driver) so a wrapper script can react.
 
@@ -127,7 +127,7 @@ The driver caps a transfer at 64 KiB. `../../sdk/vgb.py` loops internally, so `r
 
 ## 9. Performance notes
 
-- One IOCTL per read. A `heroes()` pass costs one call per array slot plus eight per hero — fine at 1 Hz, wasteful at 100 Hz. Read the array in one 64 KiB chunk before the per-object calls if that matters.
+- One IOCTL per read. A `heroes()` pass costs one call per array slot plus eight per hero â€” fine at 1 Hz, wasteful at 100 Hz. Read the array in one 64 KiB chunk before the per-object calls if that matters.
 - Read a struct once into a buffer and unpack locally rather than issuing a call per field.
 - `MmCopyVirtualMemory` takes a reference and walks page tables each call; batching is the only real lever.
 - Do not poll faster than the game writes, or you will read torn values.

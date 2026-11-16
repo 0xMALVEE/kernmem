@@ -55,7 +55,7 @@ namespace
     }
 }
 
-namespace vgb_log
+namespace km_log
 {
     void OpenFile(const std::wstring& path)
     {
@@ -109,7 +109,7 @@ namespace vgb_log
         if (!directory.empty() && directory.back() == L'\\')
             directory.pop_back();
 
-        directory += L"\\vgb-logs";
+        directory += L"\\km-logs";
         CreateDirectoryW(directory.c_str(), nullptr);
 
         SYSTEMTIME now;

@@ -18,21 +18,21 @@ namespace pe
         std::vector<BYTE> file;
         if (!nt::ReadFileToMemory(path, &file) || file.size() < sizeof(IMAGE_DOS_HEADER))
         {
-            vgb_log::Error("cannot read %ls", path.c_str());
+            km_log::Error("cannot read %ls", path.c_str());
             return false;
         }
 
         auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(file.data());
         if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
         {
-            vgb_log::Error("not a PE file (bad DOS signature)");
+            km_log::Error("not a PE file (bad DOS signature)");
             return false;
         }
 
         if (dosHeader->e_lfanew <= 0 ||
             (size_t)dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > file.size())
         {
-            vgb_log::Error("truncated PE headers");
+            km_log::Error("truncated PE headers");
             return false;
         }
 
@@ -40,20 +40,20 @@ namespace pe
 
         if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
         {
-            vgb_log::Error("not a PE file (bad NT signature)");
+            km_log::Error("not a PE file (bad NT signature)");
             return false;
         }
 
         if (ntHeaders->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
         {
-            vgb_log::Error("image is not x64");
+            km_log::Error("image is not x64");
             return false;
         }
 
         if (!(ntHeaders->FileHeader.Characteristics & IMAGE_FILE_DLL) &&
             ntHeaders->OptionalHeader.Subsystem != IMAGE_SUBSYSTEM_NATIVE)
         {
-            vgb_log::Warn("image subsystem is not NATIVE — continuing anyway");
+            km_log::Warn("image subsystem is not NATIVE â€” continuing anyway");
         }
 
         const uint32_t lfanew = (uint32_t)dosHeader->e_lfanew;
@@ -70,31 +70,31 @@ namespace pe
 
         if (!info->imageSize || !info->entryPoint)
         {
-            vgb_log::Error("image has no size or no entry point");
+            km_log::Error("image has no size or no entry point");
             return false;
         }
 
         if (info->imageSize > 0x4000000)
         {
-            vgb_log::Error("image size 0x%llX is implausible", (unsigned long long)info->imageSize);
+            km_log::Error("image size 0x%llX is implausible", (unsigned long long)info->imageSize);
             return false;
         }
 
         if (!info->relocationRva || !info->relocationSize)
         {
-            vgb_log::Error("image has no relocation directory - it cannot be mapped");
+            km_log::Error("image has no relocation directory - it cannot be mapped");
             return false;
         }
 
         if (info->entryPoint >= info->imageSize)
         {
-            vgb_log::Error("entry point lies outside the image");
+            km_log::Error("entry point lies outside the image");
             return false;
         }
 
         if (!info->sectionCount || info->sectionCount > 96)
         {
-            vgb_log::Error("implausible section count %u", info->sectionCount);
+            km_log::Error("implausible section count %u", info->sectionCount);
             return false;
         }
 
@@ -103,13 +103,13 @@ namespace pe
                                 (size_t)info->sectionCount * sizeof(IMAGE_SECTION_HEADER);
         if (tableEnd > file.size())
         {
-            vgb_log::Error("truncated section table");
+            km_log::Error("truncated section table");
             return false;
         }
 
         if (!info->sizeOfHeaders || info->sizeOfHeaders > file.size())
         {
-            vgb_log::Error("bad SizeOfHeaders (%llu) for a %zu byte file",
+            km_log::Error("bad SizeOfHeaders (%llu) for a %zu byte file",
                            (unsigned long long)info->sizeOfHeaders, file.size());
             return false;
         }
@@ -135,7 +135,7 @@ namespace pe
 
             if ((uint64_t)section->PointerToRawData + section->SizeOfRawData > info->rawSize)
             {
-                vgb_log::Error("section %u raw range lies outside the file", i);
+                km_log::Error("section %u raw range lies outside the file", i);
                 free(info->raw);
                 ZeroMemory(info, sizeof(*info));
                 return false;
@@ -143,7 +143,7 @@ namespace pe
 
             if ((uint64_t)section->VirtualAddress + section->SizeOfRawData > info->imageSize)
             {
-                vgb_log::Error("section %u overruns the image", i);
+                km_log::Error("section %u overruns the image", i);
                 free(info->raw);
                 ZeroMemory(info, sizeof(*info));
                 return false;
@@ -183,7 +183,7 @@ namespace pe
 
             if (processed + block->SizeOfBlock > directory.Size)
             {
-                vgb_log::Warn("relocation block overruns the directory");
+                km_log::Warn("relocation block overruns the directory");
                 break;
             }
 
@@ -212,7 +212,7 @@ namespace pe
                 }
                 else if (type != IMAGE_REL_BASED_ABSOLUTE)
                 {
-                    vgb_log::Warn("unsupported relocation type %u", type);
+                    km_log::Warn("unsupported relocation type %u", type);
                 }
             }
 
@@ -272,7 +272,7 @@ namespace pe
                 const uint64_t resolved = resolveExport(moduleName, function);
                 if (!resolved)
                 {
-                    vgb_log::Error("unresolved import %s!%s", moduleName, function.c_str());
+                    km_log::Error("unresolved import %s!%s", moduleName, function.c_str());
                     ok = false;
                     continue;
                 }

@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nal
 {
@@ -25,6 +26,24 @@ namespace nal
     void SetStatePath(const std::wstring& path);
     bool SaveState();
     bool LoadState();
+
+    /* The per-install device name. Empty until Load() or LoadState() resolved
+     * one; callers fall back to the static namespace when it is empty. */
+    const std::wstring& DeviceName();
+
+    /* Path the host image was dropped to. This is the file name ntoskrnl records
+     * in its unload trace, so the scrub needs it. */
+    const std::wstring& DriverPath();
+
+    /* Device path candidates for this install, DOS symlink first. The historical
+     * static namespace is always appended so an existing mapping is never
+     * orphaned by a name change. */
+    std::vector<std::wstring> DevicePaths();
+
+    /* Device type this install uses, and the matching IOCTL re-stamp. The
+     * compile-time value is returned when no name is known. */
+    unsigned long DeviceType();
+    unsigned long RecodeIoctl(unsigned long code);
 
     /* Registers + starts iqvw64e.sys as a kernel service and opens the device. */
     bool Load(const wchar_t* driverPath);

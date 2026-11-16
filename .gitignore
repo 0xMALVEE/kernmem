@@ -8,6 +8,10 @@
 !/build/*.py
 !/build/*.md
 
+# Clean-step parking spots for tracked files that live in wiped directories
+.iqvw64e.sys.keep
+.build-py.keep/
+
 # Python
 __pycache__/
 

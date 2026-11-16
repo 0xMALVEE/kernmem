@@ -1,8 +1,8 @@
 """
-Game reader — resolves the client and walks offset chains through the driver.
+Game reader â€” resolves the client and walks offset chains through the driver.
 
 The important part is that nothing here calls ReadProcessMemory. Every read goes
-through sdk/vgb.py to the driver, which copies kernel-side against the EPROCESS.
+through sdk/km.py to the driver, which copies kernel-side against the EPROCESS.
 That is why Vanguard's handle stripping does not matter to a script.
 
     from reader import Game
@@ -24,7 +24,7 @@ from typing import Iterator, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sdk"))
 
-import vgb  # noqa: E402  (path is set up above)
+import km  # noqa: E402  (path is set up above)
 
 import offsets  # noqa: E402
 
@@ -100,7 +100,7 @@ class Game:
     """A resolved, read-only view of the running client."""
 
     def __init__(self, allow_stale: bool = False):
-        self._client: Optional[vgb.Client] = None
+        self._client: Optional[km.Client] = None
         self._pid = 0
         self._base = 0
         self._allow_stale = allow_stale
@@ -116,13 +116,13 @@ class Game:
     # -- lifecycle ---------------------------------------------------------- #
 
     def open(self) -> None:
-        client = vgb.Client()
+        client = km.Client()
         client.open()
         self._client = client
 
         try:
             client.require_version()
-        except vgb.VgbError:
+        except km.KmError:
             self.close()
             raise
 
@@ -130,7 +130,7 @@ class Game:
         if not pid:
             self.close()
             raise offsets.OffsetsError(
-                f"{GAME_IMAGE} is not running — it only exists during a match"
+                f"{GAME_IMAGE} is not running â€” it only exists during a match"
             )
 
         self._pid = pid
@@ -160,7 +160,7 @@ class Game:
         return self._base
 
     @property
-    def client(self) -> vgb.Client:
+    def client(self) -> km.Client:
         if self._client is None:
             raise offsets.OffsetsError("reader is closed")
         return self._client
@@ -244,7 +244,7 @@ class Game:
 
         The manager keeps the array as a begin/end pair rather than a base and a
         count, so the length is derived from the distance. Both are validated before
-        use — a half-built array (during loading) gives end <= begin.
+        use â€” a half-built array (during loading) gives end <= begin.
         """
 
         manager = self.value_u64("ObjectManager")
@@ -254,7 +254,7 @@ class Game:
         try:
             begin = self.read_u64(manager + offsets.get("ObjArrayBegin").offset)
             end = self.read_u64(manager + offsets.get("ObjArrayEnd").offset)
-        except vgb.VgbError:
+        except km.KmError:
             return (0, 0)
 
         if not begin or not end or end <= begin:
@@ -284,7 +284,7 @@ class Game:
         while index < cap and begin + index * stride < end:
             try:
                 pointer = self.read_u64(begin + index * stride)
-            except vgb.VgbError:
+            except km.KmError:
                 return
 
             index += 1
@@ -305,7 +305,7 @@ class Game:
         for pointer in self.objects():
             try:
                 team = self.read_i32(pointer + team_offset)
-            except vgb.VgbError:
+            except km.KmError:
                 continue
 
             if team not in (100, 200):
@@ -313,7 +313,7 @@ class Game:
 
             try:
                 yield self._hero(pointer)
-            except vgb.VgbError:
+            except km.KmError:
                 continue
 
     def _hero(self, address: int) -> Hero:

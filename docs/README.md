@@ -1,4 +1,4 @@
-# kernmem — Engineering Documentation
+# kernmem â€” Engineering Documentation
 
 This documentation explains **what every component does, why it exists, and exactly how data moves between them**. Read it in order the first time; it is written so that each document builds on the previous one.
 
@@ -39,14 +39,14 @@ Vanguard registers an object callback (`ObRegisterCallbacks`) and, for every han
 
 ```mermaid
 flowchart TB
-    subgraph UM["User mode — ring 3"]
+    subgraph UM["User mode â€” ring 3"]
         CLIENT["Your script / client"]
-        SDK["vgb-sdk"]
-        LOADER["vgb-loader"]
+        SDK["km-sdk"]
+        LOADER["kernmem-loader"]
     end
-    subgraph KM["Kernel mode — ring 0"]
+    subgraph KM["Kernel mode â€” ring 0"]
         NAL["iqvw64e.sys<br/>signed, vulnerable"]
-        DRV["vgb.sys<br/>ours, unsigned"]
+        DRV["km.sys<br/>ours, unsigned"]
     end
     GAME["League of Legends.exe<br/>Vanguard-protected"]
 
@@ -62,16 +62,16 @@ flowchart TB
 ## Quick start (once the loader is built)
 
 ```powershell
-# 1. Elevated shell required — driver loading needs SeLoadDriverPrivilege
-.\dist\vgb-loader.exe load
+# 1. Elevated shell required â€” driver loading needs SeLoadDriverPrivilege
+.\dist\kernmem-loader.exe load
 
 # 2. Resolve the game and pin our client process for handle restoration
-.\dist\vgb-loader.exe pid League of Legends.exe
-.\dist\vgb-loader.exe attach --client (Get-Process vgb-loader).Id
+.\dist\kernmem-loader.exe pid League of Legends.exe
+.\dist\kernmem-loader.exe attach --client (Get-Process kernmem-loader).Id
 
 # 3. Use it
-.\dist\vgb-loader.exe base <pid> League of Legends.exe
-.\dist\vgb-loader.exe read <pid> <address> 64
+.\dist\kernmem-loader.exe base <pid> League of Legends.exe
+.\dist\kernmem-loader.exe read <pid> <address> 64
 ```
 
 ---
@@ -79,8 +79,8 @@ flowchart TB
 ## Repository layout
 
 ```
- driver/    kernel driver — the memory interface
- loader/    user-mode mapper: loads vgb.sys through the signed NAL driver
+ driver/    kernel driver â€” the memory interface
+ loader/    user-mode mapper: loads km.sys through the signed NAL driver
  sdk/       client library (C++ header + Python ctypes binding)
  docs/      this documentation
  tools/     maintenance utilities

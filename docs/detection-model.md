@@ -1,4 +1,4 @@
-# 02 — What Vanguard actually does, and what covers it
+# 02 â€” What Vanguard actually does, and what covers it
 
 This document is the **threat model**. Every countermeasure in this project exists because of a specific mechanism listed here. Read it before changing the driver, because the mapping table at the end tells you which capability you would lose.
 
@@ -53,16 +53,16 @@ sequenceDiagram
 
 | # | Mechanism | What it observes | Our countermeasure | Where |
 |---|-----------|------------------|--------------------|-------|
-| 1 | Object callback strips VM rights | access masks on handles to the game | **attach-based copy** — no handle at all | `VgbHandleRead` / `VgbHandleWrite` via `MmCopyVirtualMemory` |
-| 2 | Same callback, same masks | your process's `OpenProcess` calls | **own callback at higher altitude** re-ORs the bits for the registered PID | `VgbProcessPreOperation`, altitude `321000` |
-| 3 | `SystemModuleInformation` enumeration | loaded drivers | **manual mapping** — no `PsLoadedModuleList` entry, no service key | loader `pe.cpp` + `mapper.cpp` |
-| 4 | PEB `InLoadOrderModuleList` walk | injected DLLs | **LDR unlink** of all three lists | `VgbSetModuleHidden` |
+| 1 | Object callback strips VM rights | access masks on handles to the game | **attach-based copy** â€” no handle at all | `KmHandleRead` / `KmHandleWrite` via `MmCopyVirtualMemory` |
+| 2 | Same callback, same masks | your process's `OpenProcess` calls | **own callback above Vanguard's** re-ORs the bits for the registered PID | `KmProcessPreOperation`, altitude seeded per install (330000-390000) |
+| 3 | `SystemModuleInformation` enumeration | loaded drivers | **manual mapping** â€” no `PsLoadedModuleList` entry, no service key | loader `pe.cpp` + `mapper.cpp` |
+| 4 | PEB list walk, LDR name hash, `LdrpModuleIndex` resolve | injected DLLs | **LDR unlink** of all three lists, the `LdrpHashTable` bucket, **and** the by-name index tree (node offset and tree key recovered at runtime, validated before any write) | `KmSetModuleHidden`, `KmUnlinkModuleIndex` |
 | 5 | `NtQueryVirtualMemory` / region walks | foreign allocations | allocate inside the game with the game's own `VirtualAllocEx`, not from our process | client-side |
 | 6 | Code-page hashing | patches to game `.text` | we do not patch the game; read/write only | by design |
-| 7 | Driver-object enumeration | `\Device\` names | device name `\Device\VanguardBypass` is plain and enumerable | not hidden |
-| 8 | Handle-table scan for the device | our open device handle | unavoidable with a device; a handle to `\Device\VanguardBypass` is a strong signal | not hidden |
+| 7 | Driver-object enumeration | `\Device\` names | name is random per install, and the driver object carries a matching `DriverName` | reduced, not hidden |
+| 8 | Handle-table scan for the device | our open device handle | unavoidable with a device; a random name weakens it as a signature | not hidden |
 
-Rows 7 and 8 are the honest gaps. See §6.
+Rows 7 and 8 are reduced, not closed. See Â§6.
 
 ---
 
@@ -73,14 +73,14 @@ Object callbacks run in **descending altitude order** on the way in (pre-operati
 ```
 pre-op chain (descending altitude)
   330000  ...
-  321000  vgb.sys   ← adds VM bits back
-  320000  vgk.sys   ← removes VM bits
+  321000  km.sys   â† adds VM bits back
+  320000  vgk.sys   â† removes VM bits
   300000  ...
-            ↓
+            â†“
         mask handed to ntoskrnl
 ```
 
-If our altitude were lower than Vanguard's, Vanguard would strip the bits we just added and Path B would silently do nothing while Path A kept working — a confusing failure. `321000` sits above Vanguard's range and below the OS's upper range.
+If our altitude were lower than Vanguard's, Vanguard would strip the bits we just added and Path B would silently do nothing while Path A kept working â€” a confusing failure. `321000` sits above Vanguard's range and below the OS's upper range.
 
 ---
 
@@ -92,13 +92,13 @@ We do not depend on it. Our Path A works regardless of timing because it never a
 
 ---
 
-## 6. Residual detection surface — stated plainly
+## 6. Residual detection surface â€” stated plainly
 
 This project is **not** a claim of permanent undetected status. What remains observable:
 
 | Surface | Why it is visible | Mitigation available |
 |---------|-------------------|----------------------|
-| Device object `\Device\VanguardBypass` | `IoCreateDevice` registers it | randomise the name per build |
+| Device object `\Device\<random>` | `IoCreateDevice` registers it | name randomised per install, device type and `DriverName` derived from it |
 | Open handle to that device | your process holds it while working | open lazily, close when idle |
 | `iqvw64e.sys` service key | created by the loader, persists while loaded | unload deletes it; keep sessions short |
 | Non-Microsoft code in kernel | `vgk` can hash kernel pages | nothing, short of a signed driver |
@@ -110,7 +110,7 @@ This project is **not** a claim of permanent undetected status. What remains obs
 1. Randomised device name and symbolic link per build.
 2. Kernel page hashing defeat (`MmSetPageProtection` + restore after patch).
 3. A pool-tag sweep so allocations do not carry a recognisable tag.
-4. Signed driver via an EV certificate — removes the NAL dependency entirely.
+4. Signed driver via an EV certificate â€” removes the NAL dependency entirely.
 
 ---
 

@@ -1,4 +1,4 @@
-# Builds vgb.sys as a manually-mappable kernel image.
+# Builds km.sys as a manually-mappable kernel image.
 # Requires the WDK headers/libs that the workspace already provisioned.
 
 param(
@@ -21,8 +21,8 @@ foreach ($p in @($kmInc, $kmLib, $vcvars)) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$obj = Join-Path $OutDir 'vgb.obj'
-$sys = Join-Path $OutDir 'vgb.sys'
+$obj = Join-Path $OutDir 'km.obj'
+$sys = Join-Path $OutDir 'km.sys'
 
 $cl = @(
     '/nologo', '/c', '/kernel', '/GS-', '/Zl', '/Oi', '/O2', '/W3', '/wd4201', '/D_AMD64_', '/DAMD64', '/D_KERNEL_MODE',

@@ -1,4 +1,4 @@
-# 01 — Architecture
+# 01 â€” Architecture
 
 ## 1. Why this shape
 
@@ -15,26 +15,26 @@ Two conclusions follow, and the whole architecture is derived from them:
 
 ```mermaid
 flowchart TB
-    subgraph R3["Ring 3 — user mode"]
+    subgraph R3["Ring 3 â€” user mode"]
         direction TB
         C1["Script / bot / overlay"]
-        C2["vgb-sdk<br/>Read / Write / ModuleBase / Hide"]
-        C3["vgb-loader<br/>load · pid · base · read · write · hide · unload"]
+        C2["km-sdk<br/>Read / Write / ModuleBase / Hide"]
+        C3["kernmem-loader<br/>load Â· pid Â· base Â· read Â· write Â· hide Â· unload"]
     end
 
-    subgraph R0["Ring 0 — kernel mode"]
+    subgraph R0["Ring 0 â€” kernel mode"]
         direction TB
         K1["iqvw64e.sys<br/>Intel-signed, vulnerable"]
-        K2["vgb.sys<br/>object callback · copy engine · LDR unlinking"]
-        K3["ntoskrnl.exe<br/>MmCopyVirtualMemory · KeStackAttachProcess"]
+        K2["km.sys<br/>object callback Â· copy engine Â· LDR unlinking"]
+        K3["ntoskrnl.exe<br/>MmCopyVirtualMemory Â· KeStackAttachProcess"]
     end
 
     T["League of Legends.exe"]
-    V["vgk.sys — Vanguard"]
+    V["vgk.sys â€” Vanguard"]
 
-    C1 --> C2 -->|"DeviceIoControl<br/>\\\\.\\VanguardBypass"| K2
+    C1 --> C2 -->|"DeviceIoControl<br/>\\\\.\\<random>"| K2
     C3 -->|"service load<br/>IOCTL 0x80862007"| K1
-    K1 -->|"ExAllocatePool · MmCopyVirtualMemory · call"| K2
+    K1 -->|"ExAllocatePool Â· MmCopyVirtualMemory Â· call"| K2
     K2 -->|"attach + copy"| K3
     K3 -->|"reads / writes"| T
     V -.->|"strips VM rights<br/>from every foreign handle"| T
@@ -45,10 +45,10 @@ flowchart TB
 
 | Component | Runs | Responsibility | Signature needed |
 |-----------|------|----------------|------------------|
-| `vgb.sys` | kernel | The bypass: copy engine, object callback, LDR unlinking, IOCTL surface | no (manual mapped) |
+| `km.sys` | kernel | The bypass: copy engine, object callback, LDR unlinking, IOCTL surface | no (manual mapped) |
 | `iqvw64e.sys` | kernel | Mapping host: gives kernel R/W and kernel calls | yes (Intel, already signed) |
-| `vgb-loader.exe` | user | Loads `vgb.sys`, exposes a CLI, tears down cleanly | no |
-| `vgb-sdk` | user | Thin typed wrapper so clients never build IOCTL buffers by hand | no |
+| `kernmem-loader.exe` | user | Loads `km.sys`, exposes a CLI, tears down cleanly | no |
+| `km-sdk` | user | Thin typed wrapper so clients never build IOCTL buffers by hand | no |
 | client | user | Actual cheat logic | no |
 
 ---
@@ -57,11 +57,11 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    subgraph TRUSTED["Fully trusted — ring 0"]
-        A["vgb.sys"]
+    subgraph TRUSTED["Fully trusted â€” ring 0"]
+        A["km.sys"]
     end
-    subgraph SEMI["Semi-trusted — same-user ring 3"]
-        B["vgb-loader"]
+    subgraph SEMI["Semi-trusted â€” same-user ring 3"]
+        B["kernmem-loader"]
         C["client + sdk"]
     end
     subgraph UNTRUSTED["Untrusted"]
@@ -73,7 +73,7 @@ flowchart LR
     D -.->|"device is FILE_DEVICE_SECURE_OPEN<br/>but ACL is default"| A
 ```
 
-The device object is created with `FILE_DEVICE_SECURE_OPEN`, and the symbolic link is `\DosDevices\VanguardBypass`. The default DACL lets any interactive user open it. **Anything that can open the device can read/write any process**, so the device is not a security boundary — it is a capability.
+The device object is created with `FILE_DEVICE_SECURE_OPEN`, and the symbolic link is `\DosDevices\<random>` (both random per install, `Kernmem` only as the service-load fallback). The default DACL lets any interactive user open it. **Anything that can open the device can read/write any process**, so the device is not a security boundary â€” it is a capability.
 
 ---
 
@@ -81,16 +81,16 @@ The device object is created with `FILE_DEVICE_SECURE_OPEN`, and the symbolic li
 
 Both paths exist deliberately; they fail under different conditions.
 
-### Path A — attach-based copy (primary)
+### Path A â€” attach-based copy (primary)
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant D as vgb.sys
+    participant D as km.sys
     participant N as ntoskrnl
     participant G as Game process
 
-    C->>D: IOCTL_VGB_READ {pid, address, size}
+    C->>D: IOCTL_KM_READ {pid, address, size}
     D->>N: PsLookupProcessByProcessId(pid)
     N-->>D: PEPROCESS
     D->>N: MmCopyVirtualMemory(game, addr, self, buf)
@@ -101,13 +101,13 @@ sequenceDiagram
 
 No handle is opened by the client, so the object callback has nothing to modify. This path survives every version of the handle-stripping logic.
 
-### Path B — handle restoration (secondary)
+### Path B â€” handle restoration (secondary)
 
 ```mermaid
 sequenceDiagram
     participant C as Client process
     participant V as vgk.sys callback
-    participant D as vgb.sys callback
+    participant D as km.sys callback
     participant N as ntoskrnl
 
     C->>N: OpenProcess(VM_READ|VM_WRITE)
@@ -129,7 +129,7 @@ Our callback sits at a **higher altitude** (later in the chain) than Vanguard's,
 
 ```mermaid
 flowchart TD
-    A["vgb.sys is unsigned"] --> B{"Secure Boot on?"}
+    A["km.sys is unsigned"] --> B{"Secure Boot on?"}
     B -->|yes| C{"test signing enabled?"}
     C -->|no| D["NtLoadDriver fails<br/>STATUS_INVALID_IMAGE_HASH"]
     C -->|yes| E["NtLoadDriver works<br/>but needs reboot to enable"]
@@ -144,15 +144,15 @@ Manual mapping also leaves **no service key and no loaded-module entry**, which 
 
 ## 6. Module hiding
 
-Injected scripting DLLs are normally visible to Vanguard in three loader lists. `IOCTL_VGB_HIDE_MODULE` unlinks the entry from all three and re-initialises the list heads so the entry is self-consistent:
+Injected scripting DLLs are normally visible to Vanguard in three loader lists. `IOCTL_KM_HIDE_MODULE` unlinks the entry from all three and re-initialises the list heads so the entry is self-consistent:
 
 ```
-InLoadOrderModuleList          ──X──  entry
-InMemoryOrderModuleList        ──X──  entry
-InInitializationOrderModuleList──X──  entry
+InLoadOrderModuleList          â”€â”€Xâ”€â”€  entry
+InMemoryOrderModuleList        â”€â”€Xâ”€â”€  entry
+InInitializationOrderModuleListâ”€â”€Xâ”€â”€  entry
 ```
 
-`IOCTL_VGB_UNHIDE_MODULE` re-inserts it at the head of each list, so unload order stays sane.
+`IOCTL_KM_UNHIDE_MODULE` re-inserts it at the head of each list, so unload order stays sane.
 
 ---
 
@@ -160,7 +160,7 @@ InInitializationOrderModuleList──X──  entry
 
 | Constraint | Reason |
 |-----------|--------|
-| One client PID at a time | Keeps the callback decision O(1) and avoids a PID set to maintain. `IOCTL_VGB_SET_CLIENT_PID` is idempotent. |
+| One client PID at a time | Keeps the callback decision O(1) and avoids a PID set to maintain. `IOCTL_KM_SET_CLIENT_PID` is idempotent. |
 | 64 KiB max transfer | Matches the METHOD_BUFFERED system buffer ceiling; larger reads are looped by the SDK. |
 | No CRT in the driver | Manual mapping does not run the CRT initialiser, so no `/GS` cookie and no `memcpy` from the CRT. |
 | No `PsGetNextProcess` import | Absent from this SDK's import library; resolved at runtime with a `ZwQuerySystemInformation` fallback. |

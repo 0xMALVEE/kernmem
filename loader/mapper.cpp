@@ -8,7 +8,7 @@
 #include "nt.h"
 #include "pe.h"
 
-#include "vgb_shared_loader.h"
+#include "km_shared_loader.h"
 
 namespace
 {
@@ -57,7 +57,7 @@ namespace mapper
         if (!pe::Load(driverPath, &image))
             return false;
 
-        vgb_log::Step("image accepted: %llu bytes, image size 0x%llX, entry RVA 0x%llX",
+        km_log::Step("image accepted: %llu bytes, image size 0x%llX, entry RVA 0x%llX",
                   (unsigned long long)image.rawSize,
                   (unsigned long long)image.imageSize,
                   (unsigned long long)image.entryPoint);
@@ -66,12 +66,12 @@ namespace mapper
         const uint64_t kernelImage = nal::AllocatePool(image.imageSize);
         if (!kernelImage)
         {
-            vgb_log::Error("kernel allocation for the image failed");
+            km_log::Error("kernel allocation for the image failed");
             pe::Free(&image);
             return false;
         }
 
-        vgb_log::Step("image allocated at 0x%llX", (unsigned long long)kernelImage);
+        km_log::Step("image allocated at 0x%llX", (unsigned long long)kernelImage);
 
         /* Local mirror so headers and relocations can be fixed up before the
          * copy into the kernel. */
@@ -103,7 +103,7 @@ namespace mapper
         const uint64_t delta = kernelImage - image.preferredBase;
         if (!pe::Relocate(reinterpret_cast<uint64_t>(localImage), kernelImage, delta))
         {
-            vgb_log::Error("relocation failed");
+            km_log::Error("relocation failed");
             free(localImage);
             nal::FreePool(kernelImage);
             pe::Free(&image);
@@ -114,7 +114,7 @@ namespace mapper
         const auto resolve = [](const std::string& module, const std::string& function) -> uint64_t
         {
             if (_stricmp(module.c_str(), "ntoskrnl.exe") != 0)
-                vgb_log::Warn("import from unexpected module %s", module.c_str());
+                km_log::Warn("import from unexpected module %s", module.c_str());
 
             return nal::GetKernelModuleExport(nal::ntoskrnlBase, function);
         };
@@ -122,17 +122,40 @@ namespace mapper
         if (!pe::ResolveImports(reinterpret_cast<uint64_t>(localImage), kernelImage,
                                 image.importRva, resolve))
         {
-            vgb_log::Error("import resolution failed");
+            km_log::Error("import resolution failed");
             free(localImage);
             nal::FreePool(kernelImage);
             pe::Free(&image);
             return false;
         }
 
+        /*
+         * Wipe the PE headers before the image leaves user mode. They are only
+         * needed for relocation and import resolution, and both have run; the
+         * entry RVA is resolved to an absolute address further down, so nothing
+         * consumes them again. What is left in the kernel is a big-pool chunk
+         * with no MZ/NT signature at offset 0, so a pool scan cannot fingerprint
+         * the mapping by its own headers. Never wipe past the first section.
+         */
+        {
+            size_t wipeSize = headerSize;
+
+            for (uint32_t i = 0; i < image.sectionCount; ++i)
+            {
+                const size_t sectionStart = (size_t)image.sections[i].VirtualAddress;
+
+                if (sectionStart && sectionStart < wipeSize)
+                    wipeSize = sectionStart;
+            }
+
+            memset(localImage, 0, wipeSize);
+            km_log::Step("PE headers wiped (0x%zX bytes)", wipeSize);
+        }
+
         /* Ship the finished image into the kernel. */
         if (!WriteToKernel(kernelImage, localImage, (size_t)image.imageSize))
         {
-            vgb_log::Error("copying the image into the kernel failed");
+            km_log::Error("copying the image into the kernel failed");
             free(localImage);
             nal::FreePool(kernelImage);
             pe::Free(&image);
@@ -209,16 +232,16 @@ namespace mapper
             /* Zero is not a valid object type index - it is what the header held
              * when the object underflowed. Say so instead of leaving it silent. */
             if (!driverTypeIndex)
-                vgb_log::Warn("could not resolve the driver object type index");
+                km_log::Warn("could not resolve the driver object type index");
             if (!objectHeaderCookie)
-                vgb_log::Warn("could not recover the object header cookie");
+                km_log::Warn("could not recover the object header cookie");
         }
 
         const uint64_t driverObjectBlock =
             nal::AllocatePool(kObjectHeaderSize + kDriverObjectSize + kDriverExtensionSize);
         if (!driverObjectBlock)
         {
-            vgb_log::Error("driver object allocation failed");
+            km_log::Error("driver object allocation failed");
             nal::FreePool(kernelImage);
             pe::Free(&image);
             return false;
@@ -253,17 +276,17 @@ namespace mapper
 
             if (!ReadFromKernel(driverObjectBlock + kObjectHeaderTypeIndexOffset,
                                 &verifyStored, sizeof(verifyStored)))
-                vgb_log::Warn("could not read back the object header type index");
+                km_log::Warn("could not read back the object header type index");
             else
             {
                 const uint8_t decoded = (uint8_t)(verifyStored ^ objectHeaderCookie ^
                                                   (uint8_t)(driverObjectBlock >> 8));
 
                 if (decoded != (uint8_t)driverTypeIndex)
-                    vgb_log::Error("object header type index decodes to %u, expected %u",
+                    km_log::Error("object header type index decodes to %u, expected %u",
                                    (unsigned)decoded, (unsigned)(uint8_t)driverTypeIndex);
                 else
-                    vgb_log::Step("object header type index encoded (index %u, cookie 0x%02X)",
+                    km_log::Step("object header type index encoded (index %u, cookie 0x%02X)",
                               (unsigned)decoded, (unsigned)objectHeaderCookie);
             }
         }
@@ -275,25 +298,43 @@ namespace mapper
         WriteToKernel(extension, &extensionObject, sizeof(extensionObject));
 
         /* Init block: magic + client pid, handed over as DriverEntry arg 2. */
-        const uint64_t initBlock = nal::AllocatePool(sizeof(VGB_INIT_PARAMS));
+        const uint64_t initBlock = nal::AllocatePool(sizeof(KM_INIT_PARAMS));
         if (!initBlock)
         {
-            vgb_log::Error("init block allocation failed");
+            km_log::Error("init block allocation failed");
             nal::FreePool(driverObject - kObjectHeaderSize);
             nal::FreePool(kernelImage);
             pe::Free(&image);
             return false;
         }
 
-        VGB_INIT_PARAMS params = { 0 };
-        params.Magic = VGB_INIT_MAGIC;
+        KM_INIT_PARAMS params = { 0 };
+        params.Magic = KM_INIT_MAGIC;
         params.ClientPid = clientPid;
         params.ImageBase = kernelImage;
         params.ImageSize = image.imageSize;
+        /* Per-install callback altitude seed, so the filter is not pinned to one
+         * fixed number that can be signatured or already occupied. */
+        params.AltitudeSeed = (unsigned long)GetTickCount() ^ (unsigned long)GetCurrentThreadId();
+        /* Per-install pool tag: four letters derived from the same seed, so the
+         * tag is not a build constant that greps straight back to this project. */
+        {
+            unsigned long tagSeed = (unsigned long)GetTickCount() * 2654435761u ^
+                                    (unsigned long)GetCurrentThreadId();
+
+            for (int i = 0; i < 4; ++i)
+            {
+                params.PoolTag |= (unsigned long)('a' + (tagSeed & 0x0F)) << (i * 8);
+                tagSeed >>= 4;
+            }
+        }
+        /* Per-install device name, so the namespace is not a build constant. */
+        if (const std::wstring& device = nal::DeviceName(); !device.empty())
+            wcsncpy_s(params.DeviceName, device.c_str(), _TRUNCATE);
         WriteToKernel(initBlock, &params, sizeof(params));
 
         const uint64_t entryPoint = kernelImage + image.entryPoint;
-        vgb_log::Step("calling DriverEntry at 0x%llX (client pid %u, object 0x%llX)",
+        km_log::Step("calling DriverEntry at 0x%llX (client pid %u, object 0x%llX)",
                   (unsigned long long)entryPoint, clientPid,
                   (unsigned long long)driverObject);
 
@@ -302,7 +343,7 @@ namespace mapper
 
         if (!nal::CallKernelFunctionRaw(&entryStatus, entryPoint, args, 2))
         {
-            vgb_log::Error("the kernel call for DriverEntry failed");
+            km_log::Error("the kernel call for DriverEntry failed");
             nal::FreePool(initBlock);
             nal::FreePool(driverObject - kObjectHeaderSize);
             nal::FreePool(kernelImage);
@@ -322,7 +363,7 @@ namespace mapper
 
         if (!NT_SUCCESS(result->status))
         {
-            vgb_log::Error("DriverEntry returned 0x%08X", (unsigned)result->status);
+            km_log::Error("DriverEntry returned 0x%08X", (unsigned)result->status);
             nal::FreePool(driverObject - kObjectHeaderSize);
             nal::FreePool(kernelImage);
             return false;
@@ -349,22 +390,22 @@ namespace mapper
 
             if (!ReadFromKernel(result.driverObject + kDriverUnloadOffset, &unload, sizeof(unload)))
             {
-                vgb_log::Error("cannot read DriverUnload - image NOT freed, retry unload");
+                km_log::Error("cannot read DriverUnload - image NOT freed, retry unload");
                 return false;
             }
 
             if (unload)
             {
-                vgb_log::Step("calling DriverUnload at 0x%llX", (unsigned long long)unload);
+                km_log::Step("calling DriverUnload at 0x%llX", (unsigned long long)unload);
                 const uint64_t args[4] = { result.driverObject, 0, 0, 0 };
 
                 if (!nal::CallKernelFunctionRaw(nullptr, unload, args, 1))
                 {
-                    vgb_log::Error("DriverUnload call failed - image NOT freed");
+                    km_log::Error("DriverUnload call failed - image NOT freed");
                     return false;
                 }
 
-                vgb_log::Step("DriverUnload returned, draining IRPs");
+                km_log::Step("DriverUnload returned, draining IRPs");
             }
 
             nal::FreePool(result.driverObject - kObjectHeaderSize);

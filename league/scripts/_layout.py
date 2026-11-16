@@ -15,7 +15,7 @@ OFF_NAME=0x3890
 OFF_POS=0xA0
 
 h=None
-for dev in (r'\\.\VanguardBypass', r'\\?\GLOBALROOT\Device\VanguardBypass'):
+for dev in (r'\\.\Kernmem', r'\\?\GLOBALROOT\Device\Kernmem'):
     hh=k32.CreateFileW(dev,GR|GW,SA,None,OE,0,None)
     if hh and hh!=INV:
         h=hh; break

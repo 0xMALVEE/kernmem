@@ -6,13 +6,13 @@
 #include <cstdio>
 #include <string>
 
-namespace vgb_log
+namespace km_log
 {
     /* Enables echoing every line to a file next to the executable. */
     void OpenFile(const std::wstring& path);
     void CloseFile();
 
-    /* Opens %TEMP%\vgb-logs\<timestamp>.log and returns its path (empty on
+    /* Opens %TEMP%\km-logs\<timestamp>.log and returns its path (empty on
      * failure). Every line is flushed, so the file survives a bugcheck and the
      * last line written names the step that killed the machine. */
     std::wstring OpenCrashLog();

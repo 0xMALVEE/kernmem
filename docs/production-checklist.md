@@ -1,12 +1,12 @@
-# 07 — Production checklist
+# 07 â€” Production checklist
 
 This is the honest status document. It separates **must work for the product to function at all** from **nice to have**, and gives the order.
 
 ---
 
-## 1. Priority table — answering "do we need all of it?"
+## 1. Priority table â€” answering "do we need all of it?"
 
-### Tier 0 — without these there is no product
+### Tier 0 â€” without these there is no product
 
 | Item | Why | State |
 |------|-----|-------|
@@ -19,35 +19,35 @@ This is the honest status document. It separates **must work for the product to 
 | `build.ps1` (root) | reproducible build + dist assembly | **done** |
 | `loader/build.ps1` | builds the loader | **done** |
 
-Eight items. Nothing here is optional — a driver that cannot be loaded and a loader that cannot map are a library, not a product.
+Eight items. Nothing here is optional â€” a driver that cannot be loaded and a loader that cannot map are a library, not a product.
 
-### Tier 1 — needed for the product to be *good*
+### Tier 1 â€” needed for the product to be *good*
 
 | Item | Why | State |
 |------|-----|-------|
-| `sdk/vgb-sdk.h` | clients stop hand-rolling IOCTL buffers | **done** |
-| `sdk/vgb.py` | Python is the dominant LoL scripting language | **done** |
+| `sdk/km-sdk.h` | clients stop hand-rolling IOCTL buffers | **done** |
+| `sdk/km.py` | Python is the dominant LoL scripting language | **done** |
 | `league/client/` example | proof it works end to end | **done** |
 | Elevated-launch helper | `load` is useless without it | **done** (UI shows elevation state) |
 | `status` / `unload` verbs | operator sanity and clean teardown | **done** |
-| `loader/overlay.cpp` | visible proof the chain works; draws self, range, enemies | **done, builds** |
+| `league/client/` (C++ ESP on `sdk/client`) | visible proof the chain works; draws self, range, enemies | **done, builds** |
 | Live smoke test | nothing has run in a kernel yet | **outstanding** |
 
-### Tier 2 — needed to *sell* it
+### Tier 2 â€” needed to *sell* it
 
 | Item | Why | State |
 |------|-----|-------|
-| Randomised device name | fixed name is a fingerprint | **missing** |
+| Randomised device name | fixed name is a fingerprint | **done** - per install, device type derived from it |
 | Version handshake on both sides | already designed, needs enforcement | partial |
 | LICENSE + EULA | commercial distribution | **missing** |
 | `dist/` layout + docs copy | what a customer downloads | partial |
 | Antivirus notes | NAL and unsigned kernel code trigger heuristics | **missing** |
 
-### Tier 3 — genuinely optional
+### Tier 3 â€” genuinely optional
 
 | Item | Note |
 |------|------|
-| EV certificate + signed `vgb.sys` | removes the NAL dependency entirely; real money and a signing identity |
+| EV certificate + signed `km.sys` | removes the NAL dependency entirely; real money and a signing identity |
 | Kernel page hashing defeat | only matters against active memory scanning |
 | Pool-tag randomisation | cosmetic until someone greps for `'BGVb'` |
 | Multi-client support | one pid is enough for a single script |
@@ -55,15 +55,15 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 
 ### Direct answer
 
-**No, not all of it.** Tier 0 and Tier 1 are required — that is the difference between a design and a product. Tier 2 is what makes it sellable. Tier 3 can ship later or never.
+**No, not all of it.** Tier 0 and Tier 1 are required â€” that is the difference between a design and a product. Tier 2 is what makes it sellable. Tier 3 can ship later or never.
 
 ---
 
 ## 2. Definition of done for Tier 0
 
 - [ ] `build.ps1` runs clean from a clean tree
-- [ ] `build\vgb.sys` passes the mapper-safety check in [04](build-and-load.md)
-- [ ] `dist\vgb-loader.exe` exists and `status` reports "not loaded"
+- [ ] `build\km.sys` passes the mapper-safety check in [04](build-and-load.md)
+- [ ] `dist\kernmem-loader.exe` exists and `status` reports "not loaded"
 - [ ] elevated `load` returns success and `status` reports version 3
 - [ ] `read <pid> <base> 2` returns `4D 5A`
 - [ ] `unload` returns success and `\Device\Nal` is free again
@@ -73,8 +73,8 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 
 ## 3. Definition of done for Tier 1
 
-- [ ] C++ example compiles against `sdk/vgb-sdk.h` and reads the PE header
-- [ ] Python example does the same through `vgb.py`
+- [ ] C++ example compiles against `sdk/km-sdk.h` and reads the PE header
+- [ ] Python example does the same through `km.py`
 - [ ] `attach --client` makes plain `ReadProcessMemory` succeed
 - [ ] `hide` removes a test DLL from `Module32First`, `unhide` restores it
 - [ ] unhide-before-`FreeLibrary` proven by a clean process exit
@@ -83,12 +83,12 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 
 ## 4. Release checklist
 
-- [ ] version bumped in `vgb_shared.h` and echoed by the loader
+- [ ] version bumped in `km_shared.h` and echoed by the loader
 - [ ] driver rebuilt, not reused
 - [ ] mapper-safety check passed
 - [ ] `dist/` assembled: loader, sdk, `iqvw64e.sys`, docs, LICENSE
 - [ ] SHA-256 of every shipped file recorded
-- [ ] clean-machine test: no WDK, no MSVC — loader must still run
+- [ ] clean-machine test: no WDK, no MSVC â€” loader must still run
 - [ ] clean-machine test: Secure Boot on, HVCI off
 - [ ] clean-machine test: HVCI on
 - [ ] uninstall path verified (unload + key deleted + temp file gone)
@@ -103,7 +103,7 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 3. **One client pid at a time.**
 4. **Writes to read-only game pages can fail.** Reads always work.
 5. **`iqvw64e.sys` ships as a third-party binary.** Intel-signed, but it is Intel's file.
-6. **Not a guarantee of permanent undetection.** See [02 §6](detection-model.md).
+6. **Not a guarantee of permanent undetection.** See [02 Â§6](detection-model.md).
 7. **Patch-day risk.** Vanguard updates can move the callback altitude; `321000` is the constant to revisit first.
 
 ---
@@ -114,9 +114,9 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 |---------|--------|
 | Vanguard major update | re-test Path B; adjust altitude; re-run the smoke test |
 | Windows build change | re-verify PEB offsets (the `C_ASSERT`s should catch it) |
-| `PsGetNextProcess` export appears/disappears | fallback already covers both — verify both paths |
+| `PsGetNextProcess` export appears/disappears | fallback already covers both â€” verify both paths |
 | Intel pulls `iqvw64e.sys` | re-extract from a current driver package |
-| IOCTL surface change | bump `VGB_PROTOCOL_VERSION`, update `docs/05` |
+| IOCTL surface change | bump `KM_PROTOCOL_VERSION`, update `docs/05` |
 
 ---
 
@@ -126,12 +126,12 @@ Eight items. Nothing here is optional — a driver that cannot be loaded and a l
 |------|----------|
 | Secure Boot on, HVCI off | manual map, works |
 | Secure Boot on, HVCI on | manual map, works |
-| Game not running | `pid` returns 0, `GET_MAIN_BASE` → `STATUS_INVALID_PARAMETER` |
+| Game not running | `pid` returns 0, `GET_MAIN_BASE` â†’ `STATUS_INVALID_PARAMETER` |
 | Read at unmapped address | `STATUS_PARTIAL_COPY`, no bugcheck |
 | Write to `.text` | `STATUS_PARTIAL_COPY`, expected |
 | Read 1 MiB in one call | clamped to 64 KiB, looped by the SDK |
-| Two `load` in a row | second → `STATUS_ALREADY_REGISTERED` |
-| `unload` twice | second → success (idempotent) |
+| Two `load` in a row | second â†’ `STATUS_ALREADY_REGISTERED` |
+| `unload` twice | second â†’ success (idempotent) |
 | Hide then unhide then `FreeLibrary` | clean exit |
 | Hide then `FreeLibrary` without unhide | documented fault |
 

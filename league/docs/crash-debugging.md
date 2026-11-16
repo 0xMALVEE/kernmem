@@ -6,10 +6,10 @@ A bugcheck (BSOD) leaves almost nothing behind on its own. This document covers 
 
 ## 1. The crash log
 
-Every run of `vgb-loader.exe` writes a line-flushed log to:
+Every run of `kernmem-loader.exe` writes a line-flushed log to:
 
 ```
-%TEMP%\vgb-logs\<yyyyMMdd-HHmmss>.log
+%TEMP%\km-logs\<yyyyMMdd-HHmmss>.log
 ```
 
 The path is printed as the first line of output, so you never have to hunt for it.
@@ -20,17 +20,17 @@ The path is printed as the first line of output, so you never have to hunt for i
 
 | Marker | Meaning |
 |--------|---------|
-| `vgb-loader started` | process start, argument count |
+| `kernmem-loader started` | process start, argument count |
 | `vulnerable driver dropped` | NAL image written to `%TEMP%` |
 | `kernel base resolved / from EnumDeviceDrivers / by IDT scan` | which resolver route won |
-| `patching NtAddAtom at 0x… (page offset 0x…)` | patch site **and its page offset** — offsets near `0xFFF` are the risky ones |
-| `entering kernel function 0x… with N arg(s)` | immediately before every kernel call |
-| `kernel function returned 0x…` | immediately after |
-| `calling DriverEntry at 0x…` | the mapped entry, with object and client pid |
+| `patching NtAddAtom at 0xâ€¦ (page offset 0xâ€¦)` | patch site **and its page offset** â€” offsets near `0xFFF` are the risky ones |
+| `entering kernel function 0xâ€¦ with N arg(s)` | immediately before every kernel call |
+| `kernel function returned 0xâ€¦` | immediately after |
+| `calling DriverEntry at 0xâ€¦` | the mapped entry, with object and client pid |
 | `calling DriverUnload` / `DriverUnload returned, draining IRPs` | teardown |
-| `UNHANDLED EXCEPTION 0x… at 0x…` | user-mode fault, via `SetUnhandledExceptionFilter` |
+| `UNHANDLED EXCEPTION 0xâ€¦ at 0xâ€¦` | user-mode fault, via `SetUnhandledExceptionFilter` |
 
-So a file ending in `entering kernel function 0xFFFFF8049…` means the machine died **inside** that call, not before it.
+So a file ending in `entering kernel function 0xFFFFF8049â€¦` means the machine died **inside** that call, not before it.
 
 ---
 
@@ -59,11 +59,11 @@ Open it in WinDbg and run `!analyze -v`. The output names the faulting instructi
 
 | Code | Name | Typical cause here |
 |------|------|--------------------|
-| `0x50` | `PAGE_FAULT_IN_NONPAGED_AREA` | dereferencing a bogus kernel pointer — a bad export walk, a stale object field |
+| `0x50` | `PAGE_FAULT_IN_NONPAGED_AREA` | dereferencing a bogus kernel pointer â€” a bad export walk, a stale object field |
 | `0x7E` | `KERNEL_MODE_EXCEPTION_NOT_HANDLED` | an unguarded dereference; missing `.pdata` for `__try/__except` |
 | `0x8E` | same, different path | dispatch into freed memory, or a NULL `MajorFunction` entry |
 | `0x3B` | `SYSTEM_SERVICE_EXCEPTION` | PEB walk without `KeStackAttachProcess` |
-| `0x1A` | `MEMORY_MANAGEMENT` | a write landing in the wrong physical page — the page-straddling class |
+| `0x1A` | `MEMORY_MANAGEMENT` | a write landing in the wrong physical page â€” the page-straddling class |
 | `0xC4` | verifier | pool misuse: double free, wrong tag, use after free |
 | `0x9F` | `DRIVER_POWER_STATE_FAILURE` | an IRP not completing during a power transition |
 | `0xD1` | `DRIVER_IRQL_NOT_LESS_OR_EQUAL` | touching paged memory at raised IRQL |
@@ -82,7 +82,7 @@ Each of these was a real crash cause found by reading, and each is closed:
 | NULL `DriverExtension` | several kernel paths dereference it |
 | `driver->DeviceObject` list head NULL | `IoCreateDevice` calls `InsertTailList`, which dereferences `Blink` |
 | Image freed the instant `DriverUnload` returned | in-flight IRPs still executed inside it |
-| Double hide of the same module | second record, then a triple insert — list corruption |
+| Double hide of the same module | second record, then a triple insert â€” list corruption |
 | Copy handlers unguarded | a bad address could raise in kernel; now SEH-wrapped |
 | Garbage address above `MmHighestUserAddress` | `MmCopyVirtualMemory` treats it as kernel memory and plain-copies it with no fault handling, so a stale game pointer bugchecked `0x50` in `nt!memcpy`; the range is now screened with `MmIsAddressValid` and refused as `STATUS_PARTIAL_COPY` |
 | `OBJECT_HEADER.TypeIndex` written raw | the kernel decodes it as `stored ^ ObHeaderCookie ^ (Header >> 8)`, so a raw index resolved to a NULL object type and the first reference bugchecked `0x18`; the loader now recovers the cookie from a live object header and stores the encoded byte |
@@ -94,11 +94,11 @@ Each of these was a real crash cause found by reading, and each is closed:
 Two verbs let you test layers separately, so a failure is attributable:
 
 ```powershell
-.\dist\vgb-loader.exe kbase     # resolve the kernel base, then tear NAL down
-.\dist\vgb-loader.exe status    # device + protocol probe only
+.\dist\kernmem-loader.exe kbase     # resolve the kernel base, then tear NAL down
+.\dist\kernmem-loader.exe status    # device + protocol probe only
 ```
 
-`kbase` loads the vulnerable driver but **never maps `vgb.sys`**, so a crash there is in the host or the resolver, not in our driver.
+`kbase` loads the vulnerable driver but **never maps `km.sys`**, so a crash there is in the host or the resolver, not in our driver.
 
 ---
 
@@ -111,7 +111,7 @@ The loader now attaches to a resident host instead of refusing, and unload sweep
 leftover service whose display name contains `iqvw` even when the state file is gone:
 
 ```powershell
-.\dist\vgb-loader.exe unload
+.\dist\kernmem-loader.exe unload
 ```
 
 **A mapped image leaked in pool.** If the device still answers after a successful
@@ -140,7 +140,7 @@ Remove-Item "$env:TEMP\<random>.sys"
 ## 7. Why the leak cannot recur
 
 The driver reports its own `ImageBase`, `ImageSize` and `DriverObject` over
-`IOCTL_VGB_GET_INFO` (protocol 4), so teardown reads them from the driver instead of a
+`IOCTL_KM_GET_INFO` (protocol 4), so teardown reads them from the driver instead of a
 temp file. `mapper::Unmap` also refuses to free the image if it cannot read
 `DriverUnload`, so the pool can no longer be released while the device is still live.
 

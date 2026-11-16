@@ -1,0 +1,76 @@
+oNavGrid: 0x1DAC9E0
+CastSpellFlag: 0x1D0CEC0
+oBasicAttackBase: 0x296BC7
+Pattern found at: 7FF7FE144FFD
+oBasicAttackOffset1: However could not retrieve the Offset
+oBasicAttackOffset2: 0x344492
+oLocalPlayer: 0x1DE1EC0
+oHerroList: 0x1DA8CD0
+oGametime: 0x1DB6E70
+oMinionList: 0x1DA8D08
+oMissileList: 0x1DACA70
+oObjNetId: 0xCC
+oTargetable: 0xED0
+TeamID: 0x259
+NamePlayer: 0x2DFB89
+RangeAttack: 0x17F4
+oBasicAttackBase: 0x296BC7
+Pattern found at: 7FF7FE144FFD
+oBasicAttackOffset1: However could not retrieve the Offset
+oBasicAttackOffset2: 0x344492
+Pattern found at: 7FF7FE17F3BC
+LaneMinionArray: However could not retrieve the Offset
+LaneMinionType: 0x2A2E00
+Pattern found at: 7FF7FE1452AD
+oGetAiManagerFunc: However could not retrieve the Offset
+oObjSpellBook: 0xBDEE17
+Pattern found at: 7FF7FE7CFC50
+oSpellSlotSpellInfo: However could not retrieve the Offset
+oObjBuffManager: 0x2E40
+oHudInstance: 0x1DA8E18
+oHudInstanceSpellInfo: 0x68
+oMouseScreenVec2: 0x1DACA18
+oMouseDevice: 0x1E515C8
+oKeyboardDevice: 0x1E515C8
+oKeyboardHit: 0x1162FB0
+oKeyboardRgDOD: 0x1E515D8
+oKeyboardPdInOut: 0x1E515D8
+oIAT_GetCursorPos: 0x18E99B0
+oPrintChat: 0xB63560
+GlobalPtr: 0x1DAC9E0
+ViewPort: 0x1E719B8
+ViewProjectionMatrix: 0x1E5E6C0
+oUnderMouseObj: 0x1DACC70
+oUnderMouseObjOffset: 0x18
+WorldToScreen: 0x12759A0
+oIssueOrder: 0x2A6460
+oCastSpellWrapper: 0x8
+AttackDelay: 0x567E10
+GetPing: 0x692C20
+isMinion: 0x30E250
+Pattern found at: 7FF7FE1BE0F0
+isTurret: However could not retrieve the Offset
+GetFirstObject: 0x532EF0
+Pattern found at: 7FF7FE3E3CD0
+GetNextObject: However could not retrieve the Offset
+Pattern found at: 7FF7FE13BBF0
+oGetBoundingRadius: However could not retrieve the Offset
+oGetCollisionFlags: 0x11C94D0
+oBasicAttackBase: 0x296BC7
+oBasicAttackOffset2: 0x344492
+LaneMinionType: 0x2A2E00
+oObjBuffManager: 0x28B8
+oHudInstanceSpellInfo: 0x68
+oCastSpellWrapper: 0x8
+AttackDelay: 0x567E10
+oGetAttackWindup: 0x1D72E0
+GetPing: 0x692C20
+WorldToScreen: 0x12759A0
+isMinion: 0x30E250
+Pattern found at: 7FF7FE1BE0F0
+isTurret: However could not retrieve the Offset
+GetFirstObject: 0x532EF0
+Pattern found at: 7FF7FE3E3CD0
+GetNextObject: However could not retrieve the Offset
+
+Finished!

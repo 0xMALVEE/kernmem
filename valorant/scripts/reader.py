@@ -1,7 +1,7 @@
 """
 Valorant reader - walks the live actor array through the driver.
 
-Nothing here calls ReadProcessMemory. Every read goes through sdk/vgb.py to the
+Nothing here calls ReadProcessMemory. Every read goes through sdk/km.py to the
 driver, which copies kernel-side against the EPROCESS, so Vanguard's handle
 stripping never applies.
 
@@ -36,7 +36,7 @@ from typing import Iterator, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sdk"))
 
-import vgb  # noqa: E402
+import km  # noqa: E402
 
 import offsets  # noqa: E402
 
@@ -142,7 +142,7 @@ class Game:
     """Driver-backed handle on a running match."""
 
     def __init__(self, allow_stale: bool = False):
-        self._client: Optional[vgb.Client] = None
+        self._client: Optional[km.Client] = None
         self._pid = 0
         self._base = 0
         self._allow_stale = allow_stale
@@ -157,13 +157,13 @@ class Game:
         self.close()
 
     def open(self) -> None:
-        client = vgb.Client()
+        client = km.Client()
         client.open()
         self._client = client
 
         try:
             client.require_version()
-        except vgb.VgbError:
+        except km.KmError:
             self.close()
             raise
 
@@ -199,7 +199,7 @@ class Game:
         return self._base
 
     @property
-    def client(self) -> vgb.Client:
+    def client(self) -> km.Client:
         if self._client is None:
             raise offsets.OffsetsError("reader is closed")
         return self._client
@@ -232,7 +232,7 @@ class Game:
                 return ""
             raw = self.read(pointer, min(abs(length), limit) * 2)
             return raw.decode("utf-16-le", "replace").split("\x00", 1)[0]
-        except (vgb.VgbError, struct.error):
+        except (km.KmError, struct.error):
             return ""
 
     def actors(self) -> Iterator[Actor]:
@@ -242,7 +242,7 @@ class Game:
             array = self.base + offsets.at("ActorArraySlot")
             data = self.u64(array)
             count = self.i32(array + offsets.at("ArrayCount"))
-        except (vgb.VgbError, struct.error):
+        except (km.KmError, struct.error):
             return
 
         if not is_pointer(data) or count <= 0:
@@ -253,7 +253,7 @@ class Game:
         for index in range(min(count, offsets.at("MaxActors"))):
             try:
                 address = self.u64(data + index * offsets.at("PtrStride"))
-            except vgb.VgbError:
+            except km.KmError:
                 return
 
             if not is_pointer(address) or address in seen:
@@ -262,7 +262,7 @@ class Game:
 
             try:
                 actor = self._actor(address)
-            except (vgb.VgbError, struct.error):
+            except (km.KmError, struct.error):
                 continue
 
             if actor is not None:
@@ -286,7 +286,7 @@ class Game:
             for unpacker in (self.vec3, self.vec3d):
                 try:
                     candidate = unpacker(root + offset)
-                except (vgb.VgbError, struct.error):
+                except (km.KmError, struct.error):
                     continue
                 if not sane(candidate):
                     continue
@@ -304,7 +304,7 @@ class Game:
             try:
                 health = self.f32(handler + offsets.at("Health"))
                 max_health = self.f32(handler + offsets.at("MaxHealth"))
-            except (vgb.VgbError, struct.error):
+            except (km.KmError, struct.error):
                 health = max_health = 0.0
 
         component = self.u64(address + offsets.at("TeamComponent"))
@@ -312,7 +312,7 @@ class Game:
         if is_pointer(component):
             try:
                 team = self.i32(component + offsets.at("TeamId"))
-            except (vgb.VgbError, struct.error):
+            except (km.KmError, struct.error):
                 team = 0
 
         state = self.u64(address + offsets.at("PlayerState"))
@@ -348,14 +348,14 @@ class Game:
 
         try:
             return self._actor(pawn)
-        except (vgb.VgbError, struct.error):
+        except (km.KmError, struct.error):
             return None
 
     def _find_local(self, actors: dict) -> int:
         for delta in range(SCAN_START, SCAN_END, SCAN_CHUNK):
             try:
                 raw = self.read(self._base + delta, SCAN_CHUNK)
-            except vgb.VgbError:
+            except km.KmError:
                 continue
 
             for index in range(0, SCAN_CHUNK, 8):
@@ -365,7 +365,7 @@ class Game:
 
                 try:
                     pawn = self.u64(candidate + offsets.at("AcknowledgedPawn"))
-                except vgb.VgbError:
+                except km.KmError:
                     continue
 
                 if not is_pointer(pawn):

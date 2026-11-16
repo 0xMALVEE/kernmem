@@ -1,10 +1,10 @@
 /*
- * vgb-loader - command line front end.
+ * kernmem-loader - command line front end.
  *
  * Verbs:
  *   status                    device and version probe
  *   kbase                     resolve the kernel base without loading
- *   load [--client <pid>]     map vgb.sys through the NAL driver
+ *   load [--client <pid>]     map km.sys through the NAL driver
  *   unload                    unmap the driver and release NAL
  *   pid <image name>          resolve a pid by image name
  *   mainbase <pid>            image base shortcut
@@ -13,7 +13,7 @@
  *   read <pid> <addr> <size>  hex dump
  *   write <pid> <addr> <hex>  write bytes
  *   attach <pid>              register a client pid for handle restore
- *   overlay <pid>             toggle the in-game overlay (F9 stops it)
+ *   overlay                   start the per-game client (F9 in it stops it)
  */
 #include <windows.h>
 #include <shellapi.h>
@@ -32,10 +32,11 @@
 #include "mapper.h"
 #include "nal.h"
 #include "nt.h"
-#include "overlay.h"
-#include "vgb_shared_loader.h"
+#include "game.h"
+#include "trace.h"
+#include "km_shared_loader.h"
 
-#include "res/vgb_sys.h"
+#include "res/km_sys.h"
 
 namespace
 {
@@ -44,7 +45,7 @@ namespace
     std::wstring StatePath()
     {
         const std::wstring temp = nt::GetFullTempPath();
-        return temp.empty() ? std::wstring(L"vgb-map.state") : temp + L"\\vgb-map.state";
+        return temp.empty() ? std::wstring(L"km-map.state") : temp + L"\\km-map.state";
     }
 
     typedef struct _MAP_STATE
@@ -121,20 +122,16 @@ namespace
             return true;
 
         /*
-         * Try the DOS symlink first, then the device object itself. A teardown
-         * that deleted the symlink but left the device pinned by an open handle
-         * leaves the second path as the only way in, and without it every later
-         * open fails with "file not found" while the driver is still answering.
+         * The device name is per install, so the candidates come from nal instead
+         * of a fixed literal: this install's DOS symlink and device object first,
+         * the historical namespace last. A teardown that deleted the symlink but
+         * left the device pinned by an open handle leaves the object path as the
+         * only way in, and without it every later open fails with "file not
+         * found" while the driver is still answering.
          */
-        static const wchar_t* const paths[] =
+        for (const std::wstring& path : nal::DevicePaths())
         {
-            VGB_WIN32_NAME,
-            L"\\\\?\\GLOBALROOT\\Device\\VanguardBypass",
-        };
-
-        for (const wchar_t* path : paths)
-        {
-            g_device = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+            g_device = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
@@ -158,9 +155,11 @@ namespace
         if (!OpenDevice())
             return false;
 
+        /* The device type is per install. The call sites keep using the
+         * compile-time codes and the re-stamp happens here, once. */
         DWORD bytes = 0;
-        const BOOL ok = DeviceIoControl(g_device, code, const_cast<void*>(in), inSize,
-                                        out, outSize, &bytes, nullptr);
+        const BOOL ok = DeviceIoControl(g_device, nal::RecodeIoctl(code), const_cast<void*>(in),
+                                        inSize, out, outSize, &bytes, nullptr);
         if (returned)
             *returned = bytes;
 
@@ -232,7 +231,7 @@ namespace
 
             if (dos->e_magic != IMAGE_DOS_SIGNATURE)
             {
-                vgb_log::Warn("base does not start with MZ (0x%04X)", dos->e_magic);
+                km_log::Warn("base does not start with MZ (0x%04X)", dos->e_magic);
                 return;
             }
 
@@ -241,18 +240,18 @@ namespace
 
             if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
             {
-                vgb_log::Warn("base has no NT signature");
+                km_log::Warn("base has no NT signature");
                 return;
             }
 
-            vgb_log::Good("kernel PE header valid, image size 0x%X",
+            km_log::Good("kernel PE header valid, image size 0x%X",
                           ntHeaders->OptionalHeader.SizeOfImage);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             /* User mode cannot read supervisor pages, so a fault here is expected
              * and says nothing about whether the base is correct. */
-            vgb_log::Warn("base not directly readable from user mode (0x%08X) - expected",
+            km_log::Warn("base not directly readable from user mode (0x%08X) - expected",
                           GetExceptionCode());
         }
     }
@@ -265,7 +264,7 @@ namespace
     {
         if (!Elevated())
         {
-            vgb_log::Error("elevated shell required - the scan reads kernel memory");
+            km_log::Error("elevated shell required - the scan reads kernel memory");
             return 1;
         }
 
@@ -275,12 +274,12 @@ namespace
          * resolver without mapping our own driver at all.
          */
         const bool alreadyUp = nal::IsRunning();
-        const std::wstring statePath = nt::GetFullTempPath() + L"\\vgb-nal.state";
+        const std::wstring statePath = nt::GetFullTempPath() + L"\\km-nal.state";
         nal::SetStatePath(statePath);
 
         if (!alreadyUp && !nal::Load(nullptr))
         {
-            vgb_log::Error("could not bring up the mapping host");
+            km_log::Error("could not bring up the mapping host");
             return 1;
         }
 
@@ -289,16 +288,16 @@ namespace
         if (!alreadyUp)
         {
             nal::Unload();
-            vgb_log::Line("*", "mapping host released");
+            km_log::Line("*", "mapping host released");
         }
 
         if (!base)
         {
-            vgb_log::Error("kernel base unresolved on every route");
+            km_log::Error("kernel base unresolved on every route");
             return 1;
         }
 
-        vgb_log::Good("kernel base 0x%llX", (unsigned long long)base);
+        km_log::Good("kernel base 0x%llX", (unsigned long long)base);
 
         /* Prove the base is really an image, not a stray MZ in some other page. */
         VerifyKernelBase(base);
@@ -308,25 +307,25 @@ namespace
 
     int CmdStatus()
     {
-        vgb_log::Line("*", "NAL: %s", nal::IsRunning() ? "resident" : "not loaded");
+        km_log::Line("*", "NAL: %s", nal::IsRunning() ? "resident" : "not loaded");
 
         if (!OpenDevice())
         {
-            vgb_log::Line("*", "device: not loaded");
+            km_log::Line("*", "device: not loaded");
             return 0;
         }
 
         ULONG version = 0;
-        if (Ioctl(IOCTL_VGB_GET_VERSION, nullptr, 0, &version, sizeof(version), nullptr))
+        if (Ioctl(IOCTL_KM_GET_VERSION, nullptr, 0, &version, sizeof(version), nullptr))
         {
-            vgb_log::Good("device: present, protocol %u", version);
-            if (version != VGB_PROTOCOL_VERSION)
-                vgb_log::Warn("protocol mismatch (expected %u) - rebuild loader and driver together",
-                          VGB_PROTOCOL_VERSION);
+            km_log::Good("device: present, protocol %u", version);
+            if (version != KM_PROTOCOL_VERSION)
+                km_log::Warn("protocol mismatch (expected %u) - rebuild loader and driver together",
+                          KM_PROTOCOL_VERSION);
         }
         else
         {
-            vgb_log::Error("device open but version probe failed");
+            km_log::Error("device open but version probe failed");
             return 1;
         }
 
@@ -337,7 +336,7 @@ namespace
     {
         if (!Elevated())
         {
-            vgb_log::Error("not elevated - driver loading needs SeLoadDriverPrivilege");
+            km_log::Error("not elevated - driver loading needs SeLoadDriverPrivilege");
             return 1;
         }
 
@@ -347,10 +346,10 @@ namespace
              * one-click path checks this too, so a second double-click is harmless. */
             ULONG existing = 0;
 
-            if (Ioctl(IOCTL_VGB_GET_VERSION, nullptr, 0, &existing, sizeof(existing), nullptr) &&
-                existing == VGB_PROTOCOL_VERSION)
+            if (Ioctl(IOCTL_KM_GET_VERSION, nullptr, 0, &existing, sizeof(existing), nullptr) &&
+                existing == KM_PROTOCOL_VERSION)
             {
-                vgb_log::Good("device already present, protocol %u - reusing it", existing);
+                km_log::Good("device already present, protocol %u - reusing it", existing);
                 return 0;
             }
 
@@ -359,40 +358,48 @@ namespace
              * it can read the mapping back, and an image older than protocol 4 cannot
              * report itself - so say that instead of the vague "unload first".
              */
-            vgb_log::Error("a different driver build is already mapped (protocol %u, expected %u)",
-                           existing, VGB_PROTOCOL_VERSION);
+            km_log::Error("a different driver build is already mapped (protocol %u, expected %u)",
+                           existing, KM_PROTOCOL_VERSION);
 
-            if (existing && existing < VGB_PROTOCOL_VERSION)
+            if (existing && existing < KM_PROTOCOL_VERSION)
             {
-                vgb_log::Info("it cannot report its own mapping, so try `unload` once; "
+                km_log::Info("it cannot report its own mapping, so try `unload` once; "
                               "if the device still answers afterwards, reboot");
             }
             else
             {
-                vgb_log::Info("run `unload` first, then load again");
+                km_log::Info("run `unload` first, then load again");
             }
 
             return 1;
         }
 
-        const std::wstring nalState = nt::GetFullTempPath() + L"\\vgb-nal.state";
+        const std::wstring nalState = nt::GetFullTempPath() + L"\\km-nal.state";
         nal::SetStatePath(nalState);
 
         if (!nal::Load(nullptr))
         {
-            vgb_log::Error("could not bring up the mapping host");
+            km_log::Error("could not bring up the mapping host");
             return 1;
         }
+
+        /*
+         * The host is a real service, so ntoskrnl recorded the previous session's
+         * copy in MmUnloadedDrivers and in the PiDDB cache. Clear that now, while
+         * kernel access is available, instead of leaving a growing trail.
+         */
+        if (!nal::DriverPath().empty())
+            trace::Scrub(nal::DriverPath());
 
         std::wstring imagePath;
         if (!nt::GetFullTempPath().empty())
         {
-            imagePath = nt::GetFullTempPath() + L"\\vgb-mapped.sys";
+            imagePath = nt::GetFullTempPath() + L"\\km-mapped.sys";
             if (!nt::CreateFileFromMemory(imagePath,
-                                          reinterpret_cast<const char*>(vgb_sys),
-                                          vgb_sys_size))
+                                          reinterpret_cast<const char*>(km_sys),
+                                          km_sys_size))
             {
-                vgb_log::Error("could not stage the driver image");
+                km_log::Error("could not stage the driver image");
                 nal::Unload();
                 return 1;
             }
@@ -401,7 +408,7 @@ namespace
         mapper::MAP_RESULT result = { 0 };
         if (!mapper::Map(imagePath, clientPid, &result))
         {
-            vgb_log::Error("mapping failed");
+            km_log::Error("mapping failed");
             _wremove(imagePath.c_str());
             nal::Unload();
             return 1;
@@ -414,22 +421,22 @@ namespace
 
         if (!OpenDevice())
         {
-            vgb_log::Error("driver mapped but the device did not appear");
+            km_log::Error("driver mapped but the device did not appear");
             return 1;
         }
 
         ULONG version = 0;
-        if (!Ioctl(IOCTL_VGB_GET_VERSION, nullptr, 0, &version, sizeof(version), nullptr) ||
-            version != VGB_PROTOCOL_VERSION)
+        if (!Ioctl(IOCTL_KM_GET_VERSION, nullptr, 0, &version, sizeof(version), nullptr) ||
+            version != KM_PROTOCOL_VERSION)
         {
-            vgb_log::Error("mapped image does not answer with protocol %u", VGB_PROTOCOL_VERSION);
+            km_log::Error("mapped image does not answer with protocol %u", KM_PROTOCOL_VERSION);
             return 1;
         }
 
-        vgb_log::Good("driver loaded, protocol %u", version);
+        km_log::Good("driver loaded, protocol %u", version);
 
         if (clientPid)
-            vgb_log::Good("client pid %u registered", clientPid);
+            km_log::Good("client pid %u registered", clientPid);
 
         return 0;
     }
@@ -438,13 +445,13 @@ namespace
     {
         if (!Elevated())
         {
-            vgb_log::Error("not elevated");
+            km_log::Error("not elevated");
             return 1;
         }
 
         CloseDevice();
 
-        nal::SetStatePath(nt::GetFullTempPath() + L"\\vgb-nal.state");
+        nal::SetStatePath(nt::GetFullTempPath() + L"\\km-nal.state");
 
         /*
          * Ask the driver for its own mapping first. The state file is only a
@@ -452,9 +459,9 @@ namespace
          * leaked in pool for good (the device kept answering after "unload").
          */
         MAP_STATE state = { 0 };
-        VGB_INFO info = { 0 };
+        KM_INFO info = { 0 };
 
-        if (Ioctl(IOCTL_VGB_GET_INFO, nullptr, 0, &info, sizeof(info), nullptr))
+        if (Ioctl(IOCTL_KM_GET_INFO, nullptr, 0, &info, sizeof(info), nullptr))
         {
             state.imageBase = info.ImageBase;
             state.imageSize = info.ImageSize;
@@ -473,7 +480,7 @@ namespace
              * freed while the device was still live. */
             if (!nal::Attach())
             {
-                vgb_log::Error("cannot open the mapping host - driver NOT unmapped");
+                km_log::Error("cannot open the mapping host - driver NOT unmapped");
                 return 1;
             }
 
@@ -482,40 +489,45 @@ namespace
 
             if (!mapper::Unmap(result))
             {
-                vgb_log::Error("unmap failed - state kept, retry unload");
+                km_log::Error("unmap failed - state kept, retry unload");
                 return 1;
             }
 
             ClearMapState();
-            vgb_log::Good("driver unmapped");
+            km_log::Good("driver unmapped");
         }
         else
         {
-            vgb_log::Warn("driver is not mapped - skipping unmap");
+            km_log::Warn("driver is not mapped - skipping unmap");
         }
+
+        /* Still open: clear this session's trace before releasing the host. */
+        if (!nal::DriverPath().empty())
+            trace::Scrub(nal::DriverPath());
+
         nal::Unload();
-        vgb_log::Good("mapping host released");
+        km_log::Good("mapping host released");
 
         return 0;
     }
 
     int CmdPid(const wchar_t* name)
     {
-        VGB_NAME_REQ request = { 0 };
-        VGB_PID_REQ reply = { 0 };
+        KM_NAME_REQ request = { 0 };
+        KM_PID_REQ reply = { 0 };
 
         request.Pid = 0;
-        wcsncpy_s(request.Name, VGB_MAX_NAME_CHARS, name, VGB_MAX_NAME_CHARS - 1);
+        wcsncpy_s(request.Name, KM_MAX_NAME_CHARS, name, KM_MAX_NAME_CHARS - 1);
 
-        if (!Ioctl(IOCTL_VGB_GET_PID_BY_NAME, &request, sizeof(request), &reply, sizeof(reply), nullptr))
+        if (!Ioctl(IOCTL_KM_GET_PID_BY_NAME, &request, sizeof(request), &reply, sizeof(reply), nullptr))
         {
-            vgb_log::Error("pid lookup failed (0x%08X)", GetLastError());
+            km_log::Error("pid lookup failed (0x%08X)", GetLastError());
             return 1;
         }
 
         if (!reply.Pid)
         {
-            vgb_log::Error("no process named %ls", name);
+            km_log::Error("no process named %ls", name);
             return 1;
         }
 
@@ -525,12 +537,12 @@ namespace
 
     int CmdMainBase(uint32_t pid)
     {
-        VGB_PID_REQ request = { pid, 0 };
+        KM_PID_REQ request = { pid, 0 };
         uint64_t base = 0;
 
-        if (!Ioctl(IOCTL_VGB_GET_MAIN_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
+        if (!Ioctl(IOCTL_KM_GET_MAIN_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
         {
-            vgb_log::Error("main base failed (0x%08X)", GetLastError());
+            km_log::Error("main base failed (0x%08X)", GetLastError());
             return 1;
         }
 
@@ -540,15 +552,15 @@ namespace
 
     int CmdBase(uint32_t pid, const wchar_t* module)
     {
-        VGB_NAME_REQ request = { 0 };
+        KM_NAME_REQ request = { 0 };
         uint64_t base = 0;
 
         request.Pid = pid;
-        wcsncpy_s(request.Name, VGB_MAX_NAME_CHARS, module, VGB_MAX_NAME_CHARS - 1);
+        wcsncpy_s(request.Name, KM_MAX_NAME_CHARS, module, KM_MAX_NAME_CHARS - 1);
 
-        if (!Ioctl(IOCTL_VGB_GET_MODULE_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
+        if (!Ioctl(IOCTL_KM_GET_MODULE_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
         {
-            vgb_log::Error("module lookup failed (0x%08X)", GetLastError());
+            km_log::Error("module lookup failed (0x%08X)", GetLastError());
             return 1;
         }
 
@@ -560,16 +572,16 @@ namespace
     {
         const DWORD capacity = 256 * 1024;
         std::vector<uint8_t> buffer(capacity);
-        VGB_PID_REQ request = { pid, 0 };
+        KM_PID_REQ request = { pid, 0 };
         DWORD returned = 0;
 
-        if (!Ioctl(IOCTL_VGB_ENUM_MODULES, &request, sizeof(request), buffer.data(), capacity, &returned))
+        if (!Ioctl(IOCTL_KM_ENUM_MODULES, &request, sizeof(request), buffer.data(), capacity, &returned))
         {
-            vgb_log::Error("module enumeration failed (0x%08X)", GetLastError());
+            km_log::Error("module enumeration failed (0x%08X)", GetLastError());
             return 1;
         }
 
-        auto list = reinterpret_cast<VGB_MODULE_LIST*>(buffer.data());
+        auto list = reinterpret_cast<KM_MODULE_LIST*>(buffer.data());
 
         for (ULONG i = 0; i < list->Count; ++i)
             printf("0x%016llX  %8u  %ls\n",
@@ -578,7 +590,7 @@ namespace
                    list->Entries[i].Name);
 
         if (list->Truncated)
-            vgb_log::Warn("list truncated at %u entries", list->Count);
+            km_log::Warn("list truncated at %u entries", list->Count);
 
         return 0;
     }
@@ -587,7 +599,7 @@ namespace
     {
         if (!size)
         {
-            vgb_log::Error("size must be non-zero");
+            km_log::Error("size must be non-zero");
             return 1;
         }
 
@@ -597,14 +609,14 @@ namespace
         while (done < size)
         {
             const size_t remaining = size - done;
-            const uint32_t chunk = (uint32_t)(remaining < VGB_MAX_XFER ? remaining : VGB_MAX_XFER);
-            VGB_MEM_REQ request = { pid, chunk, address + done };
+            const uint32_t chunk = (uint32_t)(remaining < KM_MAX_XFER ? remaining : KM_MAX_XFER);
+            KM_MEM_REQ request = { pid, chunk, address + done };
             DWORD returned = 0;
 
-            if (!Ioctl(IOCTL_VGB_READ, &request, sizeof(request), buffer.data() + done,
+            if (!Ioctl(IOCTL_KM_READ, &request, sizeof(request), buffer.data() + done,
                        chunk, &returned))
             {
-                vgb_log::Error("read failed at 0x%llX (0x%08X)",
+                km_log::Error("read failed at 0x%llX (0x%08X)",
                            (unsigned long long)(address + done), GetLastError());
                 return 1;
             }
@@ -625,7 +637,7 @@ namespace
 
         if (!ParseHex(hex, &bytes) || bytes.empty())
         {
-            vgb_log::Error("could not parse the hex payload");
+            km_log::Error("could not parse the hex payload");
             return 1;
         }
 
@@ -634,18 +646,18 @@ namespace
         while (done < bytes.size())
         {
             const size_t remaining = bytes.size() - done;
-            const uint32_t chunk = (uint32_t)(remaining < VGB_MAX_XFER ? remaining : VGB_MAX_XFER);
-            std::vector<uint8_t> packet(sizeof(VGB_MEM_REQ) + chunk);
+            const uint32_t chunk = (uint32_t)(remaining < KM_MAX_XFER ? remaining : KM_MAX_XFER);
+            std::vector<uint8_t> packet(sizeof(KM_MEM_REQ) + chunk);
 
-            auto request = reinterpret_cast<VGB_MEM_REQ*>(packet.data());
+            auto request = reinterpret_cast<KM_MEM_REQ*>(packet.data());
             request->Pid = pid;
             request->Size = chunk;
             request->Address = address + done;
-            memcpy(packet.data() + sizeof(VGB_MEM_REQ), bytes.data() + done, chunk);
+            memcpy(packet.data() + sizeof(KM_MEM_REQ), bytes.data() + done, chunk);
 
-            if (!Ioctl(IOCTL_VGB_WRITE, packet.data(), (DWORD)packet.size(), nullptr, 0, nullptr))
+            if (!Ioctl(IOCTL_KM_WRITE, packet.data(), (DWORD)packet.size(), nullptr, 0, nullptr))
             {
-                vgb_log::Error("write failed at 0x%llX (0x%08X)",
+                km_log::Error("write failed at 0x%llX (0x%08X)",
                            (unsigned long long)(address + done), GetLastError());
                 return 1;
             }
@@ -653,49 +665,47 @@ namespace
             done += chunk;
         }
 
-        vgb_log::Good("wrote %zu bytes at 0x%llX", done, (unsigned long long)address);
+        km_log::Good("wrote %zu bytes at 0x%llX", done, (unsigned long long)address);
         return 0;
     }
 
     int CmdAttach(uint32_t pid)
     {
-        VGB_PID_REQ request = { pid, 0 };
+        KM_PID_REQ request = { pid, 0 };
 
-        if (!Ioctl(IOCTL_VGB_SET_CLIENT_PID, &request, sizeof(request), nullptr, 0, nullptr))
+        if (!Ioctl(IOCTL_KM_SET_CLIENT_PID, &request, sizeof(request), nullptr, 0, nullptr))
         {
-            vgb_log::Error("attach failed (0x%08X)", GetLastError());
+            km_log::Error("attach failed (0x%08X)", GetLastError());
             return 1;
         }
 
-        vgb_log::Good("client pid %u registered for handle restoration", pid);
+        km_log::Good("client pid %u registered for handle restoration", pid);
         return 0;
     }
 
     int CmdOverlay(uint32_t pid)
     {
-        if (overlay::IsRunning())
+        UNREFERENCED_PARAMETER(pid);
+
+        if (game::IsRunning())
         {
-            overlay::Stop();
-            vgb_log::Good("overlay stopped");
+            game::Stop();
+            km_log::Good("client stopped");
             return 0;
         }
 
         if (!OpenDevice())
         {
-            vgb_log::Error("driver is not loaded - load it first");
+            km_log::Error("driver is not loaded - load it first");
             return 1;
         }
 
-        if (!pid)
-        {
-            vgb_log::Error("usage: overlay <pid>");
-            return 1;
-        }
-
-        if (!overlay::Start(pid))
+        /* The client resolves the pid itself now, so the argument is only kept for
+         * command-line compatibility. */
+        if (!game::Start())
             return 1;
 
-        vgb_log::Good("overlay running over pid %u - F9 stops it", pid);
+        km_log::Good("client running - F9 in it stops it");
         return 0;
     }
 }
@@ -710,12 +720,12 @@ namespace
 
     uint32_t LookupPid(const wchar_t* name)
     {
-        VGB_NAME_REQ request = { 0 };
-        VGB_PID_REQ reply = { 0 };
+        KM_NAME_REQ request = { 0 };
+        KM_PID_REQ reply = { 0 };
 
-        wcsncpy_s(request.Name, VGB_MAX_NAME_CHARS, name, VGB_MAX_NAME_CHARS - 1);
+        wcsncpy_s(request.Name, KM_MAX_NAME_CHARS, name, KM_MAX_NAME_CHARS - 1);
 
-        if (!Ioctl(IOCTL_VGB_GET_PID_BY_NAME, &request, sizeof(request),
+        if (!Ioctl(IOCTL_KM_GET_PID_BY_NAME, &request, sizeof(request),
                    &reply, sizeof(reply), nullptr))
             return 0;
 
@@ -724,10 +734,10 @@ namespace
 
     uint64_t MainBaseOf(uint32_t pid)
     {
-        VGB_PID_REQ request = { pid, 0 };
+        KM_PID_REQ request = { pid, 0 };
         uint64_t base = 0;
 
-        if (!Ioctl(IOCTL_VGB_GET_MAIN_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
+        if (!Ioctl(IOCTL_KM_GET_MAIN_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
             return 0;
 
         return base;
@@ -735,13 +745,13 @@ namespace
 
     uint64_t ModuleBaseOf(uint32_t pid, const wchar_t* name)
     {
-        VGB_NAME_REQ request = { 0 };
+        KM_NAME_REQ request = { 0 };
         uint64_t base = 0;
 
         request.Pid = pid;
-        wcsncpy_s(request.Name, VGB_MAX_NAME_CHARS, name, VGB_MAX_NAME_CHARS - 1);
+        wcsncpy_s(request.Name, KM_MAX_NAME_CHARS, name, KM_MAX_NAME_CHARS - 1);
 
-        if (!Ioctl(IOCTL_VGB_GET_MODULE_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
+        if (!Ioctl(IOCTL_KM_GET_MODULE_BASE, &request, sizeof(request), &base, sizeof(base), nullptr))
             return 0;
 
         return base;
@@ -770,7 +780,7 @@ namespace
     void ShowHeader()
     {
         printf("\n==================================================\n");
-        printf("  VanguardBypass\n");
+        printf("  Kernmem\n");
         printf("==================================================\n");
         printf("  driver : %s\n", OpenDevice() ? "LOADED" : "not loaded");
         printf("  shell  : %s\n", Elevated() ? "elevated" : "NOT elevated (load will fail)");
@@ -792,7 +802,7 @@ namespace
 
         if (!pid)
         {
-            vgb_log::Error("game not running - the process only exists during a match");
+            km_log::Error("game not running - the process only exists during a match");
             return 0;
         }
 
@@ -839,8 +849,8 @@ namespace
 
         if (!ShellExecuteExW(&info))
         {
-            vgb_log::Error("elevation failed or was declined (0x%08X)", GetLastError());
-            vgb_log::Info("right-click the exe and choose Run as administrator");
+            km_log::Error("elevation failed or was declined (0x%08X)", GetLastError());
+            km_log::Info("right-click the exe and choose Run as administrator");
             return false;
         }
 
@@ -894,7 +904,7 @@ namespace
                 return pid;
 
             if (i % 50 == 0)
-                vgb_log::Step("waiting for the game%s", i ? "" : " - enter a match");
+                km_log::Step("waiting for the game%s", i ? "" : " - enter a match");
 
             Sleep(100);
         }
@@ -908,20 +918,20 @@ namespace
      */
     int RunOneClick()
     {
-        printf("\n  VanguardBypass\n");
+        printf("\n  Kernmem\n");
         printf("  ==============================================\n\n");
 
         if (OpenDevice())
         {
-            vgb_log::Good("driver already loaded");
+            km_log::Good("driver already loaded");
         }
         else
         {
-            vgb_log::Step("loading the driver");
+            km_log::Step("loading the driver");
 
             if (CmdLoad(GetCurrentProcessId()) != 0)
             {
-                vgb_log::Error("driver load failed - see above");
+                km_log::Error("driver load failed - see above");
                 Pause();
                 return 1;
             }
@@ -932,42 +942,43 @@ namespace
         if (!pid)
         {
             if (LaunchClient())
-                vgb_log::Info("starting the Riot client - log in and enter a match");
+                km_log::Info("starting the Riot client - log in and enter a match");
             else
-                vgb_log::Info("open League of Legends and enter a match");
+                km_log::Info("open League of Legends and enter a match");
 
             pid = WaitForGame(300);
         }
 
         if (!pid)
         {
-            vgb_log::Error("no game process found - is League of Legends installed?");
+            km_log::Error("no game process found - is League of Legends installed?");
             Pause();
             return 1;
         }
 
         g_sessionPid = pid;
-        vgb_log::Good("game pid %u", pid);
+        km_log::Good("game pid %u", pid);
 
         /* Lets this process use plain ReadProcessMemory too. */
         CmdAttach(GetCurrentProcessId());
 
-        if (!overlay::Start(pid))
+        if (!game::Start())
         {
-            vgb_log::Error("the overlay did not start");
+            km_log::Error("the client did not start");
             Pause();
             return 1;
         }
 
-        vgb_log::Good("overlay running");
-        vgb_log::Info("F9 stops it. Close this window when done.");
-        vgb_log::Info("nothing is drawn until you are in a match.");
+        km_log::Good("client running");
+        km_log::Info("F9 in the client stops it. Close this window when done.");
+        km_log::Info("nothing is drawn until you are in a match.");
 
-        /* Keep the process - and with it the render thread - alive. */
-        while (overlay::IsRunning())
+        /* Keep the device open - the client reads through this loader's mapping - 
+         * until the client exits. */
+        while (game::IsRunning())
             Sleep(200);
 
-        vgb_log::Info("overlay stopped");
+        km_log::Info("client stopped");
         Pause();
         return 0;
     }
@@ -983,9 +994,9 @@ namespace
         const uint64_t base = MainBaseOf(pid);
 
         if (base)
-            vgb_log::Good("image base 0x%llX", (unsigned long long)base);
+            km_log::Good("image base 0x%llX", (unsigned long long)base);
         else
-            vgb_log::Warn("could not resolve the image base");
+            km_log::Warn("could not resolve the image base");
     }
 
     void UiRead()
@@ -1043,30 +1054,30 @@ namespace
         if (!pid)
             return;
 
-        wchar_t name[VGB_MAX_NAME_CHARS] = { 0 };
+        wchar_t name[KM_MAX_NAME_CHARS] = { 0 };
 
         printf("  module name: ");
-        if (!ReadLine(name, VGB_MAX_NAME_CHARS) || !name[0])
+        if (!ReadLine(name, KM_MAX_NAME_CHARS) || !name[0])
             return;
 
         const uint64_t base = ModuleBaseOf(pid, name);
 
         if (!base)
         {
-            vgb_log::Error("module not found: %ls", name);
+            km_log::Error("module not found: %ls", name);
             return;
         }
 
         struct { uint32_t Pid; uint32_t Pad; uint64_t Base; } request = { pid, 0, base };
-        const ULONG code = hide ? IOCTL_VGB_HIDE_MODULE : IOCTL_VGB_UNHIDE_MODULE;
+        const ULONG code = hide ? IOCTL_KM_HIDE_MODULE : IOCTL_KM_UNHIDE_MODULE;
 
         if (!Ioctl(code, &request, sizeof(request), nullptr, 0, nullptr))
         {
-            vgb_log::Error("%s failed (0x%08X)", hide ? "hide" : "unhide", GetLastError());
+            km_log::Error("%s failed (0x%08X)", hide ? "hide" : "unhide", GetLastError());
             return;
         }
 
-        vgb_log::Good("%s: %ls (0x%llX)", hide ? "hidden" : "unhidden", name,
+        km_log::Good("%s: %ls (0x%llX)", hide ? "hidden" : "unhidden", name,
                       (unsigned long long)base);
     }
 
@@ -1095,7 +1106,7 @@ namespace
             printf("  7) unhide module\n");
             printf("  8) status\n");
             printf("  9) unload driver\n");
-            printf("  o) toggle overlay\n");
+            printf("  o) start/stop client\n");
             printf("  0) quit\n");
             printf("\n  choice: ");
 
@@ -1115,7 +1126,7 @@ namespace
             case L'7': UiHide(false); break;
             case L'8': CmdStatus(); break;
             case L'9':
-                overlay::Stop();
+                game::Stop();
                 CmdUnload();
                 g_sessionPid = 0;
                 break;
@@ -1124,7 +1135,7 @@ namespace
                 UiOverlay();
                 break;
             case L'0': return 0;
-            default: vgb_log::Warn("unknown choice"); break;
+            default: km_log::Warn("unknown choice"); break;
             }
 
             Pause();
@@ -1136,7 +1147,7 @@ namespace
 
 /*
  * Windows virtualises coordinates for a DPI-unaware process: on a 4K panel at 150%
- * GetClientRect reports 2545x1354 for a 3840x2160 game window, the overlay draws
+ * GetClientRect reports 2545x1354 for a 3840x2160 game window, the client draws
  * into that smaller surface, and the compositor then stretches it back up. Every
  * drawn pixel therefore lands about 1.5x too far from the origin, and the surface
  * does not even cover the window.
@@ -1186,16 +1197,16 @@ int wmain(int argc, wchar_t** argv)
      * after a bugcheck the last entry names the step that was running. The path is
      * printed so it can be found without guessing.
      */
-    vgb_log::InstallExceptionFilter();
+    km_log::InstallExceptionFilter();
 
-    const std::wstring crashLog = vgb_log::OpenCrashLog();
+    const std::wstring crashLog = km_log::OpenCrashLog();
 
     if (!crashLog.empty())
-        vgb_log::Info("log: %ls", crashLog.c_str());
+        km_log::Info("log: %ls", crashLog.c_str());
     else
         printf("[!] could not open a crash log\n");
 
-    vgb_log::Line("*", "vgb-loader started, %d argument(s)", argc - 1);
+    km_log::Line("*", "kernmem-loader started, %d argument(s)", argc - 1);
 
     /* No arguments at all is the product: one click, everything automatic. */
     if (argc < 2)
@@ -1276,18 +1287,19 @@ int wmain(int argc, wchar_t** argv)
     {
         result = CmdAttach((uint32_t)_wtoi(argv[2]));
     }
-    else if (verb == L"overlay" && argc >= 3)
+    else if (verb == L"overlay")
     {
-        result = CmdOverlay((uint32_t)_wtoi(argv[2]));
+        /* No pid any more - the client resolves it. */
+        result = CmdOverlay(argc >= 3 ? (uint32_t)_wtoi(argv[2]) : 0);
 
-        /* The render thread dies with this process, so the CLI form has to stay
-         * resident. F9 (handled inside the overlay) ends it. */
-        while (result == 0 && overlay::IsRunning())
+        /* The client reads through this process's mapping, so the CLI form has to
+         * stay resident until it exits. F9 in the client ends it. */
+        while (result == 0 && game::IsRunning())
             Sleep(100);
     }
     else
     {
-        vgb_log::Error("unknown verb or missing arguments");
+        km_log::Error("unknown verb or missing arguments");
     }
 
     CloseDevice();

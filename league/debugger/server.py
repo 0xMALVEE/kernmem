@@ -18,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-DEVICE_PATHS = (r'\\.\VanguardBypass', r'\\?\GLOBALROOT\Device\VanguardBypass')
+DEVICE_PATHS = (r'\\.\Kernmem', r'\\?\GLOBALROOT\Device\Kernmem')
 
 IOCTL_GET_PID = 0x80002008
 IOCTL_READ = 0x80002010
@@ -478,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(os.environ.get('VGB_DEBUG_PORT', '8777'))
+    port = int(os.environ.get('KM_DEBUG_PORT', '8777'))
     threading.Thread(target=poller, daemon=True).start()
     print('debugger api on http://127.0.0.1:%d/api/state' % port, flush=True)
     ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()

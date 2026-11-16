@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "sdk"))
 
-import vgb  # noqa: E402
+import km  # noqa: E402
 
 import reader  # noqa: E402
 
@@ -102,7 +102,7 @@ def main():
     pid = game.pid
     base = game.base
 
-    with game, vgb.Client() as c:
+    with game, km.Client() as c:
         c.require_version()
         print(f"pid {pid} base {base:#x} patch {game.patch}")
 

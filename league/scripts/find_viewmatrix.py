@@ -9,7 +9,7 @@ k32.CreateFileW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,w.LPVOID,w.DWORD,w.DWORD,w.H
 k32.DeviceIoControl.restype=w.BOOL
 k32.DeviceIoControl.argtypes=[ctypes.c_void_p,w.DWORD,ctypes.c_void_p,w.DWORD,ctypes.c_void_p,w.DWORD,ctypes.POINTER(w.DWORD),w.LPVOID]
 
-h=k32.CreateFileW(r'\\?\GLOBALROOT\Device\VanguardBypass',GR|GW,SA,None,OE,0,None)
+h=k32.CreateFileW(r'\\?\GLOBALROOT\Device\Kernmem',GR|GW,SA,None,OE,0,None)
 if not h or h==INV: raise SystemExit('open %d'%ctypes.get_last_error())
 
 def ioctl(c,i,n):

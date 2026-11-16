@@ -9,7 +9,7 @@ k32.DeviceIoControl.restype=w.BOOL
 k32.DeviceIoControl.argtypes=[ctypes.c_void_p,w.DWORD,ctypes.c_void_p,w.DWORD,ctypes.c_void_p,w.DWORD,ctypes.POINTER(w.DWORD),w.LPVOID]
 
 h=None
-for dev in (r'\\.\VanguardBypass', r'\\?\GLOBALROOT\Device\VanguardBypass'):
+for dev in (r'\\.\Kernmem', r'\\?\GLOBALROOT\Device\Kernmem'):
     hh=k32.CreateFileW(dev,GR|GW,SA,None,OE,0,None)
     print('open %-42s %s'%(dev,'OK' if hh and hh!=INV else 'fail %d'%ctypes.get_last_error()))
     if hh and hh!=INV:

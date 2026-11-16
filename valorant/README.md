@@ -1,11 +1,11 @@
 # Valorant
 
 External ESP over the shared driver. Nothing is injected; every read goes through
-`sdk/vgb.py` to the kernel driver, so Vanguard's handle stripping never applies.
+`sdk/km.py` to the kernel driver, so Vanguard's handle stripping never applies.
 
 **Status: radar works, boxes do not.** The camera POV is unresolved on the build
-this was recovered against (5.3) — every documented camera path reads null or
-denormal — so the overlay draws a top-down radar instead of screen boxes. The
+this was recovered against (5.3) â€” every documented camera path reads null or
+denormal â€” so the overlay draws a top-down radar instead of screen boxes. The
 box renderer is in place and engages automatically once `camera()` returns a POV.
 
 ## Offsets actually in use
@@ -20,7 +20,7 @@ All read live and repeatable against the running client:
 | acknowledged pawn | `0x518` | dumps say `0x4B0`/`0x510`; only `0x518` answers here |
 
 Known-broken on this build: the world chain (`GWorld` reads 0, the level's own
-actor array reads empty) — which is why the module static is used directly — and
+actor array reads empty) â€” which is why the module static is used directly â€” and
 the camera (see above). Health/team/name offsets are in the table but unverified.
 
 ## Run
@@ -36,7 +36,7 @@ python scripts\esp.py --range 20000 # wider
 `F9` pauses, `END` quits.
 
 The pawn field is unreliable, so the radar centres on you when your position
-reads cleanly and on the player centroid otherwise — the HUD says which.
+reads cleanly and on the player centroid otherwise â€” the HUD says which.
 
 ## Offsets file
 

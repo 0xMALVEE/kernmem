@@ -1,5 +1,5 @@
 /*
- * VanguardBypass kernel driver
+ * Kernmem kernel driver
  * ----------------------------
  * Riot Vanguard protects the game process with ObRegisterCallbacks and strips
  * PROCESS_VM_READ / PROCESS_VM_WRITE / PROCESS_VM_OPERATION out of every handle
@@ -30,22 +30,29 @@
 #include <ntifs.h>
 #include <ntstrsafe.h>
 
-#include "vgb_shared.h"
-#include "vgb_ntcompat.h"
+#include "km_shared.h"
+#include "km_ntcompat.h"
 
-#define VGB_TAG 'BGVb'
+/* Fallback pool tag. The real one is generated per install and arrives in the
+ * init block, so a build does not stamp one greppable four bytes into every
+ * machine's pool. */
+#define KM_TAG_DEFAULT 'MENK'
 
-#define VGB_MAX_HIDDEN 32
+#define KM_MAX_HIDDEN 32
 
-typedef struct _VGB_HIDDEN_ENTRY
+/* LdrpHashTable has 32 buckets on x64. */
+#define KM_LDR_HASH_COUNT 32
+
+typedef struct _KM_HIDDEN_ENTRY
 {
     unsigned long Pid;
     void* Entry;
     void* DllBase;
-} VGB_HIDDEN_ENTRY;
+    void* HashBucket;   /* bucket head the entry was unlinked from, or NULL */
+} KM_HIDDEN_ENTRY;
 
 /* Layout of an LDR_DATA_TABLE_ENTRY from the three list heads onward. */
-typedef struct _VGB_LDR_ENTRY
+typedef struct _KM_LDR_ENTRY
 {
     LIST_ENTRY InLoadOrderLinks;
     LIST_ENTRY InMemoryOrderLinks;
@@ -55,7 +62,16 @@ typedef struct _VGB_LDR_ENTRY
     unsigned long SizeOfImage;
     UNICODE_STRING FullDllName;
     UNICODE_STRING BaseDllName;
-} VGB_LDR_ENTRY;
+    unsigned long Flags;
+    unsigned short LoadCount;
+    unsigned short TlsIndex;
+    LIST_ENTRY HashLinks;
+} KM_LDR_ENTRY;
+
+/* HashLinks sits at 0x70 on every x64 build from 7600 to 26200; the fields in
+ * between are only present to reach that offset, so assert it rather than trust
+ * it. */
+C_ASSERT(FIELD_OFFSET(KM_LDR_ENTRY, HashLinks) == 0x70);
 
 static PDEVICE_OBJECT g_DeviceObject = NULL;
 static ULONG          g_ClientPid = 0;
@@ -63,7 +79,28 @@ static PVOID          g_ObRegistration = NULL;
 static BOOLEAN        g_ObRegistered = FALSE;
 static KSPIN_LOCK     g_HiddenLock;
 static volatile LONG  g_Unloading = 0;
-static VGB_HIDDEN_ENTRY g_Hidden[VGB_MAX_HIDDEN];
+static KM_HIDDEN_ENTRY g_Hidden[KM_MAX_HIDDEN];
+
+/*
+ * Device identity. The loader picks the name per install and hands it over in
+ * the init block, so a build does not stamp one fixed namespace onto every
+ * machine. The buffers are static because the driver object and the symbolic
+ * link both keep pointing at them for the whole life of the mapping.
+ */
+static WCHAR          g_DeviceName[KM_MAX_DEVICE_CHARS];
+static WCHAR          g_DevicePath[KM_MAX_DEVICE_CHARS + 16];
+static WCHAR          g_SymlinkName[KM_MAX_DEVICE_CHARS + 16];
+static WCHAR          g_DriverName[KM_MAX_DEVICE_CHARS + 16];
+static UNICODE_STRING g_Symlink;
+static ULONG          g_DeviceType = KM_DEVICE_TYPE;
+
+/* Per-install seed for the callback altitude. A fixed altitude is one more
+ * constant to signature on, and it also collided with other filters on some
+ * machines and fell through the whole chain. */
+static ULONG          g_AltitudeSeed = 0;
+
+/* Per-install pool tag for the transient query buffer. */
+static ULONG          g_PoolTag = KM_TAG_DEFAULT;
 
 /* Own mapping, reported to the loader so unload can free it without a state
  * file. Populated from the init block at entry. */
@@ -78,12 +115,12 @@ static PVOID            g_DriverObject = NULL;
 /* The init block arrives as DriverEntry's 2nd argument. Under manual mapping
  * that is a kernel pool pointer, under service load it is a registry path, so
  * only plausibility is checked here and the magic is validated under SEH. */
-static BOOLEAN VgbLooksLikePointer(const void* p)
+static BOOLEAN KmLooksLikePointer(const void* p)
 {
     return ((ULONG_PTR)p > 0x10000);
 }
 
-static PEPROCESS VgbReferenceProcess(ULONG pid)
+static PEPROCESS KmReferenceProcess(ULONG pid)
 {
     PEPROCESS proc = NULL;
     if (!pid)
@@ -93,13 +130,13 @@ static PEPROCESS VgbReferenceProcess(ULONG pid)
     return proc;
 }
 
-static NTSTATUS VgbCopyFromProcess(PEPROCESS proc, void* remote, void* local, SIZE_T size)
+static NTSTATUS KmCopyFromProcess(PEPROCESS proc, void* remote, void* local, SIZE_T size)
 {
     SIZE_T done = 0;
     return MmCopyVirtualMemory(proc, remote, PsGetCurrentProcess(), local, size, KernelMode, &done);
 }
 
-static NTSTATUS VgbCopyToProcess(PEPROCESS proc, void* remote, void* local, SIZE_T size)
+static NTSTATUS KmCopyToProcess(PEPROCESS proc, void* remote, void* local, SIZE_T size)
 {
     SIZE_T done = 0;
     return MmCopyVirtualMemory(PsGetCurrentProcess(), local, proc, remote, size, KernelMode, &done);
@@ -109,7 +146,7 @@ static NTSTATUS VgbCopyToProcess(PEPROCESS proc, void* remote, void* local, SIZE
 /* object callback: give our client its access rights back             */
 /* ------------------------------------------------------------------ */
 
-static OB_PREOP_CALLBACK_STATUS VgbProcessPreOperation(
+static OB_PREOP_CALLBACK_STATUS KmProcessPreOperation(
     _In_ PVOID RegistrationContext,
     _Inout_ POB_PRE_OPERATION_INFORMATION Info)
 {
@@ -138,24 +175,58 @@ static OB_PREOP_CALLBACK_STATUS VgbProcessPreOperation(
     return OB_PREOP_SUCCESS;
 }
 
-static NTSTATUS VgbRegisterObjectCallback(void)
+/*
+ * Historical fallbacks, tried after the seeded values. Kept as a table of
+ * pointers rather than inline arrays: x64 code is RIP-relative, so once no
+ * absolute address remains the linker omits the relocation section entirely and
+ * the mapper refuses the image. This table keeps one in place.
+ */
+static const WCHAR* const g_AltitudeFallbacks[] =
+{
+    L"321000", L"321100", L"329000", L"329500"
+};
+
+/* Six ASCII digits, zero padded, without the CRT. */
+static void KmFormatAltitude(WCHAR* out, ULONG value)
+{
+    ULONG i;
+
+    out[6] = 0;
+
+    for (i = 6; i > 0; --i)
+    {
+        out[i - 1] = (WCHAR)(L'0' + (value % 10));
+        value /= 10;
+    }
+}
+
+static NTSTATUS KmRegisterObjectCallback(void)
 {
     /*
      * The pre-operation chain runs in DESCENDING altitude order, so our filter
      * must sit above Vanguard's in order to put back the rights it strips.
-     * Registering at an altitude another filter already uses fails with
-     * STATUS_OBJECT_NAME_COLLISION, so several candidates are tried in order.
+     *
+     * A fixed altitude is both a constant to signature on and a collision risk.
+     * The primary value is seeded per install, safely above every process filter
+     * in the field; the historical values stay behind it as fallbacks for the
+     * case where the seeded one is already taken.
      */
-    static const WCHAR* candidates[] = { L"321000", L"321100", L"329000", L"329500" };
+    WCHAR candidates[6][7];
     OB_OPERATION_REGISTRATION operations[1];
     OB_CALLBACK_REGISTRATION registration;
     NTSTATUS status = STATUS_OBJECT_NAME_COLLISION;
     ULONG i;
 
+    KmFormatAltitude(candidates[0], 330000 + (g_AltitudeSeed % 60000));
+    KmFormatAltitude(candidates[1], 330000 + ((g_AltitudeSeed + 1) % 60000));
+    for (i = 0; i < RTL_NUMBER_OF(g_AltitudeFallbacks); ++i)
+        RtlStringCchCopyW(candidates[2 + i], RTL_NUMBER_OF(candidates[0]),
+                          g_AltitudeFallbacks[i]);
+
     RtlZeroMemory(operations, sizeof(operations));
     operations[0].ObjectType = PsProcessType;
     operations[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-    operations[0].PreOperation = VgbProcessPreOperation;
+    operations[0].PreOperation = KmProcessPreOperation;
     operations[0].PostOperation = NULL;
 
     for (i = 0; i < RTL_NUMBER_OF(candidates); ++i)
@@ -190,16 +261,16 @@ static NTSTATUS VgbRegisterObjectCallback(void)
 /* PsGetProcessImageFileName stores at most 15 chars and does NOT NUL-terminate
  * when the name is exactly that long, so the image side must be length-bounded
  * and a truncated image name counts as a match for a longer query. */
-#define VGB_IMAGE_NAME_MAX 15
+#define KM_IMAGE_NAME_MAX 15
 
-static BOOLEAN VgbImageNameMatches(const WCHAR* image, const WCHAR* wanted)
+static BOOLEAN KmImageNameMatches(const WCHAR* image, const WCHAR* wanted)
 {
     size_t i;
 
     if (!image || !image[0] || !wanted || !wanted[0])
         return FALSE;
 
-    for (i = 0; i < VGB_IMAGE_NAME_MAX && image[i]; ++i)
+    for (i = 0; i < KM_IMAGE_NAME_MAX && image[i]; ++i)
     {
         WCHAR a = image[i];
         WCHAR b = wanted[i];
@@ -214,8 +285,8 @@ static BOOLEAN VgbImageNameMatches(const WCHAR* image, const WCHAR* wanted)
             return FALSE;
     }
 
-    /* i == VGB_IMAGE_NAME_MAX means the stored name was truncated: accept it. */
-    return (i >= VGB_IMAGE_NAME_MAX) || (wanted[i] == 0);
+    /* i == KM_IMAGE_NAME_MAX means the stored name was truncated: accept it. */
+    return (i >= KM_IMAGE_NAME_MAX) || (wanted[i] == 0);
 }
 
 /* Last path component of an image path. The system information image names are
@@ -223,7 +294,7 @@ static BOOLEAN VgbImageNameMatches(const WCHAR* image, const WCHAR* wanted)
 /* Base name of an image path. ImageName is a counted UNICODE_STRING, so the
  * scan is length-bounded and works in wchar units (walking bytes would stop at
  * the high byte of the first character). */
-static const WCHAR* VgbBaseName(const WCHAR* path, ULONG chars)
+static const WCHAR* KmBaseName(const WCHAR* path, ULONG chars)
 {
     const WCHAR* base = path;
     ULONG i;
@@ -239,7 +310,7 @@ static const WCHAR* VgbBaseName(const WCHAR* path, ULONG chars)
 
 /* Fallback enumeration through the native system information query, used when
  * PsGetNextProcess cannot be resolved at runtime. */
-static ULONG VgbFindPidByNameQuery(const wchar_t* name)
+static ULONG KmFindPidByNameQuery(const wchar_t* name)
 {
     ULONG size = 0x20000;
     ULONG attempt;
@@ -250,7 +321,7 @@ static ULONG VgbFindPidByNameQuery(const wchar_t* name)
         ULONG needed = size;
         ULONG offset = 0;
         ULONG found = 0;
-        PVOID buffer = ExAllocatePoolWithTag(NonPagedPool, size, VGB_TAG);
+        PVOID buffer = ExAllocatePoolWithTag(NonPagedPool, size, g_PoolTag);
 
         if (!buffer)
             return 0;
@@ -258,35 +329,35 @@ static ULONG VgbFindPidByNameQuery(const wchar_t* name)
         status = ZwQuerySystemInformation(SystemProcessInformation, buffer, size, &needed);
         if (status == STATUS_INFO_LENGTH_MISMATCH)
         {
-            ExFreePoolWithTag(buffer, VGB_TAG);
+            ExFreePoolWithTag(buffer, g_PoolTag);
             size = needed + 0x1000;
             continue;
         }
         if (!NT_SUCCESS(status))
         {
-            ExFreePoolWithTag(buffer, VGB_TAG);
+            ExFreePoolWithTag(buffer, g_PoolTag);
             return 0;
         }
 
         for (;;)
         {
-            VGB_SYSTEM_PROCESS_INFORMATION* entry =
-                (VGB_SYSTEM_PROCESS_INFORMATION*)((PUCHAR)buffer + offset);
+            KM_SYSTEM_PROCESS_INFORMATION* entry =
+                (KM_SYSTEM_PROCESS_INFORMATION*)((PUCHAR)buffer + offset);
 
             if (entry->ImageName.Buffer && entry->ImageName.Length >= sizeof(WCHAR))
             {
                 const WCHAR* start = (const WCHAR*)entry->ImageName.Buffer;
                 const ULONG chars = entry->ImageName.Length / sizeof(WCHAR);
-                const WCHAR* base = VgbBaseName(start, chars);
+                const WCHAR* base = KmBaseName(start, chars);
                 const ULONG remaining = (ULONG)((start + chars) - base);
-                WCHAR wide[VGB_MAX_NAME_CHARS];
+                WCHAR wide[KM_MAX_NAME_CHARS];
                 ULONG i;
 
-                for (i = 0; i < remaining && i < VGB_MAX_NAME_CHARS - 1 && base[i]; ++i)
+                for (i = 0; i < remaining && i < KM_MAX_NAME_CHARS - 1 && base[i]; ++i)
                     wide[i] = base[i];
                 wide[i] = 0;
 
-                if (VgbImageNameMatches(wide, name))
+                if (KmImageNameMatches(wide, name))
                 {
                     found = (ULONG)(ULONG_PTR)entry->UniqueProcessId;
                     break;
@@ -298,16 +369,16 @@ static ULONG VgbFindPidByNameQuery(const wchar_t* name)
             offset += entry->NextEntryOffset;
         }
 
-        ExFreePoolWithTag(buffer, VGB_TAG);
+        ExFreePoolWithTag(buffer, g_PoolTag);
         return found;
     }
 
     return 0;
 }
 
-static ULONG VgbFindPidByName(const wchar_t* name)
+static ULONG KmFindPidByName(const wchar_t* name)
 {
-    static VGB_PFN_GET_NEXT_PROCESS getNext = NULL;
+    static KM_PFN_GET_NEXT_PROCESS getNext = NULL;
     static BOOLEAN resolved = FALSE;
     PEPROCESS proc;
 
@@ -319,7 +390,7 @@ static ULONG VgbFindPidByName(const wchar_t* name)
         UNICODE_STRING routine;
 
         RtlInitUnicodeString(&routine, L"PsGetNextProcess");
-        getNext = (VGB_PFN_GET_NEXT_PROCESS)MmGetSystemRoutineAddress(&routine);
+        getNext = (KM_PFN_GET_NEXT_PROCESS)MmGetSystemRoutineAddress(&routine);
         resolved = TRUE;
     }
 
@@ -332,14 +403,14 @@ static ULONG VgbFindPidByName(const wchar_t* name)
 
             if (image)
             {
-                WCHAR wide[VGB_IMAGE_NAME_MAX + 1];
+                WCHAR wide[KM_IMAGE_NAME_MAX + 1];
                 size_t i;
 
-                for (i = 0; i < VGB_IMAGE_NAME_MAX && image[i]; ++i)
+                for (i = 0; i < KM_IMAGE_NAME_MAX && image[i]; ++i)
                     wide[i] = (WCHAR)image[i];
                 wide[i] = 0;
 
-                if (VgbImageNameMatches(wide, name))
+                if (KmImageNameMatches(wide, name))
                 {
                     ULONG found = (ULONG)(ULONG_PTR)PsGetProcessId(proc);
                     ObDereferenceObject(proc);
@@ -357,12 +428,12 @@ static ULONG VgbFindPidByName(const wchar_t* name)
         return 0;
     }
 
-    return VgbFindPidByNameQuery(name);
+    return KmFindPidByNameQuery(name);
 }
 
-static NTSTATUS VgbGetMainBase(ULONG pid, unsigned __int64* base)
+static NTSTATUS KmGetMainBase(ULONG pid, unsigned __int64* base)
 {
-    PEPROCESS proc = VgbReferenceProcess(pid);
+    PEPROCESS proc = KmReferenceProcess(pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
@@ -372,25 +443,25 @@ static NTSTATUS VgbGetMainBase(ULONG pid, unsigned __int64* base)
 }
 
 /* Must be called attached to the target process. */
-static NTSTATUS VgbWalkModules(ULONG pid, VGB_MODULE_LIST* list, ULONG capacity)
+static NTSTATUS KmWalkModules(ULONG pid, KM_MODULE_LIST* list, ULONG capacity)
 {
     PEPROCESS proc = NULL;
     KAPC_STATE apc;
     NTSTATUS status = STATUS_SUCCESS;
-    VGB_PEB* peb;
+    KM_PEB* peb;
     LIST_ENTRY* head;
     LIST_ENTRY* cursor;
     ULONG count = 0;
     BOOLEAN truncated = FALSE;
 
-    proc = VgbReferenceProcess(pid);
+    proc = KmReferenceProcess(pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
     KeStackAttachProcess(proc, &apc);
     __try
     {
-        peb = (VGB_PEB*)PsGetProcessPeb(proc);
+        peb = (KM_PEB*)PsGetProcessPeb(proc);
         if (!peb || !peb->Ldr)
         {
             status = STATUS_NOT_FOUND;
@@ -400,7 +471,7 @@ static NTSTATUS VgbWalkModules(ULONG pid, VGB_MODULE_LIST* list, ULONG capacity)
             head = &peb->Ldr->InMemoryOrderModuleList;
             for (cursor = head->Flink; cursor != head; cursor = cursor->Flink)
             {
-                VGB_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, VGB_LDR_ENTRY, InMemoryOrderLinks);
+                KM_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, KM_LDR_ENTRY, InMemoryOrderLinks);
 
                 if (count >= capacity)
                 {
@@ -416,8 +487,8 @@ static NTSTATUS VgbWalkModules(ULONG pid, VGB_MODULE_LIST* list, ULONG capacity)
                 if (entry->BaseDllName.Buffer && entry->BaseDllName.Length)
                 {
                     ULONG chars = entry->BaseDllName.Length / sizeof(WCHAR);
-                    if (chars >= VGB_MAX_NAME_CHARS)
-                        chars = VGB_MAX_NAME_CHARS - 1;
+                    if (chars >= KM_MAX_NAME_CHARS)
+                        chars = KM_MAX_NAME_CHARS - 1;
                     RtlCopyMemory(list->Entries[count].Name, entry->BaseDllName.Buffer, chars * sizeof(WCHAR));
                     list->Entries[count].Name[chars] = 0;
                 }
@@ -437,33 +508,33 @@ static NTSTATUS VgbWalkModules(ULONG pid, VGB_MODULE_LIST* list, ULONG capacity)
     return status;
 }
 
-static NTSTATUS VgbGetModuleBase(ULONG pid, const wchar_t* name, unsigned __int64* base)
+static NTSTATUS KmGetModuleBase(ULONG pid, const wchar_t* name, unsigned __int64* base)
 {
     PEPROCESS proc = NULL;
     KAPC_STATE apc;
     NTSTATUS status = STATUS_NOT_FOUND;
     UNICODE_STRING wanted;
-    VGB_PEB* peb;
+    KM_PEB* peb;
     LIST_ENTRY* head;
     LIST_ENTRY* cursor;
 
     *base = 0;
     RtlInitUnicodeString(&wanted, name);
 
-    proc = VgbReferenceProcess(pid);
+    proc = KmReferenceProcess(pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
     KeStackAttachProcess(proc, &apc);
     __try
     {
-        peb = (VGB_PEB*)PsGetProcessPeb(proc);
+        peb = (KM_PEB*)PsGetProcessPeb(proc);
         if (peb && peb->Ldr)
         {
             head = &peb->Ldr->InMemoryOrderModuleList;
             for (cursor = head->Flink; cursor != head; cursor = cursor->Flink)
             {
-                VGB_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, VGB_LDR_ENTRY, InMemoryOrderLinks);
+                KM_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, KM_LDR_ENTRY, InMemoryOrderLinks);
                 if (entry->BaseDllName.Buffer &&
                     RtlEqualUnicodeString(&entry->BaseDllName, &wanted, TRUE))
                 {
@@ -485,17 +556,231 @@ static NTSTATUS VgbGetModuleBase(ULONG pid, const wchar_t* name, unsigned __int6
 }
 
 /* ------------------------------------------------------------------ */
+/* module index (the by-name tree)                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * LdrpModuleIndex is an RB tree of LDR_DATA_TABLE_ENTRY.LdrNode, ordered by
+ * DllBase, and it is what a name resolve (GetModuleHandle) walks. Unlinking the
+ * three lists and the hash bucket leaves that path intact, so the node has to
+ * come out of the tree too.
+ *
+ * Each parent is stored as ParentValue ^ key with the low bits holding the
+ * colour. Nothing is hardcoded: the node offset is found by checking the BST
+ * ordering and the key is recovered from a parent/child pair. Every step is
+ * validated, and a failure returns FALSE - leaving the index entry in place is a
+ * smaller loss than a bad splice into someone else's loader tree.
+ */
+#define KM_RB_LEFT   0x00
+#define KM_RB_RIGHT  0x08
+#define KM_RB_PARENT 0x10
+#define KM_RB_MASK   0x7ULL
+#define KM_RB_NODES  128
+
+static BOOLEAN KmUserPointer(unsigned __int64 p)
+{
+    return p >= 0x10000 && p < 0x7FFFFFFFFFFFULL && (p & 7) == 0;
+}
+
+/* The field moved between builds, so the offset is found by ordering instead of
+ * being assumed: a candidate only survives when both children are aligned user
+ * addresses whose DllBase sits on the correct side of ours. */
+static BOOLEAN KmFindLdrNodeOffset(KM_LDR_ENTRY* entry, unsigned __int64 base, ULONG* offset)
+{
+    ULONG probe;
+
+    for (probe = 0x78; probe <= 0x110; probe += 8)
+    {
+        unsigned __int64* node = (unsigned __int64*)((PUCHAR)entry + probe);
+        ULONG side;
+
+        if (!node[0] && !node[1] && !node[2])
+            continue;
+
+        for (side = 0; side < 2; ++side)
+        {
+            unsigned __int64 child = side ? node[1] : node[0];
+            unsigned __int64 childBase;
+
+            if (!child)
+                continue;
+            if (!KmUserPointer(child))
+                break;
+
+            childBase = *(unsigned __int64*)((PUCHAR)child - probe + 0x30);
+
+            if (side == 0 && childBase >= base)
+                break;
+            if (side == 1 && childBase <= base)
+                break;
+        }
+
+        if (side != 2)
+            continue;
+
+        *offset = probe;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/*
+ * Takes the node out of the tree. No rebalancing: the colours are carried over
+ * and the shape stays legal enough for a walk, which is all a resolve needs. A
+ * missing rebalance costs depth, not correctness.
+ */
+static BOOLEAN KmUnlinkModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned __int64 base)
+{
+    unsigned __int64 nodes[KM_RB_NODES];
+    unsigned __int64 key = 0;
+    unsigned __int64* node;
+    unsigned __int64 parentValue;
+    unsigned __int64 parent;
+    unsigned __int64 left;
+    unsigned __int64 right;
+    unsigned __int64 child;
+    unsigned __int64* slot;
+    LIST_ENTRY* head;
+    LIST_ENTRY* cursor;
+    ULONG offset = 0;
+    ULONG count = 0;
+    ULONG i;
+    ULONG j;
+
+    if (!ldrRaw || !entry)
+        return FALSE;
+
+    if (!KmFindLdrNodeOffset(entry, base, &offset))
+        return FALSE;
+
+    node = (unsigned __int64*)((PUCHAR)entry + offset);
+
+    /* PEB_LDR_DATA.InMemoryOrderModuleList sits at 0x20. The walk only collects
+     * the live node addresses, so the key can be recovered from a pair. */
+    head = (LIST_ENTRY*)((PUCHAR)ldrRaw + 0x20);
+
+    for (cursor = head->Flink; cursor != head && count < KM_RB_NODES; cursor = cursor->Flink)
+    {
+        KM_LDR_ENTRY* other = CONTAINING_RECORD(cursor, KM_LDR_ENTRY, InMemoryOrderLinks);
+        nodes[count++] = (unsigned __int64)((PUCHAR)other + offset);
+    }
+
+    /* Recover the key from any parent/child pair. */
+    for (i = 0; i < count && !key; ++i)
+    {
+        unsigned __int64* candidate = (unsigned __int64*)nodes[i];
+
+        if (!candidate[KM_RB_PARENT / 8])
+            continue;
+
+        for (j = 0; j < count; ++j)
+        {
+            unsigned __int64* maybe = (unsigned __int64*)nodes[j];
+
+            if (maybe[KM_RB_LEFT / 8] == (unsigned __int64)candidate ||
+                maybe[KM_RB_RIGHT / 8] == (unsigned __int64)candidate)
+            {
+                key = (candidate[KM_RB_PARENT / 8] & ~KM_RB_MASK) ^ nodes[j];
+                break;
+            }
+        }
+    }
+
+    if (!key)
+        return FALSE;
+
+    parentValue = node[KM_RB_PARENT / 8];
+    parent = (parentValue & ~KM_RB_MASK) ^ key;
+    left = node[KM_RB_LEFT / 8];
+    right = node[KM_RB_RIGHT / 8];
+
+    /* The parent has to point back at this node, or the layout is not what we
+     * think it is and nothing gets written. */
+    if (!parent || !KmUserPointer(parent))
+        return FALSE;
+
+    if (((unsigned __int64*)parent)[KM_RB_LEFT / 8] == (unsigned __int64)node)
+        slot = (unsigned __int64*)parent + (KM_RB_LEFT / 8);
+    else if (((unsigned __int64*)parent)[KM_RB_RIGHT / 8] == (unsigned __int64)node)
+        slot = (unsigned __int64*)parent + (KM_RB_RIGHT / 8);
+    else
+        return FALSE;
+
+    if (left && !KmUserPointer(left))
+        return FALSE;
+    if (right && !KmUserPointer(right))
+        return FALSE;
+
+    if (left && right)
+    {
+        /* Two children: splice in the in-order successor, which has no left child
+         * by construction, and give it this node's place and colour. */
+        unsigned __int64* successor = (unsigned __int64*)right;
+        unsigned __int64* successorParent = node;
+        ULONG depth = 0;
+
+        while (successor[KM_RB_LEFT / 8] && depth++ < 64)
+        {
+            successorParent = successor;
+            successor = (unsigned __int64*)successor[KM_RB_LEFT / 8];
+        }
+
+        if (successorParent == node)
+        {
+            successor[KM_RB_PARENT / 8] = parentValue;
+            successor[KM_RB_LEFT / 8] = left;
+        }
+        else
+        {
+            successorParent[KM_RB_LEFT / 8] = successor[KM_RB_RIGHT / 8];
+
+            if (successor[KM_RB_RIGHT / 8])
+                ((unsigned __int64*)successor[KM_RB_RIGHT / 8])[KM_RB_PARENT / 8] =
+                    ((unsigned __int64)successorParent ^ key) |
+                    (((unsigned __int64*)successor[KM_RB_RIGHT / 8])[KM_RB_PARENT / 8] & KM_RB_MASK);
+
+            successor[KM_RB_PARENT / 8] = parentValue;
+            successor[KM_RB_LEFT / 8] = left;
+            successor[KM_RB_RIGHT / 8] = right;
+
+            ((unsigned __int64*)right)[KM_RB_PARENT / 8] =
+                ((unsigned __int64)successor ^ key) |
+                (((unsigned __int64*)right)[KM_RB_PARENT / 8] & KM_RB_MASK);
+        }
+
+        ((unsigned __int64*)left)[KM_RB_PARENT / 8] =
+            ((unsigned __int64)successor ^ key) |
+            (((unsigned __int64*)left)[KM_RB_PARENT / 8] & KM_RB_MASK);
+
+        child = (unsigned __int64)successor;
+    }
+    else
+    {
+        /* At most one child: it inherits this node's position and colour. */
+        child = left ? left : right;
+
+        if (child)
+            ((unsigned __int64*)child)[KM_RB_PARENT / 8] = parentValue;
+    }
+
+    *slot = child;
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
 /* LDR unlinking (hide an injected module from Vanguard's scan)        */
 /* ------------------------------------------------------------------ */
 
-static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide)
+static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide)
 {
     PEPROCESS proc = NULL;
     KAPC_STATE apc;
     NTSTATUS status = STATUS_NOT_FOUND;
-    VGB_PEB* peb;
+    KM_PEB* peb;
     LIST_ENTRY* head;
     LIST_ENTRY* cursor;
+    LIST_ENTRY* bucket = NULL;
 
     if (!base)
         return STATUS_INVALID_PARAMETER;
@@ -512,10 +797,12 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
         BOOLEAN known = FALSE;
 
         KeAcquireSpinLock(&g_HiddenLock, &irql);
-        for (i = 0; i < VGB_MAX_HIDDEN; ++i)
+        for (i = 0; i < KM_MAX_HIDDEN; ++i)
         {
             if (g_Hidden[i].Entry && g_Hidden[i].DllBase == (void*)base && g_Hidden[i].Pid == pid)
             {
+                /* Remembered bucket, so unhide can put the hash link back. */
+                bucket = (LIST_ENTRY*)g_Hidden[i].HashBucket;
                 known = TRUE;
                 break;
             }
@@ -528,20 +815,20 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
             return STATUS_NOT_FOUND;
     }
 
-    proc = VgbReferenceProcess(pid);
+    proc = KmReferenceProcess(pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
     KeStackAttachProcess(proc, &apc);
     __try
     {
-        peb = (VGB_PEB*)PsGetProcessPeb(proc);
+        peb = (KM_PEB*)PsGetProcessPeb(proc);
         if (peb && peb->Ldr)
         {
             head = &peb->Ldr->InMemoryOrderModuleList;
             for (cursor = head->Flink; cursor != head; cursor = cursor->Flink)
             {
-                VGB_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, VGB_LDR_ENTRY, InMemoryOrderLinks);
+                KM_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, KM_LDR_ENTRY, InMemoryOrderLinks);
                 if ((unsigned __int64)entry->DllBase != base)
                     continue;
 
@@ -553,6 +840,28 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
                     InitializeListHead(&entry->InLoadOrderLinks);
                     InitializeListHead(&entry->InMemoryOrderLinks);
                     InitializeListHead(&entry->InInitializationOrderLinks);
+
+                    /*
+                     * The three lists are only what LdrEnumerateLoadedModules and
+                     * a PEB walk see. LdrpHashTable indexes the same entry by
+                     * name hash, and a scanner that resolves a module by name goes
+                     * through it, so the entry has to leave that bucket too.
+                     *
+                     * Only unlink when the link is actually live - a repeat hide
+                     * would otherwise run RemoveEntryList on a self-linked node and
+                     * corrupt the bucket. The next node doubles as the bucket head
+                     * on unhide; the list is circular, so it is valid either way.
+                     */
+                    if (entry->HashLinks.Flink && entry->HashLinks.Flink != &entry->HashLinks)
+                    {
+                        bucket = entry->HashLinks.Flink;
+                        RemoveEntryList(&entry->HashLinks);
+                        InitializeListHead(&entry->HashLinks);
+                    }
+
+                    /* And out of the by-name index tree, which is what a name
+                     * resolve walks. A failure leaves the entry in the index. */
+                    KmUnlinkModuleIndex(peb->Ldr, entry, base);
                 }
                 else
                 {
@@ -562,6 +871,11 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
                     InsertHeadList(&peb->Ldr->InLoadOrderModuleList, &entry->InLoadOrderLinks);
                     InsertHeadList(&peb->Ldr->InMemoryOrderModuleList, &entry->InMemoryOrderLinks);
                     InsertHeadList(&peb->Ldr->InInitializationOrderModuleList, &entry->InInitializationOrderLinks);
+
+                    /* Back into the bucket it came from, if one was recorded and
+                     * the link is not already live. */
+                    if (bucket && entry->HashLinks.Flink == &entry->HashLinks)
+                        InsertHeadList(bucket, &entry->HashLinks);
                 }
 
                 status = STATUS_SUCCESS;
@@ -584,25 +898,27 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
         KeAcquireSpinLock(&g_HiddenLock, &irql);
         if (hide)
         {
-            for (i = 0; i < VGB_MAX_HIDDEN; ++i)
+            for (i = 0; i < KM_MAX_HIDDEN; ++i)
             {
                 if (!g_Hidden[i].Entry)
                 {
                     g_Hidden[i].Pid = pid;
                     g_Hidden[i].DllBase = (void*)base;
                     g_Hidden[i].Entry = (void*)base;
+                    g_Hidden[i].HashBucket = (void*)bucket;
                     break;
                 }
             }
         }
         else
         {
-            for (i = 0; i < VGB_MAX_HIDDEN; ++i)
+            for (i = 0; i < KM_MAX_HIDDEN; ++i)
             {
                 if (g_Hidden[i].DllBase == (void*)base && g_Hidden[i].Pid == pid)
                 {
                     g_Hidden[i].Entry = NULL;
                     g_Hidden[i].DllBase = NULL;
+                    g_Hidden[i].HashBucket = NULL;
                     g_Hidden[i].Pid = 0;
                     break;
                 }
@@ -630,7 +946,7 @@ static NTSTATUS VgbSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hid
  * Screen the range ourselves first and refuse it while a status is still
  * possible.
  */
-static BOOLEAN VgbAddressCopyable(ULONG_PTR address, ULONG size)
+static BOOLEAN KmAddressCopyable(ULONG_PTR address, ULONG size)
 {
     ULONG_PTR last;
 
@@ -652,28 +968,28 @@ static BOOLEAN VgbAddressCopyable(ULONG_PTR address, ULONG size)
     return TRUE;
 }
 
-static NTSTATUS VgbHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PULONG_PTR written)
+static NTSTATUS KmHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PULONG_PTR written)
 {
-    VGB_MEM_REQ* req = (VGB_MEM_REQ*)in;
+    KM_MEM_REQ* req = (KM_MEM_REQ*)in;
     PEPROCESS proc;
     NTSTATUS status;
     ULONG size;
 
-    if (inLen < sizeof(VGB_MEM_REQ) || !outLen)
+    if (inLen < sizeof(KM_MEM_REQ) || !outLen)
         return STATUS_BUFFER_TOO_SMALL;
 
     size = req->Size;
-    if (size > VGB_MAX_XFER)
-        size = VGB_MAX_XFER;
+    if (size > KM_MAX_XFER)
+        size = KM_MAX_XFER;
     if (size > outLen)
         size = outLen;
     if (!size)
         return STATUS_INVALID_PARAMETER;
 
-    if (!VgbAddressCopyable((ULONG_PTR)req->Address, size))
+    if (!KmAddressCopyable((ULONG_PTR)req->Address, size))
         return STATUS_PARTIAL_COPY;
 
-    proc = VgbReferenceProcess(req->Pid);
+    proc = KmReferenceProcess(req->Pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
@@ -682,7 +998,7 @@ static NTSTATUS VgbHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PU
      * instead of a bugcheck the user has to reboot from. */
     __try
     {
-        status = VgbCopyFromProcess(proc, (void*)req->Address, out, size);
+        status = KmCopyFromProcess(proc, (void*)req->Address, out, size);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -695,35 +1011,108 @@ static NTSTATUS VgbHandleRead(PVOID in, ULONG inLen, PVOID out, ULONG outLen, PU
     return status;
 }
 
-static NTSTATUS VgbHandleWrite(PVOID in, ULONG inLen, PULONG_PTR written)
+/*
+ * One IOCTL, several reads. Each descriptor names an address, a size and the
+ * offset inside the output buffer it belongs at, so a whole per-frame scan costs
+ * a single round trip instead of one per field. A descriptor that fails leaves
+ * its slot untouched and the call still succeeds, which matches how the single
+ * read behaves from the caller's side: the caller checks the slot.
+ */
+static NTSTATUS KmHandleReadBatch(PVOID in, ULONG inLen, PVOID out, ULONG outLen,
+                                   PULONG_PTR written)
 {
-    VGB_MEM_REQ* req = (VGB_MEM_REQ*)in;
+    KM_BATCH_REQ* req = (KM_BATCH_REQ*)in;
     PEPROCESS proc;
-    NTSTATUS status;
-    ULONG size;
-    PVOID data;
+    ULONG count;
+    ULONG done = 0;
+    ULONG i;
 
-    if (inLen < sizeof(VGB_MEM_REQ))
+    if (inLen < (ULONG)FIELD_OFFSET(KM_BATCH_REQ, Entries) || !outLen)
         return STATUS_BUFFER_TOO_SMALL;
 
-    size = req->Size;
-    if (size > VGB_MAX_XFER)
-        size = VGB_MAX_XFER;
-    if (!size || inLen < sizeof(VGB_MEM_REQ) + size)
+    count = req->Count;
+    if (!count)
+        return STATUS_INVALID_PARAMETER;
+
+    if (count > KM_BATCH_MAX)
+        count = KM_BATCH_MAX;
+
+    /* Every descriptor has to actually be inside the input buffer. */
+    if (inLen < (ULONG)FIELD_OFFSET(KM_BATCH_REQ, Entries) + count * (ULONG)sizeof(KM_BATCH_DESC))
         return STATUS_BUFFER_TOO_SMALL;
 
-    data = (PVOID)((PUCHAR)in + sizeof(VGB_MEM_REQ));
-
-    if (!VgbAddressCopyable((ULONG_PTR)req->Address, size))
-        return STATUS_PARTIAL_COPY;
-
-    proc = VgbReferenceProcess(req->Pid);
+    proc = KmReferenceProcess(req->Pid);
     if (!proc)
         return STATUS_INVALID_PARAMETER;
 
     __try
     {
-        status = VgbCopyToProcess(proc, (void*)req->Address, data, size);
+        for (i = 0; i < count; ++i)
+        {
+            KM_BATCH_DESC* desc = &req->Entries[i];
+            NTSTATUS status;
+            ULONG size = desc->Size;
+
+            if (!size)
+                continue;
+
+            if (size > KM_MAX_XFER)
+                size = KM_MAX_XFER;
+
+            /* Keep the write inside the caller's output buffer. */
+            if (desc->Offset >= outLen || size > outLen - desc->Offset)
+                continue;
+
+            if (!KmAddressCopyable((ULONG_PTR)desc->Address, size))
+                continue;
+
+            status = KmCopyFromProcess(proc, (void*)desc->Address,
+                                        (PUCHAR)out + desc->Offset, size);
+
+            if (NT_SUCCESS(status))
+                done++;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        /* Whatever was copied before the fault stays valid; report the count. */
+    }
+
+    ObDereferenceObject(proc);
+
+    *written = outLen;
+    return done ? STATUS_SUCCESS : STATUS_PARTIAL_COPY;
+}
+
+static NTSTATUS KmHandleWrite(PVOID in, ULONG inLen, PULONG_PTR written)
+{
+    KM_MEM_REQ* req = (KM_MEM_REQ*)in;
+    PEPROCESS proc;
+    NTSTATUS status;
+    ULONG size;
+    PVOID data;
+
+    if (inLen < sizeof(KM_MEM_REQ))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    size = req->Size;
+    if (size > KM_MAX_XFER)
+        size = KM_MAX_XFER;
+    if (!size || inLen < sizeof(KM_MEM_REQ) + size)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    data = (PVOID)((PUCHAR)in + sizeof(KM_MEM_REQ));
+
+    if (!KmAddressCopyable((ULONG_PTR)req->Address, size))
+        return STATUS_PARTIAL_COPY;
+
+    proc = KmReferenceProcess(req->Pid);
+    if (!proc)
+        return STATUS_INVALID_PARAMETER;
+
+    __try
+    {
+        status = KmCopyToProcess(proc, (void*)req->Address, data, size);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -736,7 +1125,7 @@ static NTSTATUS VgbHandleWrite(PVOID in, ULONG inLen, PULONG_PTR written)
     return status;
 }
 
-static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
+static NTSTATUS KmDispatch(PDEVICE_OBJECT device, PIRP irp)
 {
     PIO_STACK_LOCATION stack;
     PVOID in;
@@ -760,17 +1149,22 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
     }
 
     stack = IoGetCurrentIrpStackLocation(irp);
-    code = stack->Parameters.DeviceIoControl.IoControlCode;
+
+    /* The device type is derived from the per-install name, so the code that
+     * arrives carries a type this build never compiled in. Fold it back to the
+     * historical constant so every comparison below stays a plain equality, and
+     * a client that still sends the old constant keeps working. */
+    code = KmRecodeIoctl(stack->Parameters.DeviceIoControl.IoControlCode, KM_DEVICE_TYPE);
     inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
     outLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
     in = irp->AssociatedIrp.SystemBuffer;
     out = irp->AssociatedIrp.SystemBuffer;
 
-    if (code == IOCTL_VGB_GET_VERSION)
+    if (code == IOCTL_KM_GET_VERSION)
     {
         if (outLen >= sizeof(ULONG))
         {
-            *(ULONG*)out = VGB_PROTOCOL_VERSION;
+            *(ULONG*)out = KM_PROTOCOL_VERSION;
             written = sizeof(ULONG);
             status = STATUS_SUCCESS;
         }
@@ -779,18 +1173,18 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_GET_INFO)
+    else if (code == IOCTL_KM_GET_INFO)
     {
         /* Teardown reads this: the loader may have lost its state file, and the
          * only reliable record of the mapping lives here. */
-        if (outLen >= sizeof(VGB_INFO))
+        if (outLen >= sizeof(KM_INFO))
         {
-            VGB_INFO* info = (VGB_INFO*)out;
+            KM_INFO* info = (KM_INFO*)out;
 
             info->ImageBase = g_ImageBase;
             info->ImageSize = g_ImageSize;
             info->DriverObject = (unsigned __int64)g_DriverObject;
-            written = sizeof(VGB_INFO);
+            written = sizeof(KM_INFO);
             status = STATUS_SUCCESS;
         }
         else
@@ -798,11 +1192,11 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_SET_CLIENT_PID)
+    else if (code == IOCTL_KM_SET_CLIENT_PID)
     {
-        if (inLen >= sizeof(VGB_PID_REQ))
+        if (inLen >= sizeof(KM_PID_REQ))
         {
-            g_ClientPid = ((VGB_PID_REQ*)in)->Pid;
+            g_ClientPid = ((KM_PID_REQ*)in)->Pid;
             status = STATUS_SUCCESS;
         }
         else
@@ -810,14 +1204,14 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_GET_PID_BY_NAME)
+    else if (code == IOCTL_KM_GET_PID_BY_NAME)
     {
-        if (inLen >= sizeof(VGB_NAME_REQ) && outLen >= sizeof(VGB_PID_REQ))
+        if (inLen >= sizeof(KM_NAME_REQ) && outLen >= sizeof(KM_PID_REQ))
         {
-            ((VGB_NAME_REQ*)in)->Name[VGB_MAX_NAME_CHARS - 1] = 0;
-            ((VGB_PID_REQ*)out)->Pid = VgbFindPidByName(((VGB_NAME_REQ*)in)->Name);
-            ((VGB_PID_REQ*)out)->Pad = 0;
-            written = sizeof(VGB_PID_REQ);
+            ((KM_NAME_REQ*)in)->Name[KM_MAX_NAME_CHARS - 1] = 0;
+            ((KM_PID_REQ*)out)->Pid = KmFindPidByName(((KM_NAME_REQ*)in)->Name);
+            ((KM_PID_REQ*)out)->Pad = 0;
+            written = sizeof(KM_PID_REQ);
             status = STATUS_SUCCESS;
         }
         else
@@ -825,13 +1219,13 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_GET_MODULE_BASE)
+    else if (code == IOCTL_KM_GET_MODULE_BASE)
     {
-        if (inLen >= sizeof(VGB_NAME_REQ) && outLen >= sizeof(unsigned __int64))
+        if (inLen >= sizeof(KM_NAME_REQ) && outLen >= sizeof(unsigned __int64))
         {
-            ((VGB_NAME_REQ*)in)->Name[VGB_MAX_NAME_CHARS - 1] = 0;
-            status = VgbGetModuleBase(((VGB_NAME_REQ*)in)->Pid,
-                                      ((VGB_NAME_REQ*)in)->Name,
+            ((KM_NAME_REQ*)in)->Name[KM_MAX_NAME_CHARS - 1] = 0;
+            status = KmGetModuleBase(((KM_NAME_REQ*)in)->Pid,
+                                      ((KM_NAME_REQ*)in)->Name,
                                       (unsigned __int64*)out);
             written = NT_SUCCESS(status) ? sizeof(unsigned __int64) : 0;
         }
@@ -840,11 +1234,11 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_GET_MAIN_BASE)
+    else if (code == IOCTL_KM_GET_MAIN_BASE)
     {
-        if (inLen >= sizeof(VGB_PID_REQ) && outLen >= sizeof(unsigned __int64))
+        if (inLen >= sizeof(KM_PID_REQ) && outLen >= sizeof(unsigned __int64))
         {
-            status = VgbGetMainBase(((VGB_PID_REQ*)in)->Pid, (unsigned __int64*)out);
+            status = KmGetMainBase(((KM_PID_REQ*)in)->Pid, (unsigned __int64*)out);
             written = NT_SUCCESS(status) ? sizeof(unsigned __int64) : 0;
         }
         else
@@ -852,47 +1246,51 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_READ)
+    else if (code == IOCTL_KM_READ)
     {
-        status = VgbHandleRead(in, inLen, out, outLen, &written);
+        status = KmHandleRead(in, inLen, out, outLen, &written);
     }
-    else if (code == IOCTL_VGB_WRITE)
+    else if (code == IOCTL_KM_WRITE)
     {
-        status = VgbHandleWrite(in, inLen, &written);
+        status = KmHandleWrite(in, inLen, &written);
     }
-    else if (code == IOCTL_VGB_ENUM_MODULES)
+    else if (code == IOCTL_KM_READ_BATCH)
     {
-        if (inLen >= sizeof(VGB_PID_REQ) &&
-            outLen >= FIELD_OFFSET(VGB_MODULE_LIST, Entries) + sizeof(VGB_MODULE_INFO))
+        status = KmHandleReadBatch(in, inLen, out, outLen, &written);
+    }
+    else if (code == IOCTL_KM_ENUM_MODULES)
+    {
+        if (inLen >= sizeof(KM_PID_REQ) &&
+            outLen >= FIELD_OFFSET(KM_MODULE_LIST, Entries) + sizeof(KM_MODULE_INFO))
         {
-            ULONG capacity = (outLen - FIELD_OFFSET(VGB_MODULE_LIST, Entries)) / sizeof(VGB_MODULE_INFO);
+            ULONG capacity = (outLen - FIELD_OFFSET(KM_MODULE_LIST, Entries)) / sizeof(KM_MODULE_INFO);
 
-            if (capacity > VGB_MAX_MODULES)
-                capacity = VGB_MAX_MODULES;
-            status = VgbWalkModules(((VGB_PID_REQ*)in)->Pid, (VGB_MODULE_LIST*)out, capacity);
+            if (capacity > KM_MAX_MODULES)
+                capacity = KM_MAX_MODULES;
+            status = KmWalkModules(((KM_PID_REQ*)in)->Pid, (KM_MODULE_LIST*)out, capacity);
             if (NT_SUCCESS(status))
-                written = FIELD_OFFSET(VGB_MODULE_LIST, Entries) +
-                          ((VGB_MODULE_LIST*)out)->Count * sizeof(VGB_MODULE_INFO);
+                written = FIELD_OFFSET(KM_MODULE_LIST, Entries) +
+                          ((KM_MODULE_LIST*)out)->Count * sizeof(KM_MODULE_INFO);
         }
         else
         {
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
-    else if (code == IOCTL_VGB_HIDE_MODULE || code == IOCTL_VGB_UNHIDE_MODULE)
+    else if (code == IOCTL_KM_HIDE_MODULE || code == IOCTL_KM_UNHIDE_MODULE)
     {
-        typedef struct _VGB_BASE_REQ
+        typedef struct _KM_BASE_REQ
         {
             ULONG Pid;
             ULONG Pad;
             unsigned __int64 Base;
-        } VGB_BASE_REQ;
+        } KM_BASE_REQ;
 
-        if (inLen >= sizeof(VGB_BASE_REQ))
+        if (inLen >= sizeof(KM_BASE_REQ))
         {
-            status = VgbSetModuleHidden(((VGB_BASE_REQ*)in)->Pid,
-                                        ((VGB_BASE_REQ*)in)->Base,
-                                        (BOOLEAN)(code == IOCTL_VGB_HIDE_MODULE));
+            status = KmSetModuleHidden(((KM_BASE_REQ*)in)->Pid,
+                                        ((KM_BASE_REQ*)in)->Base,
+                                        (BOOLEAN)(code == IOCTL_KM_HIDE_MODULE));
         }
         else
         {
@@ -906,7 +1304,7 @@ static NTSTATUS VgbDispatch(PDEVICE_OBJECT device, PIRP irp)
     return status;
 }
 
-static NTSTATUS VgbCreateClose(PDEVICE_OBJECT device, PIRP irp)
+static NTSTATUS KmCreateClose(PDEVICE_OBJECT device, PIRP irp)
 {
     UNREFERENCED_PARAMETER(device);
     irp->IoStatus.Status = STATUS_SUCCESS;
@@ -925,7 +1323,7 @@ static NTSTATUS VgbCreateClose(PDEVICE_OBJECT device, PIRP irp)
  * events and IRP_MJ_SYSTEM_CONTROL for WMI - each of which would dispatch to
  * address 0 and bugcheck with 0x8E/0x7E.
  */
-static NTSTATUS VgbDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
+static NTSTATUS KmDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
 {
     UNREFERENCED_PARAMETER(device);
     irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -934,10 +1332,8 @@ static NTSTATUS VgbDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
     return STATUS_INVALID_DEVICE_REQUEST;
 }
 
-static VOID VgbUnload(PDRIVER_OBJECT driver)
+static VOID KmUnload(PDRIVER_OBJECT driver)
 {
-    UNICODE_STRING symlink;
-
     InterlockedExchange(&g_Unloading, 1);
 
     if (g_ObRegistered && g_ObRegistration)
@@ -947,8 +1343,8 @@ static VOID VgbUnload(PDRIVER_OBJECT driver)
         g_ObRegistered = FALSE;
     }
 
-    RtlInitUnicodeString(&symlink, VGB_SYMLINK_NAME);
-    IoDeleteSymbolicLink(&symlink);
+    if (g_Symlink.Buffer)
+        IoDeleteSymbolicLink(&g_Symlink);
 
     if (g_DeviceObject)
     {
@@ -966,24 +1362,23 @@ static VOID VgbUnload(PDRIVER_OBJECT driver)
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPath)
 {
     UNICODE_STRING deviceName;
-    UNICODE_STRING symlink;
     NTSTATUS status;
     ULONG i;
 
-    for (i = 0; i < VGB_MAX_HIDDEN; ++i)
+    for (i = 0; i < KM_MAX_HIDDEN; ++i)
         RtlZeroMemory(&g_Hidden[i], sizeof(g_Hidden[i]));
     KeInitializeSpinLock(&g_HiddenLock);
 
-    driver->DriverUnload = VgbUnload;
+    driver->DriverUnload = KmUnload;
 
-    /* Every slot gets a real handler first; see VgbDefaultDispatch. */
+    /* Every slot gets a real handler first; see KmDefaultDispatch. */
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; ++i)
-        driver->MajorFunction[i] = VgbDefaultDispatch;
+        driver->MajorFunction[i] = KmDefaultDispatch;
 
-    driver->MajorFunction[IRP_MJ_CREATE] = VgbCreateClose;
-    driver->MajorFunction[IRP_MJ_CLEANUP] = VgbCreateClose;
-    driver->MajorFunction[IRP_MJ_CLOSE] = VgbCreateClose;
-    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = VgbDispatch;
+    driver->MajorFunction[IRP_MJ_CREATE] = KmCreateClose;
+    driver->MajorFunction[IRP_MJ_CLEANUP] = KmCreateClose;
+    driver->MajorFunction[IRP_MJ_CLOSE] = KmCreateClose;
+    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = KmDispatch;
 
     /*
      * The loader hands us a zeroed DRIVER_OBJECT. IoCreateDevice walks
@@ -1007,15 +1402,25 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     InitializeListHead((PLIST_ENTRY)&driver->DeviceObject);
 
     /* Manual mapping hands us the loader's init block in the 2nd argument. */
-    if (VgbLooksLikePointer(registryPath))
+    if (KmLooksLikePointer(registryPath))
     {
         __try
         {
-            VGB_INIT_PARAMS* params = (VGB_INIT_PARAMS*)registryPath;
-            if (params->Magic == VGB_INIT_MAGIC)
+            KM_INIT_PARAMS* params = (KM_INIT_PARAMS*)registryPath;
+            if (params->Magic == KM_INIT_MAGIC)
             {
                 if (params->ClientPid)
                     g_ClientPid = params->ClientPid;
+
+                /* Per-install device name, chosen by the loader. */
+                if (params->DeviceName[0])
+                    RtlStringCchCopyNW(g_DeviceName, RTL_NUMBER_OF(g_DeviceName),
+                                       params->DeviceName, KM_MAX_DEVICE_CHARS - 1);
+
+                g_AltitudeSeed = params->AltitudeSeed;
+
+                if (params->PoolTag)
+                    g_PoolTag = params->PoolTag;
 
                 driver->DriverStart = (void*)params->ImageBase;
                 driver->DriverSize = (ULONG)params->ImageSize;
@@ -1031,8 +1436,35 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         }
     }
 
-    RtlInitUnicodeString(&deviceName, VGB_DEVICE_NAME);
-    status = IoCreateDevice(driver, 0, &deviceName, VGB_DEVICE_TYPE, FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
+    /*
+     * Resolve the identity. An empty name means a service load or an old loader,
+     * so the historical static namespace stays as the fallback.
+     */
+    if (!g_DeviceName[0])
+        RtlStringCchCopyNW(g_DeviceName, RTL_NUMBER_OF(g_DeviceName),
+                           L"Kernmem", KM_MAX_DEVICE_CHARS - 1);
+
+    /* Derive the device type from the name: one less constant to signature on. */
+    g_DeviceType = KmDeviceTypeFor(g_DeviceName);
+
+    /* A real driver always carries a DriverName. An unnamed driver object that
+     * owns a named device is one of the cheapest mismatches to spot. */
+    /* Copy + cat rather than RtlStringCchPrintfW: the printf family pulls in
+     * __stdio_common_vswprintf from the UCRT, and this image links only
+     * ntoskrnl/BufferOverflowK/wdm. */
+    RtlStringCchCopyW(g_DriverName, RTL_NUMBER_OF(g_DriverName), L"\\Driver\\");
+    RtlStringCchCatW(g_DriverName, RTL_NUMBER_OF(g_DriverName), g_DeviceName);
+    RtlInitUnicodeString(&driver->DriverName, g_DriverName);
+
+    RtlStringCchCopyW(g_DevicePath, RTL_NUMBER_OF(g_DevicePath), L"\\Device\\");
+    RtlStringCchCatW(g_DevicePath, RTL_NUMBER_OF(g_DevicePath), g_DeviceName);
+    RtlInitUnicodeString(&deviceName, g_DevicePath);
+
+    RtlStringCchCopyW(g_SymlinkName, RTL_NUMBER_OF(g_SymlinkName), L"\\DosDevices\\");
+    RtlStringCchCatW(g_SymlinkName, RTL_NUMBER_OF(g_SymlinkName), g_DeviceName);
+    RtlInitUnicodeString(&g_Symlink, g_SymlinkName);
+
+    status = IoCreateDevice(driver, 0, &deviceName, g_DeviceType, FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -1042,8 +1474,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
      * opened. */
     g_DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    RtlInitUnicodeString(&symlink, VGB_SYMLINK_NAME);
-    status = IoCreateSymbolicLink(&symlink, &deviceName);
+    status = IoCreateSymbolicLink(&g_Symlink, &deviceName);
     if (!NT_SUCCESS(status))
     {
         IoDeleteDevice(g_DeviceObject);
@@ -1052,7 +1483,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     }
 
     /* A failing object callback is not fatal: attach-based R/W still works. */
-    VgbRegisterObjectCallback();
+    KmRegisterObjectCallback();
 
     return STATUS_SUCCESS;
 }

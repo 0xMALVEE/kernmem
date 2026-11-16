@@ -6,8 +6,8 @@ Demo CLI for the game reader.
     python demo.py heroes           list live heroes
     python demo.py heroes --watch   refresh every second
 
-The driver must be loaded first (vgb-loader.exe, elevated). Nothing here needs
-elevation and nothing here calls ReadProcessMemory — every read goes through the
+The driver must be loaded first (kernmem-loader.exe, elevated). Nothing here needs
+elevation and nothing here calls ReadProcessMemory â€” every read goes through the
 driver.
 """
 
@@ -19,7 +19,7 @@ import time
 
 import offsets
 import reader
-import vgb
+import km
 
 
 def cmd_offsets(_args) -> int:
@@ -41,7 +41,7 @@ def cmd_info(_args) -> int:
 
         try:
             header = game.read(game.base, 2)
-        except vgb.VgbError as error:
+        except km.KmError as error:
             print(f"header read failed: {error}")
             return 1
 
@@ -79,7 +79,7 @@ def show_heroes(game: reader.Game) -> None:
         shown += 1
 
     if not shown:
-        print("  no heroes resolved — the offset table is probably unverified")
+        print("  no heroes resolved â€” the offset table is probably unverified")
 
 
 def cmd_heroes(args) -> int:
@@ -127,9 +127,9 @@ def main(argv: list[str]) -> int:
     except offsets.OffsetsError as error:
         print(f"error: {error}")
         return 3
-    except vgb.VgbError as error:
+    except km.KmError as error:
         print(f"driver error: {error}")
-        print("is the driver loaded? run vgb-loader.exe (elevated)")
+        print("is the driver loaded? run kernmem-loader.exe (elevated)")
         return 4
 
 
