@@ -489,7 +489,7 @@ namespace nal
         return true;
     }
 
-    bool Unload()
+    bool Unload(bool release)
     {
         LoadState();
 
@@ -500,13 +500,40 @@ namespace nal
         }
 
         /*
+         * Default is detach and leave resident.
+         *
+         * Stopping the service makes ntoskrnl write an MmUnloadedDrivers record and
+         * a PiDDBCache entry for iqvw64e, and both are written BY the unload - so no
+         * scrub in the same session can clear them. Leaving the host up means the
+         * record is never written at all. The cost is the service key and the dropped
+         * image on disk, which is the quieter trade: a file is not a kernel record.
+         *
+         * release == true does the full teardown, for when the disk trail matters
+         * more than the kernel one.
+         */
+        if (!release)
+        {
+            if (g_ownedService || !g_serviceName.empty())
+                km_log::Info("mapping host left resident - no unload record written");
+
+            ntoskrnlBase = 0;
+            return true;
+        }
+
+        /*
          * Only release a host this session started. When \Device\Nal was already
          * resident we attached to a service somebody else registered - ours from
          * an earlier run, or another tool's - and stopping it would pull the
          * device out from under whatever still holds it. The dropped image is
          * kept too, because the registry ImagePath still points at it.
          */
-        if (!g_ownedService)
+        /*
+         * An adopted host is normally left running. On an explicit release it is
+         * torn down anyway - after a default unload the host is always resident, so
+         * the next session adopts it, and without this the guard would bail on every
+         * release and nothing would ever be cleaned up.
+         */
+        if (!g_ownedService && !release)
         {
             if (!g_serviceName.empty())
                 km_log::Info("mapping host left running - not started by this session");
@@ -535,6 +562,16 @@ namespace nal
         {
             _wremove(g_driverPath.c_str());
             g_driverPath.clear();
+        }
+
+        /*
+         * The state file names the service, the dropped path and the device name
+         * together, which is a far stronger clue than any one of them alone.
+         */
+        if (!g_statePath.empty())
+        {
+            _wremove(g_statePath.c_str());
+            g_statePath.clear();
         }
 
         ntoskrnlBase = 0;

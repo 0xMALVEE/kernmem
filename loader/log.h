@@ -17,6 +17,10 @@ namespace km_log
      * last line written names the step that killed the machine. */
     std::wstring OpenCrashLog();
 
+    /* Deletes the crash logs and the directory when it ends up empty. The log
+     * still open in this process is kept. */
+    void ClearLogs();
+
     /* Installs a filter that logs unhandled user-mode exceptions. */
     void InstallExceptionFilter();
 

@@ -53,8 +53,10 @@ namespace nal
      * every kernel read in the unmap path would fail. */
     bool Attach();
 
-    /* Stops the service, deletes the service key and the dropped driver file. */
-    bool Unload();
+    /* Detaches. With release == false the host is left resident, so ntoskrnl never
+     * writes an MmUnloadedDrivers record for it. With release == true the service
+     * is stopped, the key and the dropped image deleted and the state file removed. */
+    bool Unload(bool release);
 
     bool MemCopy(uint64_t destination, uint64_t source, uint64_t size);
     bool SetMemory(uint64_t address, uint32_t value, uint64_t size);

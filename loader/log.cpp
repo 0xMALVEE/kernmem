@@ -5,10 +5,12 @@
 #include <cstdarg>
 #include <fcntl.h>
 #include <io.h>
+#include <string>
 
 namespace
 {
     FILE* g_file = nullptr;
+    std::wstring g_filePath;
     CRITICAL_SECTION g_lock;
     bool g_lockReady = false;
 
@@ -121,9 +123,52 @@ namespace km_log
                    now.wHour, now.wMinute, now.wSecond);
 
         const std::wstring path = directory + name;
+        g_filePath = path;
         OpenFile(path);
 
         return g_file ? path : L"";
+    }
+
+    /*
+     * Deletes the crash logs, then the directory if it is empty. The log this
+     * process still holds open cannot be deleted, so it is skipped by name.
+     */
+    void ClearLogs()
+    {
+        wchar_t temp[MAX_PATH + 1] = { 0 };
+
+        if (!GetTempPathW(MAX_PATH + 1, temp))
+            return;
+
+        std::wstring directory = temp;
+
+        if (!directory.empty() && directory.back() == L'\\')
+            directory.pop_back();
+
+        directory += L"\\km-logs";
+
+        WIN32_FIND_DATAW found = { 0 };
+        const std::wstring pattern = directory + L"\\*.log";
+        HANDLE search = FindFirstFileW(pattern.c_str(), &found);
+
+        if (search != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                const std::wstring path = directory + L"\\" + found.cFileName;
+
+                if (!g_filePath.empty() && path == g_filePath)
+                    continue;
+
+                DeleteFileW(path.c_str());
+            }
+            while (FindNextFileW(search, &found));
+
+            FindClose(search);
+        }
+
+        /* Only succeeds when nothing is left inside, which is the point. */
+        RemoveDirectoryW(directory.c_str());
     }
 
     namespace

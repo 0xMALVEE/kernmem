@@ -5,7 +5,8 @@
  *   status                    device and version probe
  *   kbase                     resolve the kernel base without loading
  *   load [--client <pid>]     map km.sys through the NAL driver
- *   unload                    unmap the driver and release NAL
+ *   unload                    unmap the driver, leave NAL resident (no unload record)
+ *   release                   unmap the driver and fully release NAL, state and logs
  *   pid <image name>          resolve a pid by image name
  *   mainbase <pid>            image base shortcut
  *   base <pid> <module>       module base by name
@@ -287,8 +288,8 @@ namespace
 
         if (!alreadyUp)
         {
-            nal::Unload();
-            km_log::Line("*", "mapping host released");
+            nal::Unload(false);
+            km_log::Line("*", "mapping host detached (still resident)");
         }
 
         if (!base)
@@ -400,7 +401,7 @@ namespace
                                           km_sys_size))
             {
                 km_log::Error("could not stage the driver image");
-                nal::Unload();
+                nal::Unload(true);
                 return 1;
             }
         }
@@ -410,7 +411,7 @@ namespace
         {
             km_log::Error("mapping failed");
             _wremove(imagePath.c_str());
-            nal::Unload();
+            nal::Unload(true);
             return 1;
         }
 
@@ -441,7 +442,12 @@ namespace
         return 0;
     }
 
-    int CmdUnload()
+    /*
+     * release == false detaches and leaves the host resident, so ntoskrnl never
+     * writes an MmUnloadedDrivers record for it. release == true does the full
+     * teardown - service, key, dropped image, state file - and clears the logs.
+     */
+    int CmdUnload(bool release)
     {
         if (!Elevated())
         {
@@ -505,8 +511,17 @@ namespace
         if (!nal::DriverPath().empty())
             trace::Scrub(nal::DriverPath());
 
-        nal::Unload();
-        km_log::Good("mapping host released");
+        nal::Unload(release);
+
+        if (release)
+        {
+            km_log::ClearLogs();
+            km_log::Good("mapping host released and trace cleared");
+        }
+        else
+        {
+            km_log::Good("mapping host left resident - no unload record");
+        }
 
         return 0;
     }
@@ -1127,7 +1142,7 @@ namespace
             case L'8': CmdStatus(); break;
             case L'9':
                 game::Stop();
-                CmdUnload();
+                CmdUnload(false);
                 g_sessionPid = 0;
                 break;
             case L'o':
@@ -1257,7 +1272,11 @@ int wmain(int argc, wchar_t** argv)
     }
     else if (verb == L"unload")
     {
-        result = CmdUnload();
+        result = CmdUnload(false);
+    }
+    else if (verb == L"release")
+    {
+        result = CmdUnload(true);
     }
     else if (verb == L"pid" && argc >= 3)
     {

@@ -36,9 +36,10 @@ namespace cs2
         char text[128];
 
         _snprintf_s(text, sizeof(text), _TRUNCATE,
-                    "c%u p%u dorm%u dead%u node%u org%u pos %.0f,%.0f,%.0f",
+                    "c%u p%u dorm%u dead%u node%u org%u lf%u flag%u ctrl%X pawn%X pos %.0f,%.0f,%.0f",
                     seenControllers_, seenPawns_, seenDormant_, seenDead_, seenNoNode_,
-                    seenNoOrigin_, statusX_, statusY_, statusZ_);
+                    seenNoOrigin_, seenLocalFallback_, seenLocalFlag_, statusCtrlRaw_,
+                    statusLocalRaw_, statusX_, statusY_, statusZ_);
 
         return std::string(text);
     }
@@ -173,6 +174,51 @@ namespace cs2
         return false;
     }
 
+    /*
+     * Walks the controllers for the one flagged local and returns its pawn. Costs a
+     * controller walk, so it is only used when the global fails.
+     */
+    uint64_t Provider::LocalPawnFromControllers(km::Client& client)
+    {
+        seenControllers_ = 0;
+        seenLocalFlag_ = 0;
+
+        for (uint32_t index = 0; index < off::MaxControllers; ++index)
+        {
+            const uint64_t controller = ListEntry(client, index);
+
+            if (!controller)
+                continue;
+
+            ++seenControllers_;
+
+            uint8_t isLocal = 0;
+
+            if (!client.ReadValue(pid_, controller + off::IsLocalController, &isLocal))
+                continue;
+
+            if (!isLocal)
+                continue;
+
+            ++seenLocalFlag_;
+
+            uint32_t handle = 0;
+
+            if (!client.ReadValue(pid_, controller + off::ControllerPawn, &handle) || !handle)
+            {
+                if (!client.ReadValue(pid_, controller + off::PlayerPawn, &handle) || !handle)
+                    continue;
+            }
+
+            const uint64_t pawn = EntityAt(client, handle);
+
+            if (pawn)
+                return pawn;
+        }
+
+        return 0;
+    }
+
     bool Provider::ReadLocal(km::Client& client, esp::Local* out)
     {
         out->valid = false;
@@ -180,12 +226,48 @@ namespace cs2
         if (!base_ || !list_)
             return false;
 
-        /* dwLocalPlayerPawn is the pawn pointer itself - no entity-list hop and
-         * no handle masking. */
+        /*
+         * dwLocalPlayerPawn is the pawn pointer itself - no entity-list hop and no
+         * handle masking. When that global is stale the controllers are scanned for
+         * the local flag instead, which is how the reference resolves it.
+         */
         uint64_t pawn = 0;
 
+        /* Route 1: the pawn pointer global. */
         if (!client.ReadValue(pid_, base_ + off::LocalPlayerPawn, &pawn) || !Plausible(pawn))
-            return false;
+        {
+            pawn = 0;
+
+            /* Route 2: the controller HANDLE global, through the chunk table. */
+            uint32_t controllerHandle = 0;
+
+            if (client.ReadValue(pid_, base_ + off::LocalPlayerController, &controllerHandle) &&
+                controllerHandle)
+            {
+                statusCtrlRaw_ = controllerHandle;
+
+                const uint64_t controller = EntityAt(client, controllerHandle);
+
+                if (controller)
+                {
+                    uint32_t handle = 0;
+
+                    if (client.ReadValue(pid_, controller + off::ControllerPawn, &handle) && handle)
+                        pawn = EntityAt(client, handle);
+                }
+            }
+
+            /* Route 3: scan controllers for the local flag. */
+            if (!pawn)
+                pawn = LocalPawnFromControllers(client);
+
+            if (!pawn)
+                return false;
+
+            ++seenLocalFallback_;
+        }
+
+        statusLocalRaw_ = (uint32_t)(pawn & 0xFFFFFFFF);
 
         struct
         {
@@ -217,16 +299,17 @@ namespace cs2
         out->feet.y = readout.origin[1];
         out->feet.z = readout.origin[2];
 
+        /*
+         * A bad position is not a lost game: it happens on a respawn and while the
+         * pawn is still being built. Report the read as successful with valid ==
+         * false, so the caller shows "no local player" instead of re-attaching.
+         */
         if (!std::isfinite(out->feet.x) || !std::isfinite(out->feet.y) ||
-            !std::isfinite(out->feet.z))
-            return false;
-
-        if (fabsf(out->feet.x) < 1.0f && fabsf(out->feet.y) < 1.0f)
-            return false;
-
-        if (fabsf(out->feet.x) > off::MaxWorldXY || fabsf(out->feet.y) > off::MaxWorldXY ||
+            !std::isfinite(out->feet.z) ||
+            (fabsf(out->feet.x) < 1.0f && fabsf(out->feet.y) < 1.0f) ||
+            fabsf(out->feet.x) > off::MaxWorldXY || fabsf(out->feet.y) > off::MaxWorldXY ||
             fabsf(out->feet.z) > off::MaxWorldZ)
-            return false;
+            return true;
 
         out->valid = readout.life == 0 && readout.health > 0;
         return true;

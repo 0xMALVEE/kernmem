@@ -57,6 +57,11 @@ namespace cs2
          * comes off the pawn via m_vOldOrigin. */
         uint64_t SceneNode(km::Client& client, uint64_t pawn);
 
+        /* Local pawn resolved by scanning controllers for
+         * m_bIsLocalPlayerController. Used when the dwLocalPlayerPawn global is
+         * stale, which is the case on some builds. */
+        uint64_t LocalPawnFromControllers(km::Client& client);
+
         std::string ReadName(km::Client& client, uint64_t controller);
 
         /* Per-frame walk counters, so a failure names its own step instead of
@@ -67,6 +72,10 @@ namespace cs2
         mutable uint32_t seenDead_ = 0;
         mutable uint32_t seenNoNode_ = 0;
         mutable uint32_t seenNoOrigin_ = 0;
+        mutable uint32_t seenLocalFallback_ = 0;
+        mutable uint32_t seenLocalFlag_ = 0;
+        mutable uint32_t statusLocalRaw_ = 0;
+        mutable uint32_t statusCtrlRaw_ = 0;
 
         /* Last local position, for the status line. */
         mutable float statusX_ = 0.0f;

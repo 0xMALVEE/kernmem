@@ -214,6 +214,11 @@ namespace esp
         bool attached = false;
         int frames = 0;
 
+        /* A single bad frame is normal (respawn, menu, map load). Only re-attach
+         * after a sustained run of failures. */
+        int misses = 0;
+        constexpr int kMaxMisses = 20;
+
         const wchar_t* title = provider.WindowTitle();
         const wchar_t* process = provider.ProcessName();
 
@@ -242,19 +247,51 @@ namespace esp
             Matrix matrix = {};
             Local local = {};
 
-            if (!provider.ReadMatrix(client, &matrix) || !provider.ReadLocal(client, &local))
+            const bool haveMatrix = provider.ReadMatrix(client, &matrix);
+            const bool haveLocal = haveMatrix && provider.ReadLocal(client, &local);
+
+            if (!haveLocal)
             {
-                /* Losing the game (map change, exit, crash) means re-attach
-                 * rather than spin on dead addresses. */
+                /* Name the failing read: the two have different causes, and the
+                 * shared "game lost" text could not tell them apart. */
+                if (++misses < kMaxMisses)
+                {
+                    const char* why = haveMatrix ? "local player unresolved"
+                                                 : "view matrix unresolved";
+
+                    char unresolved[224];
+                    const std::string detail = provider.Status();
+
+                    _snprintf_s(unresolved, sizeof(unresolved), _TRUNCATE, "%s %s",
+                                why, detail.c_str());
+
+                    overlay::Draw(provider, {}, {}, {}, unresolved, title);
+                    Sleep(kFrameDelay);
+                    continue;
+                }
+
+                /* Sustained: the game is gone or the offsets are dead, so
+                 * re-attach rather than spin on stale addresses. */
+                misses = 0;
                 attached = false;
                 overlay::Draw(provider, {}, {}, {}, "game lost - re-attaching", title);
                 Sleep(250);
                 continue;
             }
 
+            misses = 0;
+
             if (!local.valid)
             {
-                overlay::Draw(provider, local, matrix, {}, "no local player", title);
+                /* The counters are what make this diagnosable - without them the
+                 * line only says the local player did not resolve. */
+                char noLocal[224];
+                const std::string detail = provider.Status();
+
+                _snprintf_s(noLocal, sizeof(noLocal), _TRUNCATE, "no local player %s",
+                            detail.c_str());
+
+                overlay::Draw(provider, local, matrix, {}, noLocal, title);
                 Sleep(kFrameDelay);
                 continue;
             }

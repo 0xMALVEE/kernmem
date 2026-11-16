@@ -26,7 +26,10 @@ namespace off
     /* ---- globals (client.dll) ---------------------------------------- */
     constexpr uint64_t EntityList            = 0x2709010;
     constexpr uint64_t LocalPlayerController = 0x252B0C8;
-    constexpr uint64_t LocalPlayerPawn       = 0x2553D38;  /* pointer, not a handle */
+    /* LocalPlayerPawn is a pointer, not a handle; LocalPlayerController above is
+     * a handle and is the third route to the local pawn:
+     * handle -> chunk table -> controller -> m_hPawn. */
+    constexpr uint64_t LocalPlayerPawn       = 0x2553D38;
     constexpr uint64_t ViewMatrix            = 0x2559640;
 
     /* ---- entity list shape -------------------------------------------
@@ -44,7 +47,7 @@ namespace off
     constexpr uint32_t EntityPerChunk    = 1u << EntityChunkShift;
 
     /* Controllers sit at low indices; nothing above this is a player. */
-    constexpr uint32_t MaxControllers = 64;
+    constexpr uint32_t MaxControllers = 256;
 
     /* Entity handles are 32-bit with a serial in the high bits. */
     constexpr uint32_t EntityHandleMask = 0x7FFF;
