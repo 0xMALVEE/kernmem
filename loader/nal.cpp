@@ -888,6 +888,8 @@ namespace nal
 
         int removed = 0;
 
+        km_log::Step("sweeping %ls for stale driver images", temp.c_str());
+
         do
         {
             if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
@@ -930,8 +932,17 @@ namespace nal
              * and the one to clear even if the file itself is somehow in use. */
             service::RemoveKeyForImage(path, !hostResident);
 
+            /*
+             * A loaded image's section holds its file open, so this delete can only
+             * succeed once it has been unloaded. Reported rather than swallowed: a
+             * sweep that silently removes nothing is indistinguishable from one that
+             * never ran.
+             */
             if (_wremove(path.c_str()) != 0)
+            {
+                km_log::Warn("sweep: could not remove %ls (0x%08X)", path.c_str(), GetLastError());
                 continue;
+            }
 
             ++removed;
         }
@@ -974,10 +985,23 @@ namespace nal
             km_log::Step("swept %d stale trail(s) out of %%TEMP%%", removed);
     }
 
-    /* Deletes the dropped host image. The image section holds its own reference, so
-     * the driver keeps running and unloading still works - what goes away is the
-     * file a scanner can hash, or read a version resource out of. Idempotent, and
-     * the path string is kept: the trace scrub and the release path still want it. */
+    /*
+     * Gets the live host image out of %TEMP%.
+     *
+     * A delete cannot do it: the loaded image's section holds the file open, so
+     * _wremove fails for as long as the driver is resident - which is the entire
+     * session, and the file is exactly what a scanner hashes. A rename is allowed
+     * on an open file, and %TEMP% and System32\drivers are on the same volume, so
+     * the bytes never have to move.
+     *
+     * That also makes the disguised FullDllName literally true: the recorded path
+     * and the real location agree, so a scanner that resolves the path finds the
+     * image where the module list says it is, next to in-box drivers.
+     *
+     * Falls back to a delete (works on a file nothing holds), then to a warning.
+     * Idempotent, and g_driverPath is updated so unload, release and the state file
+     * all follow the new location.
+     */
     void UnlinkDrop()
     {
         if (g_dropUnlinked || g_driverPath.empty())
@@ -989,6 +1013,35 @@ namespace nal
             return;
         }
 
+        WCHAR windows[MAX_PATH] = { 0 };
+        const UINT length = GetWindowsDirectoryW(windows, MAX_PATH);
+
+        if (length && length < MAX_PATH)
+        {
+            const size_t slash = g_driverPath.find_last_of(L"\\/");
+            const std::wstring stem = (slash == std::wstring::npos)
+                                          ? g_driverPath
+                                          : g_driverPath.substr(slash + 1);
+            const std::wstring target = std::wstring(windows) + L"\\System32\\drivers\\" + stem;
+
+            if (!MoveFileExW(g_driverPath.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING))
+            {
+                km_log::Warn("could not move %ls (0x%08X)", g_driverPath.c_str(), GetLastError());
+            }
+            else
+            {
+                g_driverPath = target;
+                g_dropUnlinked = true;
+
+                /* Recorded, or a later session's unload and release look in %TEMP%
+                 * for a file that is no longer there. */
+                SaveState();
+
+                km_log::Step("host image moved to %ls", target.c_str());
+                return;
+            }
+        }
+
         if (_wremove(g_driverPath.c_str()) == 0)
         {
             g_dropUnlinked = true;
@@ -996,7 +1049,7 @@ namespace nal
         }
         else
         {
-            km_log::Warn("could not remove %ls - the file stays on disk", g_driverPath.c_str());
+            km_log::Warn("host image stays at %ls", g_driverPath.c_str());
         }
     }
 
@@ -1006,7 +1059,7 @@ namespace nal
 
         /*
          * The service key is an independent trail: it names the random driver and
-         * its %TEMP% ImagePath, and it outlives the session unless removed here.
+         * its ImagePath, and it outlives the session unless removed here.
          * NtUnloadDriver needs a key to name the service by, so teardown writes it
          * back from the same values instead of leaving it for the whole session.
          *

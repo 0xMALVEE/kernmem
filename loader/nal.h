@@ -69,11 +69,11 @@ namespace nal
     /*
      * Deletes the dropped host image from disk and removes its service key.
      *
-     * The image itself is already gone by the time this is called - Load() unlinks
-     * it as soon as the device answers, because everything after that point can
-     * bugcheck and a bugcheck runs no cleanup. This call is what takes the registry
-     * entry, and it stays idempotent so the map-failure and success paths can both
-     * reach it.
+     * The image itself is already out of %TEMP% by the time this is called - Load()
+     * moves it into System32\drivers as soon as the device answers, because
+     * everything after that point can bugcheck and a bugcheck runs no cleanup. This
+     * call is what takes the registry entry, and it stays idempotent so the
+     * map-failure and success paths can both reach it.
      *
      * The path string is kept, because the trace scrub keys off the file name.
      */
