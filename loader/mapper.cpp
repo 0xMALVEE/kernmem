@@ -91,8 +91,17 @@ namespace mapper
                   (unsigned long long)image.imageSize,
                   (unsigned long long)image.entryPoint);
 
-        /* Allocate the image in kernel pool. */
-        const uint64_t kernelImage = nal::AllocatePool(image.imageSize);
+        /*
+         * Allocate the image in kernel pool, with two pages of slack.
+         *
+         * SizeOfImage is section-aligned but the copy that follows is exact, so an
+         * exact-size allocation leaves nothing behind the last byte: a single byte
+         * past the end lands on the next pool chunk's header. That is precisely the
+         * corruption seen - bugcheck 0x3B in nt!RtlRbInsertNodeEx, bucket
+         * AV_nt!ExAllocatePool, with the next chunk's tree link top byte stamped
+         * from FF to 88 - and it fires on the *next* allocation, not this one.
+         */
+        const uint64_t kernelImage = nal::AllocatePool(image.imageSize + 0x2000);
         if (!kernelImage)
         {
             km_log::Error("kernel allocation for the image failed");
@@ -102,9 +111,14 @@ namespace mapper
 
         km_log::Step("image allocated at 0x%llX", (unsigned long long)kernelImage);
 
-        /* Local mirror so headers and relocations can be fixed up before the
-         * copy into the kernel. */
-        auto localImage = static_cast<uint8_t*>(calloc(1, image.imageSize));
+        /*
+         * Local mirror so headers and relocations can be fixed up before the copy
+         * into the kernel. Carries the same slack as the kernel block: a section
+         * whose VirtualAddress + SizeOfRawData runs past SizeOfImage overruns here
+         * first, and that is a user-heap corruption rather than a bugcheck, so it
+         * has to be caught by the bounds check below instead.
+         */
+        auto localImage = static_cast<uint8_t*>(calloc(1, image.imageSize + 0x2000));
         if (!localImage)
         {
             nal::FreePool(kernelImage);
@@ -122,6 +136,18 @@ namespace mapper
             const PIMAGE_SECTION_HEADER section = &image.sections[i];
             if (!section->SizeOfRawData)
                 continue;
+
+            /* Refuse a section that does not fit rather than write past the block. */
+            if ((uint64_t)section->VirtualAddress + section->SizeOfRawData > image.imageSize)
+            {
+                km_log::Error("section %u runs past the image (0x%X + 0x%X > 0x%llX)", i,
+                              section->VirtualAddress, section->SizeOfRawData,
+                              (unsigned long long)image.imageSize);
+                free(localImage);
+                nal::FreePool(kernelImage);
+                pe::Free(&image);
+                return false;
+            }
 
             memcpy(localImage + section->VirtualAddress,
                    image.raw + section->PointerToRawData,
