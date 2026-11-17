@@ -997,17 +997,29 @@ namespace nal
 
         GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
 
+        /*
+         * Same separator trap as the directory walk above: `temp` carries no trailing
+         * slash, so `temp + "km-*.state"` built "...\\Tempkm-*.state" and matched
+         * nothing at all. The glob is also wide, not `km-*`: records written by the
+         * pre-rename build are called vgb-*.state and hold the same three lines.
+         */
+        std::wstring stateDir = temp;
+
+        if (!stateDir.empty() && stateDir.back() != L'\\' && stateDir.back() != L'/')
+            stateDir += L'\\';
+
         WIN32_FIND_DATAW state = { 0 };
-        HANDLE states = FindFirstFileW((temp + L"km-*.state").c_str(), &state);
+        HANDLE states = FindFirstFileW((stateDir + L"*.state").c_str(), &state);
 
         if (states != INVALID_HANDLE_VALUE)
         {
             do
             {
+                /* Anything written before this process started is dead. */
                 if (CompareFileTime(&state.ftLastWriteTime, &created) >= 0)
                     continue;
 
-                if (_wremove((temp + state.cFileName).c_str()) == 0)
+                if (_wremove((stateDir + state.cFileName).c_str()) == 0)
                     ++removed;
             }
             while (FindNextFileW(states, &state));
