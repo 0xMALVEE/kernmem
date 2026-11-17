@@ -74,6 +74,50 @@ namespace
                address + size <= 0xFFFFFFFFFFFFFFFFULL;
     }
 
+    /*
+     * Whether the pages at [address, address+size) are actually mapped.
+     *
+     * KernelRange only proves an address is canonical and in the high half; it says
+     * nothing about whether anything is there. A write to a canonical-but-unmapped
+     * address faults inside the host driver's own memcpy, where user-mode SEH cannot
+     * reach, so the machine bugchecks 0x50 instead of the scrub warning. The scrub
+     * writes, so it has to know the pages are real first.
+     */
+    uint64_t g_addressValid = 0;
+
+    bool Mapped(uint64_t address, uint64_t size)
+    {
+        if (!KernelRange(address, size))
+            return false;
+
+        if (!g_addressValid)
+        {
+            const uint64_t kernelBase = nal::ResolveKernelBase();
+
+            if (!kernelBase)
+                return false;
+
+            g_addressValid = nal::GetKernelModuleExport(kernelBase, "MmIsAddressValid");
+
+            if (!g_addressValid)
+                return false;
+        }
+
+        /* Both ends. A record is at most a few hundred bytes, so its ends are enough
+         * to refuse the case that matters without walking every page. */
+        uint64_t ok = 0;
+
+        if (!nal::CallKernelFunction(&ok, g_addressValid, address) || !ok)
+            return false;
+
+        ok = 0;
+
+        if (!nal::CallKernelFunction(&ok, g_addressValid, address + size - 1))
+            return false;
+
+        return ok != 0;
+    }
+
     bool Aligned(uint64_t address)
     {
         return (address & 0x7) == 0;
@@ -312,7 +356,10 @@ namespace trace
                         ++names;
                 }
 
-                if (names)
+                /* Two named records, not one. A single name inside a 50-record stride
+                 * is cheap to hit by chance once the scan covers far more memory; two
+                 * in a row is not. */
+                if (names >= 2)
                     return candidate;
             }
         }
@@ -483,7 +530,9 @@ namespace trace
                              (unsigned long long)array);
         }
 
-        if (!array || !KernelRange(array, kUnloadedEntrySize))
+        /* Canonical is not mapped: the widened scan can return a canonical address
+         * with nothing behind it, and the write then bugchecks inside the host. */
+        if (!array || !Mapped(array, kUnloadedEntrySize * 2))
         {
             km_log::Warn("MmUnloadedDrivers not resolved - unload trace left in place");
             return 0;
@@ -503,6 +552,12 @@ namespace trace
             /* Zero the whole record: name, start, end and timestamp. A partially
              * cleared entry is still findable by its timestamp. */
             uint8_t zero[kUnloadedEntrySize] = { 0 };
+
+            if (!Mapped(entry, sizeof(zero)))
+            {
+                km_log::Warn("unloaded-driver slot %u is not mapped - left in place", i);
+                continue;
+            }
 
             if (!nal::WriteMemory(entry, zero, sizeof(zero)))
             {
@@ -547,7 +602,7 @@ namespace trace
                              (unsigned long long)table);
         }
 
-        if (!table || !KernelRange(table, 0x80))
+        if (!table || !Mapped(table, 0x80))
         {
             km_log::Warn("PiDDBCacheTable not resolved - cache entry left in place");
             return 0;
@@ -608,7 +663,8 @@ namespace trace
                     break;
                 }
 
-                if (!nal::WriteMemory(flink + 0x08, &blink, sizeof(blink)) ||
+                if (!Mapped(flink, 0x10) || !Mapped(blink, 0x10) ||
+                    !nal::WriteMemory(flink + 0x08, &blink, sizeof(blink)) ||
                     !nal::WriteMemory(blink, &flink, sizeof(flink)))
                 {
                     km_log::Warn("could not unlink the PiDDBCache entry");
@@ -690,7 +746,7 @@ namespace trace
 
         const uint64_t lock = Relative(lockHit, 3, 7);
 
-        if (!KernelRange(list, 0x10) || !KernelRange(lock, 0x10))
+        if (!Mapped(list, 0x10) || !Mapped(lock, 0x10))
             return 0;
 
         const uint64_t acquire =
@@ -814,7 +870,7 @@ namespace trace
 
         const uint64_t list = nal::GetKernelModuleExport(kernelBase, "PsLoadedModuleList");
 
-        if (!list || !KernelRange(list, 0x10))
+        if (!list || !Mapped(list, 0x10))
         {
             km_log::Warn("PsLoadedModuleList unresolved - host keeps its real path");
             return false;

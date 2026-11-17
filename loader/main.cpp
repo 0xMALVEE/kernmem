@@ -64,6 +64,24 @@ namespace
         }
     }
 
+    /*
+     * The scrub gets its own frame for the same reason the disguise does: __try
+     * cannot live in a function with unwinding locals. It also needs one - the scan
+     * can resolve a wrong address and a write into the host's kernel memcpy
+     * bugchecks rather than returning.
+     */
+    void ScrubGuarded(const std::wstring& path)
+    {
+        __try
+        {
+            trace::Scrub(path);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            km_log::Warn("trace scrub faulted (0x%08X)", GetExceptionCode());
+        }
+    }
+
     std::wstring StatePath()
     {
         const std::wstring temp = nt::GetFullTempPath();
@@ -424,7 +442,7 @@ namespace
          * kernel access is available, instead of leaving a growing trail.
          */
         if (!nal::DriverPath().empty())
-            trace::Scrub(nal::DriverPath());
+            ScrubGuarded(nal::DriverPath());
 
         std::wstring imagePath;
         if (!nt::GetFullTempPath().empty())
@@ -589,7 +607,7 @@ namespace
 
         /* Still open: clear this session's trace before releasing the host. */
         if (!nal::DriverPath().empty())
-            trace::Scrub(nal::DriverPath());
+            ScrubGuarded(nal::DriverPath());
 
         nal::Unload(release);
 
