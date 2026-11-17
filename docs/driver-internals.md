@@ -199,7 +199,34 @@ The order matters: the table points into the image, the entry holds the name buf
 
 ---
 
-## 10. Hazard index
+## 10. Comparison with kdmapper
+
+kdmapper is the reference implementation for this technique and is vendored at `driver/research/kdm_src/kdmapper-master`. The two are not equivalent: kdmapper is a one-shot mapper, this is a runtime system. Stating where each is better is more useful than claiming parity.
+
+| | kdmapper | here |
+|---|---|---|
+| Entry arguments | `NULL, NULL` (`main.cpp:203`) - no `DRIVER_OBJECT` | fabricated object, so `IoCreateDevice` and callbacks work |
+| Exception table | none - no `RtlAddFunctionTable`/`PsLoadedModuleList` anywhere in its `kdmapper/` | header skeleton + early publish (section 6) |
+| Module list | not published | published (section 7) |
+| Allocation | `MmAllocateIndependentPagesEx` + `MmSetPageProtection` | `NonPagedPool`, executable, `+0x2000` slack |
+| Host residency | unloaded immediately after the map | kept resident for the shared block |
+| Device already present | refuses to load | attaches (section 2) |
+| Target discovery | PDB offsets via `KDSymbolsHandler` | patterns, then shape scans |
+| Trail hiding | none | sweep, relocation, path disguise |
+
+**Taken from it:**
+
+- **The unload record is suppressed, not scrubbed.** `ClearMmUnloadedDrivers` walks the handle table to its own device, follows `FILE_OBJECT -> DeviceObject -> DriverObject -> DriverSection`, and zeroes `BaseDllName.Length` so `MiRememberUnloadedDriver` skips the write. Nothing is guessed, so no candidate can be a false positive - which is what produced three bugchecks here. Offsets: object `+0x08`, device `+0x08`, driver `+0x28`, section `+0x58`. Its bounded `NtQuerySystemInformation` retry is used too, because the handle table grows between the sizing call and the real one.
+- **PiDDBCacheTable by pattern**, resolved `(hit + 2, 6, 10)` - the same arithmetic it uses. The shape scan stays as a fallback and says so.
+
+**Not taken:**
+
+- **`NULL` entry arguments.** It has no way to create a device or register a callback, which is the whole basis of the Vanguard workaround.
+- **Unloading the host.** Its exposure window is milliseconds; ours is a session. The shared block is the reason, and the trade is deliberate.
+
+---
+
+## 11. Hazard index
 
 Every entry is a real fault this driver has taken, or a bug found while fixing one.
 
@@ -213,10 +240,13 @@ Every entry is a real fault this driver has taken, or a bug found while fixing o
 | `0x50` in `memcpy` | bogus pointer treated as kernel | range screen first |
 | `0x1E` on PEB read | process tearing down | `KmUserPointer` before every deref |
 | `0x7E` / `0x8E` | NULL `MajorFunction` slot | `KmDefaultDispatch` everywhere |
+| `0x50` writing a scrub record | canonical is not mapped; scan false positive | `Mapped()` before every write |
+| `0x50` reading a name buffer | same, on the read path | `Mapped()` on descriptor and buffer |
+| `0x50` in a scan chunk | one merged span read across non-writable gaps | per-section ranges |
 
 ---
 
-## 11. Limits
+## 12. Limits
 
 - **Not a security boundary.** Anything with a kernel primitive can walk pool and find the image.
 - **Pool is not executable-safe by default** — the loader asks for `NonPagedPool`, never `Nx`.
