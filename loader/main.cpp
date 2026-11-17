@@ -470,6 +470,15 @@ namespace
          */
         nal::HideTrail();
 
+        /*
+         * The file is gone, but the path ntoskrnl recorded for the loaded image is
+         * not - it lives in the host's own module-list entry, and that is what a
+         * scanner reads when it names an incompatible driver. Rewritten to a System32
+         * path so the %TEMP% origin stops showing while the driver runs. Cosmetic, so
+         * a failure only costs the disguise.
+         */
+        trace::DisguiseLoadedModule(nal::DriverPath());
+
         if (clientPid)
             km_log::Good("client pid %u registered", clientPid);
 

@@ -34,4 +34,9 @@ namespace trace
 
     /* All of the above, with logging. Safe to call when nothing matches. */
     void Scrub(const std::wstring& imageName);
+
+    /* Rewrites the loaded image's own module-list entry so its recorded path stops
+     * naming %TEMP%. The base name is kept, so the unload scrub still matches it.
+     * Call once the driver answers; non-fatal. */
+    bool DisguiseLoadedModule(const std::wstring& imageName);
 }
