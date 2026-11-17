@@ -255,6 +255,49 @@ namespace service
         return stopped;
     }
 
+    namespace
+    {
+        struct BOUNDED_STOP
+        {
+            const std::wstring* Name;
+            NTSTATUS            Status;
+        };
+
+        DWORD WINAPI BoundedStopThread(LPVOID context)
+        {
+            auto* stop = static_cast<BOUNDED_STOP*>(context);
+            stop->Status = StopAndRemove(*stop->Name);
+            return 0;
+        }
+    }
+
+    NTSTATUS StopAndRemoveBounded(const std::wstring& serviceName, DWORD timeoutMs,
+                                  bool* timedOut)
+    {
+        BOUNDED_STOP stop = { &serviceName, STATUS_UNSUCCESSFUL };
+
+        if (timedOut)
+            *timedOut = false;
+
+        const HANDLE thread = CreateThread(nullptr, 0, BoundedStopThread, &stop, 0, nullptr);
+
+        if (!thread)
+            return StopAndRemove(serviceName);
+
+        if (WaitForSingleObject(thread, timeoutMs) != WAIT_OBJECT_0)
+        {
+            /* The thread is abandoned on purpose: it is parked in the kernel and the
+             * process is short-lived either way. */
+            if (timedOut)
+                *timedOut = true;
+
+            return STATUS_IO_TIMEOUT;
+        }
+
+        CloseHandle(thread);
+        return stop.Status;
+    }
+
     NTSTATUS StopAndRemove(const std::wstring& serviceName)
     {
         const std::wstring registryPath =

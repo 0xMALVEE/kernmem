@@ -11,6 +11,12 @@ namespace service
     NTSTATUS RegisterAndStart(const std::wstring& driverPath, const std::wstring& serviceName);
     NTSTATUS StopAndRemove(const std::wstring& serviceName);
 
+    /* StopAndRemove with a bound. NtUnloadDriver has no timeout of its own, so a
+     * driver that stopped completing IRPs parks the caller forever. timedOut says a
+     * timeout, not a refusal, is why it failed. */
+    NTSTATUS StopAndRemoveBounded(const std::wstring& serviceName, DWORD timeoutMs,
+                                  bool* timedOut);
+
     /* Writes the service key without starting anything, and deletes it without
      * unloading. Splitting the two is what lets the key be hidden right after a
      * successful map: NtUnloadDriver needs a key to name the service by, so it is

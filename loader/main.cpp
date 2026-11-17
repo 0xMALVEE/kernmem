@@ -151,11 +151,13 @@ namespace
          * only way in, and without it every later open fails with "file not
          * found" while the driver is still answering.
          */
+        /*
+         * Bounded, like the attach path: a host that stopped completing I/O leaves
+         * an open pending forever, and every later Ioctl call goes through here.
+         */
         for (const std::wstring& path : nal::DevicePaths())
         {
-            g_device = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            g_device = nal::OpenBounded(path.c_str(), nullptr);
 
             if (g_device != INVALID_HANDLE_VALUE)
                 return true;

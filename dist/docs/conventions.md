@@ -1,4 +1,4 @@
-# 10 — Conventions
+# 09 — Conventions
 
 > Rules for this repository. They exist because the root accumulated ~50 one-off files and every build dropped `.obj` files into it.
 
@@ -13,7 +13,26 @@ build.ps1      the one entry point
 .gitignore     what is not tracked
 ```
 
-Nothing else belongs there. If a file is not one of those, it goes somewhere:
+Nothing else belongs there. Decide where a file goes before you create it:
+
+```mermaid
+flowchart TD
+    A["new file"] --> B{"is it documentation?"}
+    B -->|yes| C["docs/"]
+    B -->|no| D{"is it a one-off script?"}
+    D -->|yes| E["scripts/\nroot = Split-Path -Parent $PSScriptRoot"]
+    D -->|no| F{"is it captured output?"}
+    F -->|yes| G["logs/"]
+    F -->|no| H{"is it compiler output?"}
+    H -->|yes| I["build/ (ignored)"]
+    H -->|no| J["is it shippable?"}
+    J -->|yes| K["dist/"]
+    J -->|no| L{"reconsider"}
+    C --> M["index it in docs/README.md"]
+    E --> N["never write \\$root"]
+```
+
+If a file is not one of those, it goes somewhere:
 
 | Kind | Home |
 |---|---|

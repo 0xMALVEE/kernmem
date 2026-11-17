@@ -575,16 +575,89 @@ namespace nal
         return true;
     }
 
+    /*
+     * How long a device open is allowed to take before the host is called wedged.
+     *
+     * CreateFileW and DeviceIoControl have no timeout of their own: if the driver
+     * stops completing anything the caller waits forever, with no error and no log
+     * line. That is exactly how this loader froze - the log stopped one line into
+     * Attach and the process sat in kernel until it had to be power-cycled.
+     */
+    constexpr DWORD kDeviceTimeoutMs = 5000;
+
+    struct BOUNDED_OPEN
+    {
+        const wchar_t* Path;
+        HANDLE         Handle;
+    };
+
+    DWORD WINAPI BoundedOpenThread(LPVOID context)
+    {
+        auto* open = static_cast<BOUNDED_OPEN*>(context);
+
+        open->Handle = CreateFileW(open->Path, FILE_ANY_ACCESS,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        return 0;
+    }
+
+    /*
+     * Opens a device path with a bound.
+     *
+     * The open runs on a worker and is abandoned after kDeviceTimeoutMs. A thread
+     * still inside CreateFileW is leaked on purpose: the handle it may yet produce
+     * belongs to this process and stays usable, and the process is short-lived.
+     * timedOut tells the caller that a timeout, not a refusal, is why it failed.
+     */
+    HANDLE OpenBounded(const wchar_t* path, bool* timedOut)
+    {
+        BOUNDED_OPEN open = { path, INVALID_HANDLE_VALUE };
+
+        if (timedOut)
+            *timedOut = false;
+
+        const HANDLE thread = CreateThread(nullptr, 0, BoundedOpenThread, &open, 0, nullptr);
+
+        if (!thread)
+        {
+            /* No thread to bound with: a direct open is better than none. */
+            return CreateFileW(path, FILE_ANY_ACCESS, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+
+        const DWORD waited = WaitForSingleObject(thread, kDeviceTimeoutMs);
+
+        if (waited == WAIT_OBJECT_0)
+        {
+            CloseHandle(thread);
+            return open.Handle;
+        }
+
+        if (timedOut)
+            *timedOut = true;
+
+        return INVALID_HANDLE_VALUE;
+    }
+
     bool IsRunning()
     {
-        const HANDLE probe = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS,
-                                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        bool timedOut = false;
+        const HANDLE probe = OpenBounded(L"\\\\.\\Nal", &timedOut);
+
         if (probe != INVALID_HANDLE_VALUE)
         {
             CloseHandle(probe);
             return true;
         }
+
+        /* A wedged host is still a resident host - Attach gets to say so properly. */
+        if (timedOut)
+        {
+            km_log::Warn("\\Device\\Nal did not answer an open in %u ms - the host looks wedged",
+                         kDeviceTimeoutMs);
+            return true;
+        }
+
         return false;
     }
 
@@ -592,13 +665,56 @@ namespace nal
     {
         LoadState();
 
-        hDevice = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        bool timedOut = false;
+        hDevice = OpenBounded(L"\\\\.\\Nal", &timedOut);
 
         if (hDevice == INVALID_HANDLE_VALUE)
         {
-            km_log::Error("mapping host is not running - nothing to attach to");
+            if (timedOut)
+            {
+                /*
+                 * The host is resident but not completing an open: the device object
+                 * is still in the namespace holding the image section, so the file
+                 * stays locked and the key is already gone. Nothing can be mapped on
+                 * top of it, but it can still be unloaded - NtUnloadDriver works off
+                 * the service key, not the device. Rebuild that key from the state file
+                 * and try, bounded, because a wedged driver parks the unload too.
+                 */
+                km_log::Error("mapping host is wedged - it holds \\Device\\Nal but does not answer");
+
+                if (!g_serviceName.empty() && !g_driverPath.empty())
+                {
+                    service::WriteKey(g_driverPath, g_serviceName);
+
+                    bool unloadTimedOut = false;
+                    const NTSTATUS unloadStatus =
+                        service::StopAndRemoveBounded(g_serviceName, kDeviceTimeoutMs,
+                                                      &unloadTimedOut);
+
+                    if (NT_SUCCESS(unloadStatus))
+                    {
+                        g_serviceName.clear();
+                        g_ownedService = false;
+                        km_log::Good("wedged host unloaded - run load again and it will start clean");
+                        return false;
+                    }
+
+                    if (unloadTimedOut)
+                        km_log::Info("the unload did not complete either; reboot clears the image");
+                    else
+                        km_log::Warn("could not unload the wedged host (0x%08X)",
+                                     (unsigned)unloadStatus);
+                }
+                else
+                {
+                    km_log::Info("no state file to name the service by; reboot clears the image");
+                }
+            }
+            else
+            {
+                km_log::Error("mapping host is not running - nothing to attach to");
+            }
+
             return false;
         }
 

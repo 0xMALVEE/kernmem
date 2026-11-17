@@ -99,6 +99,11 @@ namespace nal
      * driver, because the block is registered at map time. */
     bool     SelfTest();
 
+    /* Opens a device path with a bound, so a wedged host reports instead of hanging
+     * forever in CreateFileW. timedOut says a timeout, not a refusal, is why it
+     * failed. INVALID_HANDLE_VALUE on failure. */
+    HANDLE   OpenBounded(const wchar_t* path, bool* timedOut);
+
     bool ReadMemory(uint64_t address, void* buffer, uint64_t size);
     bool WriteMemory(uint64_t address, void* buffer, uint64_t size);
 

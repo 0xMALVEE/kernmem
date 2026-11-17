@@ -1,4 +1,4 @@
-# 09 — Driver internals
+# 08 — Driver internals
 
 > How `km.sys` actually works, end to end. Read `architecture.md` first for *why* the design is shaped this way; this page is the *how*.
 
