@@ -83,6 +83,11 @@ typedef struct _KM_INIT_PARAMS
      * MDL and maps it into system space, so reads cost no IOCTL at all. */
     unsigned __int64 SharedUser;
     unsigned long SharedSize;
+    /* .pdata location, relative to ImageBase. A mapped image is invisible to the SEH
+     * dispatcher, so the driver registers its own exception table before any of its
+     * code can take a fault - otherwise every __try/__except escalates to 0x1E. */
+    unsigned long ExceptionRva;
+    unsigned long ExceptionSize;
 } KM_INIT_PARAMS;
 
 /* What the driver reports about its own mapping, so teardown needs no state

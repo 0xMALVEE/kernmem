@@ -708,7 +708,12 @@ namespace trace
         const std::wstring wanted = BaseName(imageName);
 
         if (wanted.empty())
+        {
+            km_log::Warn("disguise: no image name given");
             return false;
+        }
+
+        km_log::Step("disguising the recorded path for %ls", wanted.c_str());
 
         const uint64_t kernelBase = nal::ResolveKernelBase();
 
@@ -729,7 +734,10 @@ namespace trace
         uint64_t head = 0;
 
         if (!nal::ReadMemory(list, &head, sizeof(head)))
+        {
+            km_log::Warn("disguise: cannot read the module list head");
             return false;
+        }
 
         for (uint32_t guard = 0; head && head != list && guard < kMaxNodes; ++guard)
         {
@@ -738,7 +746,10 @@ namespace trace
             std::wstring name;
 
             if (!nal::ReadMemory(entry + kLdrNext, &head, sizeof(head)))
+            {
+                km_log::Warn("disguise: walk broke at 0x%llX", (unsigned long long)entry);
                 return false;
+            }
 
             if (!nal::ReadMemory(entry + kLdrDllBase, &dllBase, sizeof(dllBase)) ||
                 !KernelRange(dllBase, 0x1000))
@@ -754,10 +765,17 @@ namespace trace
             const uint64_t buffer = nal::AllocatePool(bytes + sizeof(wchar_t));
 
             if (!buffer)
+            {
+                km_log::Warn("disguise: cannot allocate the name buffer");
                 return false;
+            }
 
             if (!nal::WriteMemory(buffer, (void*)disguised.c_str(), bytes + sizeof(wchar_t)))
+            {
+                km_log::Warn("disguise: cannot write the name buffer at 0x%llX",
+                             (unsigned long long)buffer);
                 return false;
+            }
 
             uint8_t descriptor[0x10] = { 0 };
             *(uint16_t*)(descriptor + 0x00) = (uint16_t)bytes;
@@ -765,7 +783,11 @@ namespace trace
             *(uint64_t*)(descriptor + 0x08) = buffer;
 
             if (!nal::WriteMemory(entry + kLdrFullDllName, descriptor, sizeof(descriptor)))
+            {
+                km_log::Warn("disguise: cannot rewrite the entry at 0x%llX",
+                             (unsigned long long)entry);
                 return false;
+            }
 
             km_log::Good("host now reported as %ls", disguised.c_str());
             return true;

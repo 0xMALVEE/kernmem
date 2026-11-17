@@ -202,7 +202,13 @@ namespace mapper
          */
         uint64_t functionTable = 0;
 
-        if (image.exceptionRva && image.exceptionSize >= sizeof(RUNTIME_FUNCTION))
+        /*
+         * Kept, but switched off: the driver registers its own .pdata now, directly
+         * from kernel mode. Doing it from here meant copying the table into pool and
+         * reaching RtlAddFunctionTable through the NtAddAtom trampoline, and the table
+         * was refused. The location travels in the init block instead.
+         */
+        if (false && image.exceptionRva && image.exceptionSize >= sizeof(RUNTIME_FUNCTION))
         {
             const size_t count = (size_t)(image.exceptionSize / sizeof(RUNTIME_FUNCTION));
             const auto* source = reinterpret_cast<const RUNTIME_FUNCTION*>(
@@ -239,10 +245,38 @@ namespace mapper
                                                                 "RtlAddFunctionTable");
                 uint64_t tableArgs[4] = { functionTable, count, kernelImage, 0 };
 
-                if (!written || !add ||
-                    !nal::CallKernelFunctionRaw(nullptr, add, tableArgs, 3))
+                /*
+                 * One call. Three ways this fails and they need different answers, so
+                 * each says which one it was - collapsed into one message the failure
+                 * is unactionable. The result BOOLEAN is read back rather than the
+                 * trampoline's own status: the call can complete and still refuse.
+                 */
+                bool registered = false;
+
+                if (!written)
                 {
-                    km_log::Warn("exception table not registered - guarded faults will bugcheck");
+                    km_log::Warn("exception table write failed - guarded faults will bugcheck");
+                }
+                else if (!add)
+                {
+                    km_log::Warn("RtlAddFunctionTable unresolved - guarded faults will bugcheck");
+                }
+                else
+                {
+                    uint64_t accepted = 0;
+
+                    if (nal::CallKernelFunctionRaw(&accepted, add, tableArgs, 3))
+                        registered = accepted != 0;
+                    else
+                        km_log::Warn("RtlAddFunctionTable call failed - guarded faults will bugcheck");
+
+                    if (!registered && accepted == 0)
+                        km_log::Warn("RtlAddFunctionTable refused the table (base 0x%llX)",
+                                     (unsigned long long)kernelImage);
+                }
+
+                if (!registered)
+                {
                     DropFunctionTable(functionTable);
                     functionTable = 0;
                 }
@@ -252,7 +286,7 @@ namespace mapper
                 }
             }
         }
-        else
+        else if (!image.exceptionRva || image.exceptionSize < sizeof(RUNTIME_FUNCTION))
         {
             km_log::Warn("image has no exception directory - guarded faults will bugcheck");
         }
@@ -430,6 +464,9 @@ namespace mapper
          * IOCTL and no syscall stays patched. Empty when allocation failed. */
         params.SharedUser = nal::SharedUser();
         params.SharedSize = nal::SharedSize();
+        /* .pdata, so the driver can register its own exception table. */
+        params.ExceptionRva = (unsigned long)image.exceptionRva;
+        params.ExceptionSize = (unsigned long)image.exceptionSize;
         WriteToKernel(initBlock, &params, sizeof(params));
 
         const uint64_t entryPoint = kernelImage + image.entryPoint;

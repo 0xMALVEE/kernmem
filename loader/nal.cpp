@@ -872,12 +872,27 @@ namespace nal
      */
     void SweepDirectory(const std::wstring& directory, bool hostResident, int* removed)
     {
-        WIN32_FIND_DATAW found = { 0 };
-        HANDLE search = FindFirstFileW((directory + L"*.sys").c_str(), &found);
-        if (search == INVALID_HANDLE_VALUE)
-            return;
+        /*
+         * Normalised here rather than at the call sites. GetFullTempPath() hands back
+         * a path with no trailing separator, so `directory + "*.sys"` built
+         * "...\Temp*.sys" and FindFirstFile matched nothing - the %TEMP% sweep never
+         * ran at all, while the System32 one did only because its separator was
+         * hardcoded at the call site.
+         */
+        std::wstring dir = directory;
 
-        km_log::Step("sweeping %ls for stale driver images", directory.c_str());
+        if (!dir.empty() && dir.back() != L'\\' && dir.back() != L'/')
+            dir += L'\\';
+
+        WIN32_FIND_DATAW found = { 0 };
+        HANDLE search = FindFirstFileW((dir + L"*.sys").c_str(), &found);
+        if (search == INVALID_HANDLE_VALUE)
+        {
+            km_log::Warn("sweep: cannot enumerate %ls (0x%08X)", dir.c_str(), GetLastError());
+            return;
+        }
+
+        km_log::Step("sweeping %ls for stale driver images", dir.c_str());
 
         do
         {
@@ -886,7 +901,7 @@ namespace nal
 
             /* The live host's own file cannot go while its section holds it open,
              * and its key is already deleted - skipping keeps the log honest. */
-            const std::wstring candidate = directory + found.cFileName;
+            const std::wstring candidate = dir + found.cFileName;
 
             if (!g_driverPath.empty() &&
                 _wcsicmp(candidate.c_str(), g_driverPath.c_str()) == 0)
@@ -901,7 +916,7 @@ namespace nal
 
             if (found.nFileSizeLow == iqvw64e_sys_size || found.nFileSizeLow == km_sys_size)
             {
-                const std::wstring path = directory + found.cFileName;
+                const std::wstring path = dir + found.cFileName;
                 std::ifstream in(path, std::ios::binary);
 
                 if (in)
@@ -923,7 +938,7 @@ namespace nal
             if (!match)
                 continue;
 
-            const std::wstring path = directory + found.cFileName;
+            const std::wstring path = dir + found.cFileName;
 
             /* Key first: it names the file, so it is the stronger of the two trails
              * and the one to clear even if the file itself is somehow in use. */

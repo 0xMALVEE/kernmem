@@ -112,6 +112,33 @@ NTKERNELAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     _In_ ULONG SystemInformationLength,
     _Out_opt_ PULONG ReturnLength);
 
+/*
+ * RUNTIME_FUNCTION is only typedef'd by winnt.h on the user-mode path, so a /kernel
+ * compile has neither the struct nor the pointer alias. This is the same layout the
+ * ABI uses - three DWORDs, 12 bytes, RVAs relative to the base passed to the
+ * registrar - and it is what .pdata actually contains.
+ */
+typedef struct _KM_RUNTIME_FUNCTION
+{
+    ULONG BeginAddress;
+    ULONG EndAddress;
+    ULONG UnwindInfoAddress;
+} KM_RUNTIME_FUNCTION, *PKM_RUNTIME_FUNCTION;
+
+C_ASSERT(sizeof(KM_RUNTIME_FUNCTION) == 0xC);
+
+/*
+ * Neither is in the SDK's kernel import library, so both are resolved at runtime
+ * through MmGetSystemRoutineAddress. Declared as function types, not as imports.
+ */
+typedef BOOLEAN (NTAPI* KM_PFN_ADD_FUNCTION_TABLE)(
+    _In_ PKM_RUNTIME_FUNCTION FunctionTable,
+    _In_ ULONG EntryCount,
+    _In_ ULONG_PTR BaseAddress);
+
+typedef BOOLEAN (NTAPI* KM_PFN_DELETE_FUNCTION_TABLE)(
+    _In_ PKM_RUNTIME_FUNCTION FunctionTable);
+
 NTKERNELAPI NTSTATUS NTAPI MmCopyVirtualMemory(
     _In_ PEPROCESS SourceProcess,
     _In_ PVOID SourceAddress,

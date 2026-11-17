@@ -119,6 +119,33 @@ static PVOID            g_DriverObject = NULL;
  * own: unload unlinks and frees it before the image goes. */
 static PVOID            g_ModuleEntry = NULL;
 
+/* The image's own registered exception table, or NULL. It points into the image, so
+ * it is deleted before the image is freed. */
+static PKM_RUNTIME_FUNCTION g_FunctionTable = NULL;
+
+/* Resolved once, on first use. Both are absent from the kernel import library. */
+static KM_PFN_ADD_FUNCTION_TABLE    g_RtlAddFunctionTable = NULL;
+static KM_PFN_DELETE_FUNCTION_TABLE g_RtlDeleteFunctionTable = NULL;
+
+static VOID KmResolveTableRoutines(VOID)
+{
+    UNICODE_STRING routine;
+
+    if (!g_RtlAddFunctionTable)
+    {
+        RtlInitUnicodeString(&routine, L"RtlAddFunctionTable");
+        g_RtlAddFunctionTable =
+            (KM_PFN_ADD_FUNCTION_TABLE)MmGetSystemRoutineAddress(&routine);
+    }
+
+    if (!g_RtlDeleteFunctionTable)
+    {
+        RtlInitUnicodeString(&routine, L"RtlDeleteFunctionTable");
+        g_RtlDeleteFunctionTable =
+            (KM_PFN_DELETE_FUNCTION_TABLE)MmGetSystemRoutineAddress(&routine);
+    }
+}
+
 /*
  * Shared block. The client allocates it and hands the user VA over in the init
  * block; it is locked here and mapped into system space, and a worker thread
@@ -2226,6 +2253,15 @@ static VOID KmUnload(PDRIVER_OBJECT driver)
             KmStopShared(b);
     }
 
+    /* The table points into the image, so it goes before the image is freed. */
+    if (g_FunctionTable)
+    {
+        if (g_RtlDeleteFunctionTable)
+            g_RtlDeleteFunctionTable(g_FunctionTable);
+
+        g_FunctionTable = NULL;
+    }
+
     if (g_ObRegistered && g_ObRegistration)
     {
         ObUnRegisterCallbacks(g_ObRegistration);
@@ -2279,6 +2315,8 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     KM_INIT_PARAMS* initParams = NULL;
     unsigned __int64 sharedUser = 0;
     ULONG sharedSize = 0;
+    ULONG exceptionRva = 0;
+    ULONG exceptionSize = 0;
 
     for (i = 0; i < KM_MAX_HIDDEN; ++i)
         RtlZeroMemory(&g_Hidden[i], sizeof(g_Hidden[i]));
@@ -2350,12 +2388,61 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
                 g_ImageBase = params->ImageBase;
                 g_ImageSize = params->ImageSize;
                 g_DriverObject = driver;
+
+                exceptionRva = params->ExceptionRva;
+                exceptionSize = params->ExceptionSize;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             g_ClientPid = 0;
         }
+    }
+
+    /*
+     * Register the image's own exception table, before any code below can take a
+     * fault. This is the difference between a survivable fault and a bugcheck: with
+     * no table registered, RtlLookupFunctionEntry finds nothing for a RIP inside a
+     * mapped image and every __try/__except in it escalates to 0x1E instead of being
+     * caught.
+     *
+     * Done here rather than from the loader because this side is already in kernel
+     * mode and links RtlAddFunctionTable directly - no pool copy, no export walk, no
+     * syscall trampoline to go wrong. The RVAs are relative to the base handed over,
+     * so the image base is that base and they are used as they sit.
+     *
+     * Non-fatal: a refused table costs the guards, not the load.
+     */
+    if (exceptionRva && exceptionSize >= sizeof(KM_RUNTIME_FUNCTION) &&
+        exceptionRva < g_ImageSize && exceptionSize <= g_ImageSize - exceptionRva)
+    {
+        KmResolveTableRoutines();
+
+        if (!g_RtlAddFunctionTable)
+        {
+            DbgPrint("kernmem: RtlAddFunctionTable unresolved - guarded faults will bugcheck\n");
+        }
+        else
+        {
+            g_FunctionTable = (PKM_RUNTIME_FUNCTION)(g_ImageBase + exceptionRva);
+
+            if (!g_RtlAddFunctionTable(g_FunctionTable,
+                                       exceptionSize / sizeof(KM_RUNTIME_FUNCTION),
+                                       (ULONG_PTR)g_ImageBase))
+            {
+                g_FunctionTable = NULL;
+                DbgPrint("kernmem: exception table refused - guarded faults will bugcheck\n");
+            }
+            else
+            {
+                DbgPrint("kernmem: %lu exception entries registered\n",
+                         exceptionSize / sizeof(KM_RUNTIME_FUNCTION));
+            }
+        }
+    }
+    else if (initParams)
+    {
+        DbgPrint("kernmem: no exception directory handed over - guarded faults will bugcheck\n");
     }
 
     /*
@@ -2460,6 +2547,14 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         {
             IoDeleteDevice(g_DeviceObject);
             g_DeviceObject = NULL;
+        }
+
+        if (g_FunctionTable)
+        {
+            if (g_RtlDeleteFunctionTable)
+                g_RtlDeleteFunctionTable(g_FunctionTable);
+
+            g_FunctionTable = NULL;
         }
 
         return status;
