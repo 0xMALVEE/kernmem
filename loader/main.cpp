@@ -44,6 +44,26 @@ namespace
 {
     HANDLE g_device = INVALID_HANDLE_VALUE;
 
+    /*
+     * The disguise gets its own frame because __try cannot appear in a function that
+     * needs object unwinding (C2712), and the load path is full of std::wstring
+     * locals. Nothing here unwinds, so the SEH compiles - and a bad list link then
+     * costs the disguise instead of bugchecking the machine mid-load.
+     */
+    bool DisguiseGuarded(const std::wstring& path)
+    {
+        __try
+        {
+            trace::DisguiseLoadedModule(path);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            km_log::Warn("disguise faulted (0x%08X)", GetExceptionCode());
+            return false;
+        }
+    }
+
     std::wstring StatePath()
     {
         const std::wstring temp = nt::GetFullTempPath();
@@ -477,7 +497,7 @@ namespace
          * path so the %TEMP% origin stops showing while the driver runs. Cosmetic, so
          * a failure only costs the disguise.
          */
-        trace::DisguiseLoadedModule(nal::DriverPath());
+        DisguiseGuarded(nal::DriverPath());
 
         if (clientPid)
             km_log::Good("client pid %u registered", clientPid);

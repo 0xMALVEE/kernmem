@@ -58,6 +58,17 @@ namespace
 
     bool KernelRange(uint64_t address, uint64_t size)
     {
+        /*
+         * Canonical first. Bits 63:47 must all match bit 47 or the address cannot
+         * be dereferenced at all - 0xffffff79806408c4 clears a naive lower-bound
+         * test but faults on access, and that was bugcheck 0x3B in the loader with
+         * no SEH behind it.
+         */
+        const uint64_t high = address >> 47;
+
+        if (high != 0 && high != 0x1FFFF)
+            return false;
+
         return address >= 0xFFFF800000000000ULL &&
                address + size > address &&
                address + size <= 0xFFFFFFFFFFFFFFFFULL;
@@ -744,6 +755,15 @@ namespace trace
             const uint64_t entry = head;
             uint64_t dllBase = 0;
             std::wstring name;
+
+            /* The cursor comes out of the list, so it is only as trustworthy as the
+             * entry that produced it. */
+            if (!KernelRange(entry, 0x60))
+            {
+                km_log::Warn("disguise: entry 0x%llX is not a kernel range",
+                             (unsigned long long)entry);
+                return false;
+            }
 
             if (!nal::ReadMemory(entry + kLdrNext, &head, sizeof(head)))
             {

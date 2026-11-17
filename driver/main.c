@@ -188,6 +188,7 @@ static PEPROCESS KmReferenceProcess(ULONG pid);
 static BOOLEAN KmAddressCopyable(ULONG_PTR address, ULONG size);
 static NTSTATUS KmCopyFromProcess(PEPROCESS proc, void* remote, void* local, SIZE_T size);
 static VOID KmStopShared(ULONG index);
+static BOOLEAN KmUserPointer(unsigned __int64 p);
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -949,8 +950,19 @@ static NTSTATUS KmWalkModules(ULONG pid, KM_MODULE_LIST* list, ULONG capacity)
     KeStackAttachProcess(proc, &apc);
     __try
     {
+        /*
+         * The PEB belongs to the target process and is only valid while it lives.
+         * A process that is tearing down (cs2.exe closing) yields a PEB whose pages
+         * are already going, so the pointer is checked before it is dereferenced -
+         * the SEH below is the backstop, not the guard.
+         */
         peb = (KM_PEB*)PsGetProcessPeb(proc);
-        if (!peb || !peb->Ldr)
+
+        if (!peb || !KmUserPointer((unsigned __int64)peb))
+        {
+            status = STATUS_NOT_FOUND;
+        }
+        else if (!peb->Ldr || !MmIsAddressValid(peb->Ldr))
         {
             status = STATUS_NOT_FOUND;
         }
@@ -967,12 +979,23 @@ static NTSTATUS KmWalkModules(ULONG pid, KM_MODULE_LIST* list, ULONG capacity)
                     break;
                 }
 
+                /* Every cursor comes out of the target's own list, so it is only as
+                 * trustworthy as the entry before it. One bad link in a process that
+                 * is tearing down otherwise faults the whole walk. */
+                if (!KmUserPointer((unsigned __int64)cursor) ||
+                    !KmUserPointer((unsigned __int64)cursor->Flink))
+                {
+                    truncated = TRUE;
+                    break;
+                }
+
                 list->Entries[count].Base = (unsigned __int64)entry->DllBase;
                 list->Entries[count].SizeOfImage = entry->SizeOfImage;
                 list->Entries[count].Pad = 0;
                 list->Entries[count].Name[0] = 0;
 
-                if (entry->BaseDllName.Buffer && entry->BaseDllName.Length)
+                if (entry->BaseDllName.Buffer && entry->BaseDllName.Length &&
+                    KmUserPointer((unsigned __int64)entry->BaseDllName.Buffer))
                 {
                     ULONG chars = entry->BaseDllName.Length / sizeof(WCHAR);
                     if (chars >= KM_MAX_NAME_CHARS)
@@ -2465,6 +2488,23 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     RtlInitUnicodeString(&driver->DriverName, g_DriverName);
 
     /*
+     * Published here, early, before anything below can take a fault.
+     *
+     * This is what makes the __try blocks in this image work at all. The unwinder
+     * finds an image's .pdata by looking its RIP up in PsLoadedModuleList; an
+     * unregistered mapping therefore has no unwind data, so RtlLookupFunctionEntry
+     * returns NULL and a guarded fault escalates to 0x1E instead of being caught.
+     *
+     * Registering through RtlAddFunctionTable was supposed to cover that, but
+     * ntoskrnl does not export it on this build, so MmGetSystemRoutineAddress
+     * returns NULL every time and the table never registers. Listing the image is
+     * the route that does not depend on that export. Name and base are final by
+     * this point, which is all the entry needs.
+     */
+    if (!NT_SUCCESS(KmPublishModuleEntry()))
+        DbgPrint("kernmem: could not publish module entry\n");
+
+    /*
      * A name left owned by a dead image must not fail the load. Suffix and retry
      * (base, base_1, base_2 ...), and on success report the name actually used
      * back through the init block - the loader opens whatever comes back, so a
@@ -2592,26 +2632,10 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
                            g_DeviceName, KM_MAX_DEVICE_CHARS - 1);
 
     /*
-     * Last, once the image base, size and name are all final. A failing publish
-     * is not fatal either: everything else about the driver works without it, it
-     * just stays invisible to module enumeration.
+     * The entry is already published above. This registers the object callback,
+     * which walks the process object type chain by hand, so it stays guarded and
+     * non-fatal - the driver works without it.
      */
-    /*
-     * Both of these walk kernel structures by hand from inside an image the
-     * kernel knows nothing about, so a raised fault here would bugcheck the whole
-     * machine on an otherwise good load. Guarded, and non-fatal either way: the
-     * driver works without the entry and without the callback.
-     */
-    __try
-    {
-        if (!NT_SUCCESS(KmPublishModuleEntry()))
-            DbgPrint("kernmem: could not publish module entry\n");
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        DbgPrint("kernmem: publish faulted\n");
-    }
-
     __try
     {
         KmRegisterObjectCallback();
