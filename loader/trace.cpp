@@ -170,7 +170,12 @@ namespace
     bool ReadUnicodeName(uint64_t address, std::wstring* out)
     {
         uint8_t descriptor[0x10] = { 0 };
-        if (!nal::ReadMemory(address, descriptor, sizeof(descriptor)))
+
+        /* Mapped, not merely canonical. The descriptor read itself faults inside the
+         * host's own memcpy if the address is canonical but empty, and user-mode SEH
+         * cannot reach a fault taken there. */
+        if (!Mapped(address, sizeof(descriptor)) ||
+            !nal::ReadMemory(address, descriptor, sizeof(descriptor)))
             return false;
 
         const uint16_t length = *(uint16_t*)(descriptor + 0x00);
@@ -180,7 +185,14 @@ namespace
         if (!length || length > 0x200 || length > maximum || (length & 1))
             return false;
 
-        if (!KernelRange(buffer, length))
+        /*
+         * The buffer is the field that actually killed the machine twice. A record
+         * whose Length looked plausible carried Buffer = 0xffffffff8000002c: canonical,
+         * so the old KernelRange test passed it, and the 0x28-byte copy from it faulted
+         * 0x50 inside the host driver. Nothing is behind it, so ask whether it is
+         * mapped rather than whether it is canonical.
+         */
+        if (!Mapped(buffer, length))
             return false;
 
         wchar_t text[0x101] = { 0 };
@@ -617,7 +629,7 @@ namespace trace
         uint32_t visited = 0;
         int unlinked = 0;
 
-        if (root && KernelRange(root, 0x20))
+        if (root && Mapped(root, 0x20))
             stack[depth++] = root;
 
         while (depth && visited < kMaxNodes)
@@ -625,7 +637,7 @@ namespace trace
             const uint64_t node = stack[--depth];
             ++visited;
 
-            if (!KernelRange(node, 0x20) || !Aligned(node))
+            if (!Mapped(node, 0x20) || !Aligned(node))
                 continue;
 
             const uint64_t entry = node - kEntryFromNode;
@@ -774,7 +786,7 @@ namespace trace
         if (!nal::ReadMemory(list, &entry, sizeof(entry)))
             entry = 0;
 
-        for (uint32_t guard = 0; entry && KernelRange(entry, kHashEntrySize) && guard < kMaxNodes;
+        for (uint32_t guard = 0; entry && Mapped(entry, kHashEntrySize) && guard < kMaxNodes;
              ++guard)
         {
             uint64_t next = 0;
