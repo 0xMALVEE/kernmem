@@ -870,29 +870,26 @@ namespace nal
      * trail on its own - it names the file even after the file is gone - so the key
      * goes with it.
      */
-    void SweepOrphans(bool hostResident)
+    void SweepDirectory(const std::wstring& directory, bool hostResident, int* removed)
     {
-        const std::wstring temp = nt::GetFullTempPath();
-        if (temp.empty())
-            return;
-
-        /*
-         * Nothing is kept by name: every candidate is matched on its bytes instead,
-         * so an unrelated .sys in the directory is never touched. When the host is
-         * still resident the caller says so and the service is left loaded.
-         */
         WIN32_FIND_DATAW found = { 0 };
-        HANDLE search = FindFirstFileW((temp + L"*.sys").c_str(), &found);
+        HANDLE search = FindFirstFileW((directory + L"*.sys").c_str(), &found);
         if (search == INVALID_HANDLE_VALUE)
             return;
 
-        int removed = 0;
-
-        km_log::Step("sweeping %ls for stale driver images", temp.c_str());
+        km_log::Step("sweeping %ls for stale driver images", directory.c_str());
 
         do
         {
             if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+
+            /* The live host's own file cannot go while its section holds it open,
+             * and its key is already deleted - skipping keeps the log honest. */
+            const std::wstring candidate = directory + found.cFileName;
+
+            if (!g_driverPath.empty() &&
+                _wcsicmp(candidate.c_str(), g_driverPath.c_str()) == 0)
                 continue;
 
             /*
@@ -904,7 +901,7 @@ namespace nal
 
             if (found.nFileSizeLow == iqvw64e_sys_size || found.nFileSizeLow == km_sys_size)
             {
-                const std::wstring path = temp + found.cFileName;
+                const std::wstring path = directory + found.cFileName;
                 std::ifstream in(path, std::ios::binary);
 
                 if (in)
@@ -926,7 +923,7 @@ namespace nal
             if (!match)
                 continue;
 
-            const std::wstring path = temp + found.cFileName;
+            const std::wstring path = directory + found.cFileName;
 
             /* Key first: it names the file, so it is the stronger of the two trails
              * and the one to clear even if the file itself is somehow in use. */
@@ -944,11 +941,33 @@ namespace nal
                 continue;
             }
 
-            ++removed;
+            ++(*removed);
         }
         while (FindNextFileW(search, &found));
 
         FindClose(search);
+    }
+
+    /*
+     * Two directories, not one: %TEMP%, and System32\drivers where the live host is
+     * moved once it is up. A crash after the move leaves the image there, so
+     * sweeping only %TEMP% would miss exactly the case this exists for.
+     */
+    void SweepOrphans(bool hostResident)
+    {
+        int removed = 0;
+
+        const std::wstring temp = nt::GetFullTempPath();
+
+        if (!temp.empty())
+            SweepDirectory(temp, hostResident, &removed);
+
+        WCHAR windows[MAX_PATH] = { 0 };
+        const UINT windowsLength = GetWindowsDirectoryW(windows, MAX_PATH);
+
+        if (windowsLength && windowsLength < MAX_PATH)
+            SweepDirectory(std::wstring(windows) + L"\\System32\\drivers\\", hostResident,
+                           &removed);
 
         /*
          * The state records go too. They hold the service name, the %TEMP% path and
@@ -982,7 +1001,7 @@ namespace nal
         }
 
         if (removed)
-            km_log::Step("swept %d stale trail(s) out of %%TEMP%%", removed);
+            km_log::Step("swept %d stale trail(s)", removed);
     }
 
     /*
