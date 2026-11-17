@@ -49,6 +49,7 @@ typedef struct _KM_HIDDEN_ENTRY
     void* Entry;
     void* DllBase;
     void* HashBucket;   /* bucket head the entry was unlinked from, or NULL */
+    unsigned long NodeOffset;   /* LdrNode offset, found while the node was live */
 } KM_HIDDEN_ENTRY;
 
 /* Layout of an LDR_DATA_TABLE_ENTRY from the three list heads onward. */
@@ -79,6 +80,12 @@ static PVOID          g_ObRegistration = NULL;
 static BOOLEAN        g_ObRegistered = FALSE;
 static KSPIN_LOCK     g_HiddenLock;
 static volatile LONG  g_Unloading = 0;
+/* Handlers currently executing inside this image. The loader frees the image the
+ * moment DriverUnload returns, so unload has to drain this before letting go. */
+static volatile LONG  g_ActiveCalls = 0;
+static KEVENT         g_UnloadDrain;
+/* Serialises the shared-worker start/stop decision; see KmStartShared. */
+static KMUTEX         g_SharedLock;
 static KM_HIDDEN_ENTRY g_Hidden[KM_MAX_HIDDEN];
 
 /*
@@ -108,6 +115,44 @@ static unsigned __int64 g_ImageBase = 0;
 static unsigned __int64 g_ImageSize = 0;
 static PVOID            g_DriverObject = NULL;
 
+/*
+ * Shared block. The client allocates it and hands the user VA over in the init
+ * block; it is locked here and mapped into system space, and a worker thread
+ * services it. Reads then cost no IOCTL at all, so no syscall is patched while
+ * the game is running.
+ */
+/*
+ * Two blocks: 0 is the loader's, for kernel reads; 1 is the client's, for target
+ * reads. Separate so a client cannot see or overwrite the loader's slots.
+ */
+#define KM_BLOCK_COUNT  2
+#define KM_BLOCK_KERNEL 0
+#define KM_BLOCK_CLIENT 1
+
+typedef struct _KM_BLOCK_STATE
+{
+    PMDL       Mdl;
+    KM_SHARED* Map;
+    volatile LONG Running;   /* interlocked: two cleanups can race a start */
+    ULONG      OwnerPid;  /* process whose VA the pages are locked into; 0 if idle */
+    KMUTEX     Lock;   /* held by the worker while it services this block */
+} KM_BLOCK_STATE;
+
+static KM_BLOCK_STATE g_Blocks[KM_BLOCK_COUNT];
+static PETHREAD        g_SharedThread = NULL;
+static KEVENT          g_SharedStop;
+static BOOLEAN         g_SharedRunning = FALSE;
+
+/*
+ * Declared ahead of the shared helpers: those sit above the definitions of the
+ * copy helpers they use, and a manual-mapped image has no implicit declarations
+ * to fall back on.
+ */
+static PEPROCESS KmReferenceProcess(ULONG pid);
+static BOOLEAN KmAddressCopyable(ULONG_PTR address, ULONG size);
+static NTSTATUS KmCopyFromProcess(PEPROCESS proc, void* remote, void* local, SIZE_T size);
+static VOID KmStopShared(ULONG index);
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -118,6 +163,376 @@ static PVOID            g_DriverObject = NULL;
 static BOOLEAN KmLooksLikePointer(const void* p)
 {
     return ((ULONG_PTR)p > 0x10000);
+}
+
+/*
+ * Services one shared slot: copies the requested range from the target process
+ * into the shared Data buffer. Done is written last, and only ever to the Seq it
+ * serviced, so the client can spin on Seq == Done without a lock.
+ */
+static VOID KmSharedService(KM_BLOCK_STATE* block, KM_SHARED_REQ* req)
+{
+    PEPROCESS proc;
+    NTSTATUS status = STATUS_PARTIAL_COPY;
+    ULONG size = req->Size;
+
+    if (!block || !block->Map)
+    {
+        req->Status = (unsigned long)STATUS_INVALID_PARAMETER;
+        req->Done = req->Seq;
+        return;
+    }
+
+    if (!size || size > KM_SHARED_DATA || req->Offset >= KM_SHARED_DATA ||
+        size > KM_SHARED_DATA - req->Offset)
+    {
+        req->Status = (unsigned long)STATUS_BUFFER_TOO_SMALL;
+        req->Done = req->Seq;
+        return;
+    }
+
+    /*
+     * Pid 0 means a kernel address. Kernel VAs are valid in any context, so the
+     * range is copied directly instead of through a process.
+     */
+    if (!req->Pid)
+    {
+        __try
+        {
+            RtlCopyMemory(block->Map->Data + req->Offset, (void*)req->Address, size);
+            status = STATUS_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = STATUS_PARTIAL_COPY;
+        }
+
+        req->Status = (unsigned long)status;
+        req->Done = req->Seq;
+        return;
+    }
+
+    proc = KmReferenceProcess(req->Pid);
+
+    if (proc)
+    {
+        if (KmAddressCopyable((ULONG_PTR)req->Address, size))
+        {
+            __try
+            {
+                status = KmCopyFromProcess(proc, (void*)req->Address,
+                                           block->Map->Data + req->Offset, size);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                status = STATUS_PARTIAL_COPY;
+            }
+        }
+
+        ObDereferenceObject(proc);
+    }
+    else
+    {
+        status = STATUS_INVALID_PARAMETER;
+    }
+
+    req->Status = (unsigned long)status;
+    req->Done = req->Seq;
+}
+
+static VOID KmSharedWorker(PVOID context)
+{
+    UNREFERENCED_PARAMETER(context);
+
+    for (;;)
+    {
+        ULONG i;
+        LARGE_INTEGER tick;
+
+        /*
+         * Timed, and it has to be. g_SharedStop is a notification event that is
+         * never reset, so an untimed wait parked the worker right here until a stop
+         * and the service loop below was never reached - no slot was ever serviced.
+         * The 1 ms tick is also what paces the loop when idle, without a busy spin.
+         */
+        tick.QuadPart = -10000;
+
+        if (KeWaitForSingleObject(&g_SharedStop, Executive, KernelMode, FALSE, &tick) ==
+            STATUS_WAIT_0)
+            break;
+
+        for (i = 0; i < KM_BLOCK_COUNT; ++i)
+        {
+            KM_BLOCK_STATE* block = &g_Blocks[i];
+            ULONG slot;
+
+            if (!block->Running || !block->Map)
+                continue;
+
+            /*
+             * The stop path takes this same lock before it unmaps, so a slot can
+             * never be serviced against a mapping that is going away. The state is
+             * re-checked under the lock because it may have been torn down while we
+             * were waiting for it.
+             */
+            KeWaitForMutexObject(&block->Lock, Executive, KernelMode, FALSE, NULL);
+
+            if (block->Running && block->Map)
+            {
+                for (slot = 0; slot < KM_SHARED_SLOTS; ++slot)
+                {
+                    KM_SHARED_REQ* req = &block->Map->Reqs[slot];
+
+                    if (req->Seq == req->Done)
+                        continue;
+
+                    KmSharedService(block, req);
+                }
+            }
+
+            KeReleaseMutex(&block->Lock, FALSE);
+        }
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static BOOLEAN KmStartShared(ULONG index, unsigned __int64 user, ULONG size)
+{
+    KM_BLOCK_STATE* block;
+    OBJECT_ATTRIBUTES attributes;
+    HANDLE thread = NULL;
+    NTSTATUS status;
+    KM_SHARED* map;
+
+    if (index >= KM_BLOCK_COUNT || !user || size < sizeof(KM_SHARED))
+        return FALSE;
+
+    block = &g_Blocks[index];
+
+    /*
+     * A repeat registration with a different VA or size has to drop the old
+     * block first. Returning TRUE on a live slot leaves the old MDL locked
+     * against a VA nobody owns any more, and OwnerPid goes stale - which is the
+     * 0x76 path. Identical VA and size: nothing to do.
+     */
+    if (block->Running)
+    {
+        if (block->Mdl && MmGetMdlByteCount(block->Mdl) == size &&
+            (unsigned __int64)MmGetMdlVirtualAddress(block->Mdl) == user)
+        {
+            /* Same VA, but possibly a new owner: cleanup matches on the pid, so
+             * a stale one would leak this block past the process's exit. */
+            block->OwnerPid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+            return TRUE;
+        }
+
+        KmStopShared(index);
+    }
+
+    block->Mdl = IoAllocateMdl((PVOID)user, size, FALSE, FALSE, NULL);
+
+    if (!block->Mdl)
+        return FALSE;
+
+    __try
+    {
+        MmProbeAndLockPages(block->Mdl, UserMode, IoModifyAccess);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        IoFreeMdl(block->Mdl);
+        block->Mdl = NULL;
+        return FALSE;
+    }
+
+    map = (KM_SHARED*)MmMapLockedPagesSpecifyCache(block->Mdl, KernelMode, MmCached,
+                                                   NULL, FALSE, NormalPagePriority);
+
+    if (!map)
+    {
+        MmUnlockPages(block->Mdl);
+        IoFreeMdl(block->Mdl);
+        block->Mdl = NULL;
+        return FALSE;
+    }
+
+    block->Map = map;
+    KeInitializeMutex(&block->Lock, 0);
+
+    RtlZeroMemory(map, sizeof(KM_SHARED));
+    map->Slots = KM_SHARED_SLOTS;
+    map->DataSize = KM_SHARED_DATA;
+
+    /*
+     * Held from the decision until this block is marked Running. Without it a
+     * cleanup could stop the worker in the window where the thread exists but the
+     * block does not count as live yet, leaving a live block with no worker - and
+     * the stopping side then cleared g_SharedThread under the new thread.
+     */
+    KeWaitForMutexObject(&g_SharedLock, Executive, KernelMode, FALSE, NULL);
+
+    /*
+     * One worker serves every block, so it starts with the first and stops with the
+     * last. Starting it per block would leave threads behind on every re-register.
+     */
+    if (!g_SharedRunning)
+    {
+        KeInitializeEvent(&g_SharedStop, NotificationEvent, FALSE);
+        InitializeObjectAttributes(&attributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, &attributes, NULL, NULL,
+                                      KmSharedWorker, NULL);
+
+        if (!NT_SUCCESS(status))
+        {
+            MmUnmapLockedPages(map, block->Mdl);
+            MmUnlockPages(block->Mdl);
+            IoFreeMdl(block->Mdl);
+            block->Map = NULL;
+            block->Mdl = NULL;
+            KeReleaseMutex(&g_SharedLock, FALSE);
+            return FALSE;
+        }
+
+        /*
+         * KeWaitForSingleObject wants a dispatcher object pointer, not a handle.
+         * A handle is a sign-extended 32-bit value, so waiting on it dereferences
+         * 0xFFFFFFFF80004A88 and bugchecks 0x0A at DISPATCH_LEVEL (write, IRQL 2).
+         * Keep a referenced object and close the handle instead.
+         */
+        g_SharedThread = NULL;
+
+        status = ObReferenceObjectByHandle(thread, THREAD_ALL_ACCESS, NULL, KernelMode,
+                                           (PVOID*)&g_SharedThread, NULL);
+
+        if (!NT_SUCCESS(status))
+        {
+            /*
+             * The worker is already running and its code lives in this image, so
+             * it has to be gone before the map is dropped. A thread handle is not
+             * a dispatcher object, but ZwWaitForSingleObject takes the handle - so
+             * wait here, while the handle is still open.
+             */
+            KeSetEvent(&g_SharedStop, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(thread, FALSE, NULL);
+            ZwClose(thread);
+            g_SharedThread = NULL;
+
+            MmUnmapLockedPages(map, block->Mdl);
+            MmUnlockPages(block->Mdl);
+            IoFreeMdl(block->Mdl);
+            block->Map = NULL;
+            block->Mdl = NULL;
+            KeReleaseMutex(&g_SharedLock, FALSE);
+            return FALSE;
+        }
+
+        ZwClose(thread);
+
+        g_SharedRunning = TRUE;
+    }
+
+    /*
+     * The pages are locked against the calling process's address space, so that
+     * process is what the teardown paths have to match on. Recorded before
+     * Running goes up, so a cleanup racing this cannot see a live block with a
+     * stale owner.
+     */
+    block->OwnerPid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+
+    /* Ready last: a client waits on it before issuing anything. */
+    map->Magic = KM_SHARED_MAGIC;
+    InterlockedExchange(&block->Running, TRUE);
+    map->Ready = 1;
+
+    KeReleaseMutex(&g_SharedLock, FALSE);
+    return TRUE;
+}
+
+static VOID KmStopShared(ULONG index)
+{
+    KM_BLOCK_STATE* block;
+    ULONG i;
+    BOOLEAN remaining = FALSE;
+
+    if (index >= KM_BLOCK_COUNT)
+        return;
+
+    block = &g_Blocks[index];
+
+    /* Same lifecycle lock as the start side: the stop decision reads the other
+     * blocks and owns g_SharedThread. */
+    KeWaitForMutexObject(&g_SharedLock, Executive, KernelMode, FALSE, NULL);
+
+    /* Two cleanups can race here (two handles closing at once). Only the caller
+     * that actually clears the flag may tear the block down. */
+    if (InterlockedExchange(&block->Running, FALSE) == FALSE)
+    {
+        KeReleaseMutex(&g_SharedLock, FALSE);
+        return;
+    }
+
+    if (block->Map)
+        block->Map->Ready = 0;
+
+    for (i = 0; i < KM_BLOCK_COUNT; ++i)
+    {
+        if (g_Blocks[i].Running)
+            remaining = TRUE;
+    }
+
+    /* Last block out stops the shared worker, and waiting on it is what makes the
+     * unmap below safe. */
+    if (!remaining && g_SharedRunning)
+    {
+        g_SharedRunning = FALSE;
+        KeSetEvent(&g_SharedStop, IO_NO_INCREMENT, FALSE);
+
+        if (g_SharedThread)
+        {
+            KeWaitForSingleObject(g_SharedThread, Executive, KernelMode, FALSE, NULL);
+            ObDereferenceObject(g_SharedThread);
+            g_SharedThread = NULL;
+        }
+    }
+
+    /* Serialises against a worker that may still be servicing this block, which
+     * happens whenever another block keeps the thread alive. */
+    KeWaitForMutexObject(&block->Lock, Executive, KernelMode, FALSE, NULL);
+
+    if (block->Map)
+    {
+        MmUnmapLockedPages(block->Map, block->Mdl);
+        block->Map = NULL;
+    }
+
+    if (block->Mdl)
+    {
+        MmUnlockPages(block->Mdl);
+        IoFreeMdl(block->Mdl);
+        block->Mdl = NULL;
+    }
+
+    KeReleaseMutex(&block->Lock, FALSE);
+
+    /* No pages are owned any more, so a later cleanup must not match this slot. */
+    block->OwnerPid = 0;
+
+    KeReleaseMutex(&g_SharedLock, FALSE);
+}
+
+/*
+ * Used by the entry failure paths. Returning a failed DriverEntry lets the loader
+ * free this image, and the worker thread executes code inside it - so anything
+ * brought up has to be stopped here, not left to an unload that never runs.
+ */
+static VOID KmTeardownShared(VOID)
+{
+    ULONG i;
+
+    for (i = 0; i < KM_BLOCK_COUNT; ++i)
+        KmStopShared(i);
 }
 
 static PEPROCESS KmReferenceProcess(ULONG pid)
@@ -630,7 +1045,8 @@ static BOOLEAN KmFindLdrNodeOffset(KM_LDR_ENTRY* entry, unsigned __int64 base, U
  * and the shape stays legal enough for a walk, which is all a resolve needs. A
  * missing rebalance costs depth, not correctness.
  */
-static BOOLEAN KmUnlinkModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned __int64 base)
+static BOOLEAN KmUnlinkModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned __int64 base,
+                                   ULONG* offsetOut)
 {
     unsigned __int64 nodes[KM_RB_NODES];
     unsigned __int64 key = 0;
@@ -648,9 +1064,17 @@ static BOOLEAN KmUnlinkModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned _
     ULONG i;
     ULONG j;
 
+    if (offsetOut)
+        *offsetOut = 0;
+
     if (!ldrRaw || !entry)
         return FALSE;
 
+    /*
+     * Found here, while the node is still linked. Once it is out, its three link
+     * words are zero and KmFindLdrNodeOffset rejects it - so the offset is handed
+     * back and carried in the hidden record for the re-insert.
+     */
     if (!KmFindLdrNodeOffset(entry, base, &offset))
         return FALSE;
 
@@ -749,6 +1173,12 @@ static BOOLEAN KmUnlinkModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned _
                 (((unsigned __int64*)right)[KM_RB_PARENT / 8] & KM_RB_MASK);
         }
 
+        /*
+         * This write has to stay inside the branch. successor is uninitialised in
+         * the single-child path below, where left's parent has already been set
+         * from parentValue - so doing it unconditionally stamped garbage into
+         * left's parent, and faulted outright on a leaf, where left is NULL.
+         */
         ((unsigned __int64*)left)[KM_RB_PARENT / 8] =
             ((unsigned __int64)successor ^ key) |
             (((unsigned __int64*)left)[KM_RB_PARENT / 8] & KM_RB_MASK);
@@ -765,6 +1195,153 @@ static BOOLEAN KmUnlinkModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned _
     }
 
     *slot = child;
+
+    /* Leave no stale links behind: unhide overwrites them anyway, but until then a
+     * walker must not follow them out of the tree. */
+    node[KM_RB_LEFT / 8] = 0;
+    node[KM_RB_RIGHT / 8] = 0;
+    node[KM_RB_PARENT / 8] = 0;
+
+    if (offsetOut)
+        *offsetOut = offset;
+
+    return TRUE;
+}
+
+/*
+ * Puts the node back. The tree is walked by DllBase down to the slot the order
+ * calls for; no rebalancing, same as the unlink - a resolve only ever compares,
+ * so depth and colour are irrelevant. The key is recovered from a live
+ * parent/child pair as before, and the climb stops at the root because the root's
+ * parent is LdrpModuleIndexBase, which is not an LDR entry and so does not point
+ * back at it.
+ */
+static BOOLEAN KmInsertModuleIndex(void* ldrRaw, KM_LDR_ENTRY* entry, unsigned __int64 base,
+                                   ULONG offset)
+{
+    unsigned __int64 nodes[KM_RB_NODES];
+    unsigned __int64 key = 0;
+    unsigned __int64* node;
+    unsigned __int64* cursor;
+    unsigned __int64* parent = NULL;
+    unsigned __int64* slot = NULL;
+    unsigned __int64 parentValue;
+    unsigned __int64 next;
+    unsigned __int64 nodeBase;
+    LIST_ENTRY* head;
+    LIST_ENTRY* walk;
+    ULONG count = 0;
+    ULONG side;
+    ULONG steps;
+    ULONG i;
+    ULONG j;
+
+    if (!ldrRaw || !entry)
+        return FALSE;
+
+    /*
+     * The recorded offset is preferred: the node is detached by now and the probe
+     * rejects a node whose links are all zero. The probe is only a fallback for a
+     * hide whose unlink never ran, in which case the node is still linked.
+     */
+    if (!offset && !KmFindLdrNodeOffset(entry, base, &offset))
+        return FALSE;
+
+    node = (unsigned __int64*)((PUCHAR)entry + offset);
+
+    head = (LIST_ENTRY*)((PUCHAR)ldrRaw + 0x20);
+
+    for (walk = head->Flink; walk != head && count < KM_RB_NODES; walk = walk->Flink)
+    {
+        KM_LDR_ENTRY* other = CONTAINING_RECORD(walk, KM_LDR_ENTRY, InMemoryOrderLinks);
+        unsigned __int64 candidate = (unsigned __int64)((PUCHAR)other + offset);
+
+        /*
+         * Unhide re-linked the entry before calling in here, so the head of the
+         * list now yields the detached node itself - carrying stale tree links.
+         * Using it for key recovery or as the climb start would read garbage, so
+         * only live nodes go in.
+         */
+        if (candidate == (unsigned __int64)node)
+            continue;
+
+        nodes[count++] = candidate;
+    }
+
+    if (!count)
+        return FALSE;
+
+    for (i = 0; i < count && !key; ++i)
+    {
+        unsigned __int64* candidate = (unsigned __int64*)nodes[i];
+
+        if (!candidate[KM_RB_PARENT / 8])
+            continue;
+
+        for (j = 0; j < count; ++j)
+        {
+            unsigned __int64* maybe = (unsigned __int64*)nodes[j];
+
+            if (maybe[KM_RB_LEFT / 8] == (unsigned __int64)candidate ||
+                maybe[KM_RB_RIGHT / 8] == (unsigned __int64)candidate)
+            {
+                key = (candidate[KM_RB_PARENT / 8] & ~KM_RB_MASK) ^ nodes[j];
+                break;
+            }
+        }
+    }
+
+    if (!key)
+        return FALSE;
+
+    cursor = (unsigned __int64*)nodes[0];
+
+    for (steps = 0; steps <= count; ++steps)
+    {
+        parentValue = cursor[KM_RB_PARENT / 8];
+        parent = (unsigned __int64*)((parentValue & ~KM_RB_MASK) ^ key);
+
+        if (!parent || parent == cursor || parent == node ||
+            !KmUserPointer((unsigned __int64)parent))
+            break;
+
+        if (parent[KM_RB_LEFT / 8] != (unsigned __int64)cursor &&
+            parent[KM_RB_RIGHT / 8] != (unsigned __int64)cursor)
+            break;
+
+        cursor = parent;
+    }
+
+    if (cursor == node)
+        return FALSE;
+
+    for (steps = 0; steps <= count; ++steps)
+    {
+        nodeBase = *(unsigned __int64*)((PUCHAR)cursor - offset + 0x30);
+        side = base < nodeBase ? 0 : 1;
+        next = cursor[side ? KM_RB_RIGHT / 8 : KM_RB_LEFT / 8];
+
+        if (next == (unsigned __int64)node)
+            next = 0;
+
+        if (!next || !KmUserPointer(next))
+        {
+            slot = (unsigned __int64*)cursor + (side ? KM_RB_RIGHT / 8 : KM_RB_LEFT / 8);
+            parent = cursor;
+            break;
+        }
+
+        cursor = (unsigned __int64*)next;
+    }
+
+    if (!slot)
+        return FALSE;
+
+    node[KM_RB_LEFT / 8] = 0;
+    node[KM_RB_RIGHT / 8] = 0;
+    node[KM_RB_PARENT / 8] = ((unsigned __int64)parent ^ key);
+    *slot = (unsigned __int64)node;
+
     return TRUE;
 }
 
@@ -781,6 +1358,9 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
     LIST_ENTRY* head;
     LIST_ENTRY* cursor;
     LIST_ENTRY* bucket = NULL;
+    KM_LDR_ENTRY* entry = NULL;
+    KM_LDR_ENTRY* recorded = NULL;
+    ULONG nodeOffset = 0;
 
     if (!base)
         return STATUS_INVALID_PARAMETER;
@@ -801,8 +1381,10 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
         {
             if (g_Hidden[i].Entry && g_Hidden[i].DllBase == (void*)base && g_Hidden[i].Pid == pid)
             {
-                /* Remembered bucket, so unhide can put the hash link back. */
+                /* Remembered bucket and entry, so unhide can put the links back. */
                 bucket = (LIST_ENTRY*)g_Hidden[i].HashBucket;
+                recorded = (KM_LDR_ENTRY*)g_Hidden[i].Entry;
+                nodeOffset = g_Hidden[i].NodeOffset;
                 known = TRUE;
                 break;
             }
@@ -826,12 +1408,29 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
         if (peb && peb->Ldr)
         {
             head = &peb->Ldr->InMemoryOrderModuleList;
-            for (cursor = head->Flink; cursor != head; cursor = cursor->Flink)
-            {
-                KM_LDR_ENTRY* entry = CONTAINING_RECORD(cursor, KM_LDR_ENTRY, InMemoryOrderLinks);
-                if ((unsigned __int64)entry->DllBase != base)
-                    continue;
 
+            /*
+             * Hiding takes the entry out of every list, so a walk over
+             * InMemoryOrderModuleList cannot find it again: unhide used to come
+             * back STATUS_NOT_FOUND on every call and the module stayed invisible
+             * for good. The entry pointer kept from the hide is the only way back
+             * in, so a known unhide resolves straight from the record. A recorded
+             * entry whose DllBase no longer matches (module reloaded at another
+             * base) falls back to the walk.
+             */
+            if (!hide && recorded && recorded->DllBase == (void*)base)
+                entry = recorded;
+
+            for (cursor = head->Flink; !entry && cursor != head; cursor = cursor->Flink)
+            {
+                KM_LDR_ENTRY* other = CONTAINING_RECORD(cursor, KM_LDR_ENTRY, InMemoryOrderLinks);
+
+                if ((unsigned __int64)other->DllBase == base)
+                    entry = other;
+            }
+
+            if (entry)
+            {
                 if (hide)
                 {
                     RemoveEntryList(&entry->InLoadOrderLinks);
@@ -860,8 +1459,9 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
                     }
 
                     /* And out of the by-name index tree, which is what a name
-                     * resolve walks. A failure leaves the entry in the index. */
-                    KmUnlinkModuleIndex(peb->Ldr, entry, base);
+                     * resolve walks. A failure leaves the entry in the index, and
+                     * the offset stays 0 for the re-insert. */
+                    KmUnlinkModuleIndex(peb->Ldr, entry, base, &nodeOffset);
                 }
                 else
                 {
@@ -876,10 +1476,13 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
                      * the link is not already live. */
                     if (bucket && entry->HashLinks.Flink == &entry->HashLinks)
                         InsertHeadList(bucket, &entry->HashLinks);
+
+                    /* And back into the by-name index. A failure here only costs
+                     * name resolves - the entry is already live in the lists. */
+                    KmInsertModuleIndex(peb->Ldr, entry, base, nodeOffset);
                 }
 
                 status = STATUS_SUCCESS;
-                break;
             }
         }
     }
@@ -904,8 +1507,9 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
                 {
                     g_Hidden[i].Pid = pid;
                     g_Hidden[i].DllBase = (void*)base;
-                    g_Hidden[i].Entry = (void*)base;
+                    g_Hidden[i].Entry = (void*)entry;   /* the entry, not the base */
                     g_Hidden[i].HashBucket = (void*)bucket;
+                    g_Hidden[i].NodeOffset = nodeOffset;
                     break;
                 }
             }
@@ -919,6 +1523,7 @@ static NTSTATUS KmSetModuleHidden(ULONG pid, unsigned __int64 base, BOOLEAN hide
                     g_Hidden[i].Entry = NULL;
                     g_Hidden[i].DllBase = NULL;
                     g_Hidden[i].HashBucket = NULL;
+                    g_Hidden[i].NodeOffset = 0;
                     g_Hidden[i].Pid = 0;
                     break;
                 }
@@ -1138,10 +1743,18 @@ static NTSTATUS KmDispatch(PDEVICE_OBJECT device, PIRP irp)
 
     UNREFERENCED_PARAMETER(device);
 
-    /* The loader unmaps and frees this image right after DriverUnload returns;
-     * an IRP arriving after that would dispatch into freed pool. */
+    /*
+     * Counted before the check: a handler that is only just starting must not be
+     * missed by an unload that flips the flag in between. The loader unmaps and
+     * frees this image the moment DriverUnload returns, so a handler still running
+     * then would dispatch into freed pool.
+     */
+    InterlockedIncrement(&g_ActiveCalls);
+
     if (InterlockedCompareExchange(&g_Unloading, 1, 1) != 0)
     {
+        InterlockedDecrement(&g_ActiveCalls);
+        KeSetEvent(&g_UnloadDrain, IO_NO_INCREMENT, FALSE);
         irp->IoStatus.Status = STATUS_DELETE_PENDING;
         irp->IoStatus.Information = 0;
         IoCompleteRequest(irp, IO_NO_INCREMENT);
@@ -1297,16 +1910,88 @@ static NTSTATUS KmDispatch(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_BUFFER_TOO_SMALL;
         }
     }
+    else if (code == IOCTL_KM_SET_CLIENT_BLOCK)
+    {
+        /*
+         * A client hands its own block over here, once. The client index is fixed:
+         * the loader's block is not addressable from user mode, so one process
+         * cannot displace the loader's kernel read path. A zero User is a request to
+         * drop the block again, which is what the client does on close.
+         */
+        if (inLen >= sizeof(KM_BLOCK_REQ))
+        {
+            const KM_BLOCK_REQ* req = (const KM_BLOCK_REQ*)in;
+
+            if (!req->User || !req->Size)
+            {
+                KmStopShared(KM_BLOCK_CLIENT);
+                status = STATUS_SUCCESS;
+            }
+            else if (KmStartShared(KM_BLOCK_CLIENT, req->User, req->Size))
+            {
+                status = STATUS_SUCCESS;
+            }
+            else
+            {
+                status = STATUS_INVALID_PARAMETER;
+            }
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+    }
 
     irp->IoStatus.Status = status;
     irp->IoStatus.Information = written;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
+
+    /* Released only now: the completion above still executes code in this image. */
+    if (InterlockedDecrement(&g_ActiveCalls) == 0 &&
+        InterlockedCompareExchange(&g_Unloading, 1, 1) != 0)
+        KeSetEvent(&g_UnloadDrain, IO_NO_INCREMENT, FALSE);
+
     return status;
 }
 
 static NTSTATUS KmCreateClose(PDEVICE_OBJECT device, PIRP irp)
 {
     UNREFERENCED_PARAMETER(device);
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * IRP_MJ_CLEANUP is the only warning we get that a process is going away, and it
+ * arrives before its address space is torn down - the last moment an MDL locked
+ * into that process can still be released.
+ *
+ * Without this, a client that exits without deregistering (a crash, a kill, or a
+ * loader that detaches and leaves the host resident on purpose) leaves its block's
+ * pages locked against a dead process, and reaping it bugchecks
+ * 0x76 PROCESS_HAS_LOCKED_PAGES. That is exactly the 0x21 = 33 page crash: 33
+ * pages is sizeof(KM_SHARED).
+ *
+ * Only blocks owned by the closing process are dropped. One process closing a
+ * handle must never pull another process's block out from under it, and the
+ * loader's kernel block is registered from the loader's own context, so it is
+ * matched only by the loader's own exit.
+ */
+static NTSTATUS KmCleanup(PDEVICE_OBJECT device, PIRP irp)
+{
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    ULONG b;
+
+    UNREFERENCED_PARAMETER(device);
+
+    for (b = 0; b < KM_BLOCK_COUNT; ++b)
+    {
+        if (g_Blocks[b].Running && g_Blocks[b].OwnerPid == pid)
+            KmStopShared(b);
+    }
+
     irp->IoStatus.Status = STATUS_SUCCESS;
     irp->IoStatus.Information = 0;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
@@ -1334,7 +2019,40 @@ static NTSTATUS KmDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
 
 static VOID KmUnload(PDRIVER_OBJECT driver)
 {
+    LARGE_INTEGER timeout;
+    ULONG i;
+
     InterlockedExchange(&g_Unloading, 1);
+
+    /*
+     * Handlers already inside this image have to be out before it is freed, and
+     * the loader frees it the moment this returns.
+     *
+     * The first wait is unconditional. A handler can increment in the window
+     * between the flag going up and a count read, so a zero read is not proof
+     * that none is running - but that handler will drop the event when it leaves,
+     * and the settle wait catches it. The iteration cap is a backstop so a wedged
+     * handler cannot keep the machine from unloading forever.
+     */
+    timeout.QuadPart = -1000000;   /* relative, 100ns units: 100 ms per pass */
+
+    for (i = 0; i < 5; ++i)
+    {
+        KeWaitForSingleObject(&g_UnloadDrain, Executive, KernelMode, FALSE, &timeout);
+
+        if (InterlockedCompareExchange(&g_ActiveCalls, 0, 0) == 0)
+            break;
+    }
+
+    /* Stop the worker before anything it touches is released, then drop every
+     * block. The last one stops the shared thread and waits for it, so the unmaps
+     * below cannot race a slot that is still being serviced. */
+    {
+        ULONG b;
+
+        for (b = 0; b < KM_BLOCK_COUNT; ++b)
+            KmStopShared(b);
+    }
 
     if (g_ObRegistered && g_ObRegistration)
     {
@@ -1359,15 +2077,35 @@ static VOID KmUnload(PDRIVER_OBJECT driver)
 /* entry                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A run that never reached DriverUnload leaves its DEVICE_OBJECT and its
+ * \DosDevices link behind. The object lives in pool, so it outlives the freed
+ * image: the name stays owned while the device itself is unreachable - which is
+ * why a later load both fails to open it and then fails to create it.
+ */
+#ifndef STATUS_OBJECT_NAME_COLLISION
+#define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
+#endif
+#ifndef STATUS_OBJECT_NAME_EXISTS
+#define STATUS_OBJECT_NAME_EXISTS ((NTSTATUS)0xC0000034L)
+#endif
+
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPath)
 {
     UNICODE_STRING deviceName;
     NTSTATUS status;
     ULONG i;
+    ULONG attempt;
+    WCHAR baseName[KM_MAX_DEVICE_CHARS];
+    KM_INIT_PARAMS* initParams = NULL;
+    unsigned __int64 sharedUser = 0;
+    ULONG sharedSize = 0;
 
     for (i = 0; i < KM_MAX_HIDDEN; ++i)
         RtlZeroMemory(&g_Hidden[i], sizeof(g_Hidden[i]));
     KeInitializeSpinLock(&g_HiddenLock);
+    KeInitializeEvent(&g_UnloadDrain, NotificationEvent, FALSE);
+    KeInitializeMutex(&g_SharedLock, 0);
 
     driver->DriverUnload = KmUnload;
 
@@ -1376,7 +2114,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         driver->MajorFunction[i] = KmDefaultDispatch;
 
     driver->MajorFunction[IRP_MJ_CREATE] = KmCreateClose;
-    driver->MajorFunction[IRP_MJ_CLEANUP] = KmCreateClose;
+    driver->MajorFunction[IRP_MJ_CLEANUP] = KmCleanup;
     driver->MajorFunction[IRP_MJ_CLOSE] = KmCreateClose;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = KmDispatch;
 
@@ -1409,6 +2147,8 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
             KM_INIT_PARAMS* params = (KM_INIT_PARAMS*)registryPath;
             if (params->Magic == KM_INIT_MAGIC)
             {
+                initParams = params;
+
                 if (params->ClientPid)
                     g_ClientPid = params->ClientPid;
 
@@ -1421,6 +2161,9 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
 
                 if (params->PoolTag)
                     g_PoolTag = params->PoolTag;
+
+                sharedUser = params->SharedUser;
+                sharedSize = params->SharedSize;
 
                 driver->DriverStart = (void*)params->ImageBase;
                 driver->DriverSize = (ULONG)params->ImageSize;
@@ -1436,6 +2179,12 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         }
     }
 
+    /* The shared block is optional - without it every read stays on IOCTL. */
+    if (sharedUser && KmStartShared(KM_BLOCK_KERNEL, sharedUser, sharedSize))
+        DbgPrint("kernmem: shared block up, reads need no IOCTL\n");
+    else if (sharedUser)
+        DbgPrint("kernmem: shared block failed, reads stay on IOCTL\n");
+
     /*
      * Resolve the identity. An empty name means a service load or an old loader,
      * so the historical static namespace stays as the fallback.
@@ -1444,8 +2193,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         RtlStringCchCopyNW(g_DeviceName, RTL_NUMBER_OF(g_DeviceName),
                            L"Kernmem", KM_MAX_DEVICE_CHARS - 1);
 
-    /* Derive the device type from the name: one less constant to signature on. */
-    g_DeviceType = KmDeviceTypeFor(g_DeviceName);
+    RtlStringCchCopyW(baseName, RTL_NUMBER_OF(baseName), g_DeviceName);
 
     /* A real driver always carries a DriverName. An unnamed driver object that
      * owns a named device is one of the cheapest mismatches to spot. */
@@ -1453,34 +2201,95 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
      * __stdio_common_vswprintf from the UCRT, and this image links only
      * ntoskrnl/BufferOverflowK/wdm. */
     RtlStringCchCopyW(g_DriverName, RTL_NUMBER_OF(g_DriverName), L"\\Driver\\");
+    RtlStringCchCatW(g_DriverName, RTL_NUMBER_OF(g_DriverName), baseName);
+    RtlInitUnicodeString(&driver->DriverName, g_DriverName);
+
+    /*
+     * A name left owned by a dead image must not fail the load. Suffix and retry
+     * (base, base_1, base_2 ...), and on success report the name actually used
+     * back through the init block - the loader opens whatever comes back, so a
+     * suffixed name is not a problem for it. Only a collision retries; any other
+     * failure is final.
+     */
+    status = STATUS_OBJECT_NAME_COLLISION;
+
+    for (attempt = 0; attempt < 16; ++attempt)
+    {
+        if (attempt)
+        {
+            WCHAR suffix[4];
+
+            suffix[0] = L'_';
+            suffix[1] = (WCHAR)(attempt < 10 ? (L'0' + attempt) : (L'a' + attempt - 10));
+            suffix[2] = 0;
+            suffix[3] = 0;
+
+            RtlStringCchCopyW(g_DeviceName, RTL_NUMBER_OF(g_DeviceName), baseName);
+            RtlStringCchCatW(g_DeviceName, RTL_NUMBER_OF(g_DeviceName), suffix);
+        }
+
+        /* Per attempt, from the name in hand. The client derives the IOCTL type
+         * from the name it is told was used, so a suffixed name has to yield the
+         * same type on both sides. */
+        g_DeviceType = KmDeviceTypeFor(g_DeviceName);
+
+        RtlStringCchCopyW(g_DevicePath, RTL_NUMBER_OF(g_DevicePath), L"\\Device\\");
+        RtlStringCchCatW(g_DevicePath, RTL_NUMBER_OF(g_DevicePath), g_DeviceName);
+        RtlInitUnicodeString(&deviceName, g_DevicePath);
+
+        RtlStringCchCopyW(g_SymlinkName, RTL_NUMBER_OF(g_SymlinkName), L"\\DosDevices\\");
+        RtlStringCchCatW(g_SymlinkName, RTL_NUMBER_OF(g_SymlinkName), g_DeviceName);
+        RtlInitUnicodeString(&g_Symlink, g_SymlinkName);
+
+        g_DeviceObject = NULL;
+        status = IoCreateDevice(driver, 0, &deviceName, g_DeviceType,
+                                FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
+
+        if (!NT_SUCCESS(status))
+        {
+            if (status == STATUS_OBJECT_NAME_COLLISION || status == STATUS_OBJECT_NAME_EXISTS)
+                continue;
+
+            break;
+        }
+
+        g_DeviceObject->Flags |= DO_BUFFERED_IO;
+        /* Cleared automatically only for devices created inside a real
+         * DriverEntry. Under IoCreateDriver it is not, and an initialising device
+         * cannot be opened. */
+        g_DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+
+        status = IoCreateSymbolicLink(&g_Symlink, &deviceName);
+
+        if (NT_SUCCESS(status))
+            break;
+
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
+
+        if (status != STATUS_OBJECT_NAME_COLLISION && status != STATUS_OBJECT_NAME_EXISTS)
+            break;
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        KmTeardownShared();
+        return status;
+    }
+
+    /* The driver object name has to follow the device name actually used, or an
+     * unnamed-looking driver owns a named device. */
+    RtlStringCchCopyW(g_DriverName, RTL_NUMBER_OF(g_DriverName), L"\\Driver\\");
     RtlStringCchCatW(g_DriverName, RTL_NUMBER_OF(g_DriverName), g_DeviceName);
     RtlInitUnicodeString(&driver->DriverName, g_DriverName);
 
-    RtlStringCchCopyW(g_DevicePath, RTL_NUMBER_OF(g_DevicePath), L"\\Device\\");
-    RtlStringCchCatW(g_DevicePath, RTL_NUMBER_OF(g_DevicePath), g_DeviceName);
-    RtlInitUnicodeString(&deviceName, g_DevicePath);
+    if (attempt)
+        DbgPrint("kernmem: device name taken, using %ws\n", g_DeviceName);
 
-    RtlStringCchCopyW(g_SymlinkName, RTL_NUMBER_OF(g_SymlinkName), L"\\DosDevices\\");
-    RtlStringCchCatW(g_SymlinkName, RTL_NUMBER_OF(g_SymlinkName), g_DeviceName);
-    RtlInitUnicodeString(&g_Symlink, g_SymlinkName);
-
-    status = IoCreateDevice(driver, 0, &deviceName, g_DeviceType, FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
-    if (!NT_SUCCESS(status))
-        return status;
-
-    g_DeviceObject->Flags |= DO_BUFFERED_IO;
-    /* Cleared automatically only for devices created inside a real DriverEntry.
-     * Under IoCreateDriver it is not, and an initialising device cannot be
-     * opened. */
-    g_DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
-
-    status = IoCreateSymbolicLink(&g_Symlink, &deviceName);
-    if (!NT_SUCCESS(status))
-    {
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
-    }
+    /* Tell the loader which name was actually created. */
+    if (initParams)
+        RtlStringCchCopyNW(initParams->DeviceName, KM_MAX_DEVICE_CHARS,
+                           g_DeviceName, KM_MAX_DEVICE_CHARS - 1);
 
     /* A failing object callback is not fatal: attach-based R/W still works. */
     KmRegisterObjectCallback();

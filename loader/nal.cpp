@@ -96,6 +96,14 @@ namespace
     /* True only when this session registered the host service itself. */
     bool g_ownedService = false;
 
+    /*
+     * Shared block. Allocated here, locked and serviced by the driver. While it is
+     * up, kernel reads cost no IOCTL - and so no syscall stays patched while the
+     * game runs.
+     */
+    KM_SHARED*      g_shared = nullptr;
+    volatile LONG   g_sharedSlot = 0;
+
     std::wstring RandomServiceName()
     {
         static const char alphanum[] =
@@ -133,6 +141,132 @@ namespace
         return std::wstring(buffer, buffer + len);
     }
 
+}
+
+namespace nal
+{
+    bool CreateShared()
+    {
+        if (g_shared)
+            return true;
+
+        void* block = VirtualAlloc(nullptr, sizeof(KM_SHARED), MEM_COMMIT | MEM_RESERVE,
+                                   PAGE_READWRITE);
+
+        if (!block)
+        {
+            km_log::Warn("shared block allocation failed - reads stay on IOCTL");
+            return false;
+        }
+
+        ZeroMemory(block, sizeof(KM_SHARED));
+        g_shared = reinterpret_cast<KM_SHARED*>(block);
+
+        return true;
+    }
+
+    uint64_t SharedUser()
+    {
+        return reinterpret_cast<uint64_t>(g_shared);
+    }
+
+    uint32_t SharedSize()
+    {
+        return g_shared ? (uint32_t)sizeof(KM_SHARED) : 0;
+    }
+
+    /*
+     * Makes the driver drop every shared block this process owns.
+     *
+     * The block handed over at map time is the driver's kernel block, and there is
+     * no IOCTL that releases it - only IRP_MJ_CLEANUP does, and that is sent when
+     * the last handle to a file object is closed. Each CreateFileW makes a new
+     * file object, so a throwaway open/close is enough.
+     *
+     * Without this the driver keeps sizeof(KM_SHARED) pages locked into this
+     * process after the VA is freed, and reaping the process bugchecks
+     * 0x76 PROCESS_HAS_LOCKED_PAGES. Arg3 0x21 is exactly those 33 pages.
+     */
+    bool ReleaseDriverBlock()
+    {
+        /*
+         * Magic is only written by the driver at registration, so it tells us
+         * whether any pages are actually locked into this process. Verbs that
+         * never mapped (attach, status, a failed load before the handoff) leave it
+         * zero, and there is nothing to wait for - freeing the VA is safe.
+         */
+        if (!g_shared || g_shared->Magic != KM_SHARED_MAGIC)
+            return true;
+
+        std::vector<std::wstring> paths = DevicePaths();
+
+        /*
+         * The cleanup handler runs from the close, but not synchronously with it,
+         * so the block is polled until the driver has actually marked it dropped.
+         * Ready lives in the mapped block itself, which stays readable until the
+         * VA is freed.
+         */
+        for (int attempt = 0; attempt < 25; ++attempt)
+        {
+            for (size_t i = 0; i < paths.size(); ++i)
+            {
+                HANDLE probe = CreateFileW(paths[i].c_str(), FILE_ANY_ACCESS,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+                if (probe == INVALID_HANDLE_VALUE)
+                    continue;
+
+                CloseHandle(probe);
+
+                if (g_shared && g_shared->Ready == 0)
+                    return true;
+
+                break;
+            }
+
+            Sleep(10);
+        }
+
+        return false;
+    }
+
+    void DestroyShared()
+    {
+        if (!g_shared)
+            return;
+
+        /*
+         * The pages have to be released before the VA goes away, never after. If
+         * the driver cannot be reached the VA is leaked on purpose - freeing it
+         * while the MDL is still locked is exactly the 0x76 (33 pages = this
+         * block) when the process then exits.
+         *
+         * IRP_MJ_CLEANUP only arrives when the LAST handle to the device closes,
+         * so our own control handle has to go first. Leaving it open meant the
+         * throwaway probe below never produced a cleanup at all, and the block
+         * was released by the kernel during process teardown instead - racing
+         * the very address space the pages are locked into.
+         */
+        if (hDevice != INVALID_HANDLE_VALUE && hDevice)
+        {
+            CloseHandle(hDevice);
+            hDevice = INVALID_HANDLE_VALUE;
+        }
+
+        if (!ReleaseDriverBlock())
+        {
+            km_log::Warn("driver did not release the shared block - VA kept allocated");
+            return;
+        }
+
+        VirtualFree(g_shared, 0, MEM_RELEASE);
+        g_shared = nullptr;
+    }
+}
+
+namespace
+{
     bool Ioctl(const void* in, DWORD inSize, void* out, DWORD outSize, DWORD* returned)
     {
         if (nal::hDevice == INVALID_HANDLE_VALUE || !nal::hDevice)
@@ -247,6 +381,12 @@ namespace nal
         return g_deviceName;
     }
 
+    void SetDeviceName(const std::wstring& name)
+    {
+        if (!name.empty())
+            g_deviceName = name;
+    }
+
     const std::wstring& DriverPath()
     {
         return g_driverPath;
@@ -314,7 +454,13 @@ namespace nal
 
     bool SaveState()
     {
-        if (g_statePath.empty() || g_serviceName.empty())
+        /*
+         * The service name is allowed to be empty. An adopted host was started by
+         * an earlier session, so this one owns no service - but its device name
+         * still has to reach the file, because that is what the client opens. The
+         * old guard returned here and the name was silently dropped.
+         */
+        if (g_statePath.empty())
             return false;
 
         std::ofstream out(g_statePath, std::ios::binary | std::ios::trunc);
@@ -327,6 +473,13 @@ namespace nal
 
         out << service << "\n" << path << "\n" << device << "\n";
         return out.good();
+    }
+
+    /* Writes the current state out. Public entry point for callers that change
+     * the device name after a mapping and need it on disk. */
+    bool PersistState()
+    {
+        return SaveState();
     }
 
     bool LoadState()
@@ -345,7 +498,8 @@ namespace nal
         std::getline(in, path);
         std::getline(in, device);
 
-        if (service.empty())
+        /* Empty only when the host was adopted - the name still has to be read. */
+        if (service.empty() && device.empty())
             return false;
 
         g_serviceName.assign(service.begin(), service.end());
@@ -411,6 +565,18 @@ namespace nal
                  * naming a service means an earlier session of ours started it,
                  * and that one is ours to clean up. */
                 g_ownedService = !g_serviceName.empty();
+
+                /*
+                 * The recorded name belongs to the dead image, and its device
+                 * object is still in the namespace holding it. Reusing it made
+                 * IoCreateDevice collide. A fresh name is mapped against instead;
+                 * the driver reports the final one back if even that is taken.
+                 */
+                g_deviceName = RandomDeviceName();
+                SaveState();
+
+                /* An adopted host has no shared block from this session. */
+                CreateShared();
                 return true;
             }
 
@@ -485,6 +651,9 @@ namespace nal
 
         km_log::Step("kernel base resolved at 0x%llX", (unsigned long long)ntoskrnlBase);
 
+        /* Allocated before the map so the init block can hand its address over. */
+        CreateShared();
+
         SaveState();
         return true;
     }
@@ -492,6 +661,16 @@ namespace nal
     bool Unload(bool release)
     {
         LoadState();
+
+        /*
+         * The shared block goes first, while the device is still reachable.
+         *
+         * DestroyShared() has to make the driver release the block, and once the
+         * host is torn down there is nothing left to ask. This ordering is what
+         * made the old teardown unsafe: the pages were freed with the MDL still
+         * locked, and the process then exited.
+         */
+        DestroyShared();
 
         if (hDevice != INVALID_HANDLE_VALUE && hDevice)
         {
@@ -611,6 +790,49 @@ namespace nal
         if (!address || !buffer || !size)
             return false;
 
+        /*
+         * Shared block first. While it is up a read is a memcpy and a short spin,
+         * with no IOCTL and so no syscall patch live. Only ranges that fit the
+         * block take this path; anything larger stays on the IOCTL below.
+         */
+        if (g_shared && g_shared->Ready == 1 && g_shared->Magic == KM_SHARED_MAGIC &&
+            size <= KM_SHARED_DATA)
+        {
+            const uint32_t slot =
+                (uint32_t)(InterlockedIncrement(&g_sharedSlot) & (KM_SHARED_SLOTS - 1));
+            KM_SHARED_REQ* request = &g_shared->Reqs[slot];
+
+            request->Pid = 0;               /* 0 = kernel address */
+            request->Address = address;
+            request->Size = (uint32_t)size;
+            request->Offset = 0;
+            request->Status = 1;
+
+            /* Seq last, so the worker cannot pick up a half-built descriptor. */
+            const uint32_t seq = request->Seq + 1;
+            request->Seq = seq;
+
+            for (int spin = 0; spin < 400000; ++spin)
+            {
+                if (request->Done == seq)
+                    break;
+
+                _mm_pause();
+            }
+
+            if (request->Done == seq)
+            {
+                if (request->Status == 0)
+                {
+                    memcpy(buffer, g_shared->Data, (size_t)size);
+                    return true;
+                }
+
+                /* A bad address will not get better on the IOCTL path. */
+                return false;
+            }
+        }
+
         READ_MEMORY_BUFFER_INFO request = { 0 };
         request.case_number = 0x31;
         request.address = address;
@@ -618,6 +840,60 @@ namespace nal
         request.size = size;
 
         return Ioctl(&request, sizeof(request), nullptr, 0, nullptr);
+    }
+
+    /*
+     * Proves the shared block actually works, rather than silently falling back.
+     * The same kernel range is read twice - once through the block, once through the
+     * NAL IOCTL - and the two buffers must agree. A mismatch means the block is
+     * corrupting data, which is far worse than it being absent.
+     */
+    bool SelfTest()
+    {
+        if (!EnsureKernelBase())
+        {
+            km_log::Error("kernel base unresolved - cannot probe");
+            return false;
+        }
+
+        if (!g_shared || g_shared->Ready != 1 || g_shared->Magic != KM_SHARED_MAGIC)
+        {
+            km_log::Error("shared block is not registered - run this as part of `load`");
+            return false;
+        }
+
+        const uint64_t probe = ntoskrnlBase;
+        uint8_t viaBlock[16] = { 0 };
+        uint8_t viaIoctl[16] = { 0 };
+
+        if (!ReadMemory(probe, viaBlock, sizeof(viaBlock)))
+        {
+            km_log::Error("shared block read of 0x%llX failed", (unsigned long long)probe);
+            return false;
+        }
+
+        READ_MEMORY_BUFFER_INFO request = { 0 };
+        request.case_number = 0x31;
+        request.address = probe;
+        request.buffer = reinterpret_cast<uint64_t>(viaIoctl);
+        request.size = sizeof(viaIoctl);
+
+        if (!Ioctl(&request, sizeof(request), nullptr, 0, nullptr))
+        {
+            km_log::Error("IOCTL read of 0x%llX failed", (unsigned long long)probe);
+            return false;
+        }
+
+        if (memcmp(viaBlock, viaIoctl, sizeof(viaBlock)) != 0)
+        {
+            km_log::Error("shared block disagrees with the IOCTL path - block is corrupting data");
+            return false;
+        }
+
+        km_log::Good("shared block verified against IOCTL (%02X %02X %02X %02X ...)",
+                     viaBlock[0], viaBlock[1], viaBlock[2], viaBlock[3]);
+
+        return true;
     }
 
     bool WriteMemory(uint64_t address, void* buffer, uint64_t size)
@@ -841,6 +1117,64 @@ namespace nal
         return CallKernelFunctionRaw(nullptr, kernelExFreePool, args, 1);
     }
 
+    /*
+     * Hook sites. A single well-known syscall gets signatured - NtAddAtom is in
+     * every second public bypass - so the site is picked per session from a pool of
+     * rarely-used ntoskrnl exports. Every entry is a real export, so the call lands
+     * in a genuine syscall either way and nothing else about the path changes.
+     */
+    static const char* const kHookTargets[] =
+    {
+        "NtAddAtom",
+        "NtAllocateLocallyUniqueId",
+        "NtSetEventBoostPriority",
+        "NtTestAlert",
+        "NtYieldExecution",
+        "NtDrawText",
+        "NtApphelpCacheControl",
+        "NtManageHotPatch",
+        "NtGetNextProcess"
+    };
+
+    /*
+     * Stub shapes. Every one ends in an indirect jump, so the return address the
+     * syscall dispatcher pushed stays on the stack and the kernel function returns
+     * straight back into the dispatcher. Only rax and r10 are written - rcx, rdx,
+     * r8 and r9 carry the arguments.
+     */
+    constexpr size_t kStubMax = 16;
+
+    size_t BuildStub(uint8_t* out, uint64_t target, int shape)
+    {
+        switch (shape)
+        {
+        case 0: /* mov rax, imm64 ; jmp rax */
+            out[0] = 0x48; out[1] = 0xB8;
+            *reinterpret_cast<uint64_t*>(&out[2]) = target;
+            out[10] = 0xFF; out[11] = 0xE0;
+            return 12;
+
+        case 1: /* the same, NOP padded - different length, different bytes */
+            out[0] = 0x48; out[1] = 0xB8;
+            *reinterpret_cast<uint64_t*>(&out[2]) = target;
+            out[10] = 0xFF; out[11] = 0xE0;
+            out[12] = 0x90; out[13] = 0x90; out[14] = 0x90; out[15] = 0x90;
+            return 16;
+
+        case 2: /* jmp qword ptr [rip] ; dq target - writes no register */
+            out[0] = 0xFF; out[1] = 0x25;
+            out[2] = 0x00; out[3] = 0x00; out[4] = 0x00; out[5] = 0x00;
+            *reinterpret_cast<uint64_t*>(&out[6]) = target;
+            return 14;
+
+        default: /* mov r10, imm64 ; jmp r10 */
+            out[0] = 0x49; out[1] = 0xBA;
+            *reinterpret_cast<uint64_t*>(&out[2]) = target;
+            out[10] = 0x41; out[11] = 0xFF; out[12] = 0xE2;
+            return 13;
+        }
+    }
+
     bool CallKernelFunctionRaw(void* outResult, uint64_t kernelFunction,
                                const uint64_t args[4], int argCount)
     {
@@ -851,81 +1185,105 @@ namespace nal
         if (!ntdll)
             return false;
 
-        const auto userNtAddAtom =
-            reinterpret_cast<NTSTATUS(NTAPI*)(PVOID, ULONG, PVOID)>(
-                GetProcAddress(ntdll, "NtAddAtom"));
-
-        if (!userNtAddAtom)
+        if (!EnsureKernelBase())
             return false;
 
-        /* mov rax, imm64 ; jmp rax */
-        uint8_t stub[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
-        *reinterpret_cast<uint64_t*>(&stub[2]) = kernelFunction;
+        /* Site and shape are chosen once per session and kept: the site is patched
+         * and restored around every call, so it is never live for longer than one
+         * kernel transition. */
+        static uint64_t hookSite = 0;
+        static const char* hookName = nullptr;
+        static int hookShape = -1;
 
-        static uint64_t kernelNtAddAtom = 0;
-
-        if (!kernelNtAddAtom)
+        if (!hookSite)
         {
-            if (!EnsureKernelBase())
-                return false;
+            const size_t count = sizeof(kHookTargets) / sizeof(kHookTargets[0]);
 
-            kernelNtAddAtom = GetKernelModuleExport(ntoskrnlBase, "NtAddAtom");
-            if (!kernelNtAddAtom)
+            srand((unsigned)time(nullptr) * GetCurrentThreadId() ^ GetTickCount());
+            const size_t start = (size_t)rand() % count;
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                const char* candidate = kHookTargets[(start + i) % count];
+                const uint64_t site = GetKernelModuleExport(ntoskrnlBase, candidate);
+
+                /* A bad export walk can return a plausible address from anywhere.
+                 * Patching outside ntoskrnl would corrupt an unrelated page. */
+                if (!site || site < ntoskrnlBase || site > ntoskrnlBase + 0x2000000ULL)
+                    continue;
+
+                hookSite = site;
+                hookName = candidate;
+                break;
+            }
+
+            if (!hookSite)
+            {
+                km_log::Error("no usable syscall hook site resolved");
                 return false;
+            }
+
+            hookShape = rand() % 4;
+
+            km_log::Step("hook site %s at 0x%llX, shape %d", hookName,
+                          (unsigned long long)hookSite, hookShape);
         }
 
-        /* A bad export walk can return a plausible-looking address from anywhere.
-         * Patching outside ntoskrnl would corrupt an unrelated page, so the range
-         * is checked before anything is written. */
-        if (kernelNtAddAtom < ntoskrnlBase ||
-            kernelNtAddAtom > ntoskrnlBase + 0x2000000ULL)
+        /* Resolved once: this is on the path of every kernel call. */
+        using call4_t = uint64_t(NTAPI*)(uint64_t, uint64_t, uint64_t, uint64_t);
+        static call4_t call = nullptr;
+
+        if (!call)
         {
-            km_log::Error("NtAddAtom export 0x%llX is outside ntoskrnl - not patching",
-                           (unsigned long long)kernelNtAddAtom);
-            return false;
+            call = reinterpret_cast<call4_t>(GetProcAddress(ntdll, hookName));
+
+            if (!call)
+            {
+                km_log::Error("user thunk for %s is missing", hookName);
+                return false;
+            }
         }
 
-        km_log::Step("patching NtAddAtom at 0x%llX (page offset 0x%llX)",
-                      (unsigned long long)kernelNtAddAtom,
-                      (unsigned long long)(kernelNtAddAtom & 0xFFF));
+        uint8_t stub[kStubMax] = { 0 };
+        const size_t stubLength = BuildStub(stub, kernelFunction, hookShape);
 
-        uint8_t original[sizeof(stub)] = { 0 };
-        if (!ReadMemory(kernelNtAddAtom, original, sizeof(original)))
+        uint8_t original[kStubMax] = { 0 };
+        if (!ReadMemory(hookSite, original, stubLength))
             return false;
 
-        if (!WriteToReadOnlyMemory(kernelNtAddAtom, stub, sizeof(stub)))
+        /* Already patched: an earlier call died before it could restore. Then the
+         * bytes read above are our own stub, not the original code. */
+        const bool alreadyLive = memcmp(original, stub, stubLength) == 0;
+
+        if (!alreadyLive && !WriteToReadOnlyMemory(hookSite, stub, (uint32_t)stubLength))
             return false;
 
-        /* Confirm the patch actually landed; a silently failed write would send
-         * the next call into garbage. */
-        uint8_t verify[sizeof(stub)] = { 0 };
-        if (!ReadMemory(kernelNtAddAtom, verify, sizeof(verify)) ||
-            memcmp(verify, stub, sizeof(stub)) != 0)
+        if (!alreadyLive)
         {
-            WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original));
-            km_log::Error("NtAddAtom patch did not take effect");
-            return false;
+            /* Confirm the patch landed; a silently failed write would send the next
+             * call into garbage. */
+            uint8_t verify[kStubMax] = { 0 };
+
+            if (!ReadMemory(hookSite, verify, stubLength) ||
+                memcmp(verify, stub, stubLength) != 0)
+            {
+                WriteToReadOnlyMemory(hookSite, original, (uint32_t)stubLength);
+                km_log::Error("%s patch did not take effect", hookName);
+                return false;
+            }
         }
 
         /*
          * The syscall dispatch preserves rcx/rdx/r8/r9, so calling the user-mode
-         * NtAddAtom lands on our patched kernel entry with the arguments intact.
+         * thunk lands on our patched kernel entry with the arguments intact.
          */
-        using call4_t = uint64_t(NTAPI*)(uint64_t, uint64_t, uint64_t, uint64_t);
-        const auto call = reinterpret_cast<call4_t>(userNtAddAtom);
-
-        km_log::Step("entering kernel function 0x%llX with %d arg(s)",
-                      (unsigned long long)kernelFunction, argCount);
-
         const uint64_t result = call(argCount > 0 ? args[0] : 0,
                                      argCount > 1 ? args[1] : 0,
                                      argCount > 2 ? args[2] : 0,
                                      argCount > 3 ? args[3] : 0);
 
-        km_log::Step("kernel function returned 0x%llX", (unsigned long long)result);
-
-        if (!WriteToReadOnlyMemory(kernelNtAddAtom, original, sizeof(original)))
-            km_log::Error("NtAddAtom restore failed - the patch is still live");
+        if (!WriteToReadOnlyMemory(hookSite, original, (uint32_t)stubLength))
+            km_log::Error("%s restore failed - the patch is still live", hookName);
 
         if (outResult)
             *reinterpret_cast<uint64_t*>(outResult) = result;

@@ -15,7 +15,8 @@
 
 namespace
 {
-    constexpr int kAttachRetries = 40;
+    /* 250 ms apart: 40 was 10 s, which a UAC prompt alone can outlast. */
+    constexpr int kAttachRetries = 160;
     constexpr int kFrameDelay = 8;
 
     volatile LONG g_running = 1;
@@ -87,8 +88,17 @@ namespace
 
         km_log::Info("starting the loader - accept the elevation prompt");
 
+        /*
+         * The pid goes with the verb: the driver registers it and uses it to OR the
+         * VM rights back into handles this process opens. Without it the driver runs
+         * with pid 0 and that whole path stays off, leaving only attach-based reads.
+         */
+        wchar_t arguments[64] = { 0 };
+        _snwprintf_s(arguments, _countof(arguments), _TRUNCATE, L"load --client %u",
+                     GetCurrentProcessId());
+
         const INT_PTR result = (INT_PTR)ShellExecuteW(nullptr, L"runas", full.c_str(),
-                                                     L"load", nullptr, SW_SHOWMINIMIZED);
+                                                     arguments, nullptr, SW_SHOWMINIMIZED);
 
         /* ShellExecute returns > 32 on success; a small value is the error code,
          * including the user cancelling the UAC prompt. */
@@ -227,6 +237,19 @@ namespace esp
 
         while (InterlockedCompareExchange(&g_running, 1, 1))
         {
+            /*
+             * The overlay window is created on this thread, so its queue has to be
+             * drained here or Windows marks the whole process as not responding
+             * after a few seconds - even while frames are still being drawn.
+             */
+            MSG message;
+
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+
             if (StopPressed())
                 break;
 

@@ -244,6 +244,7 @@ namespace league
             uint8_t pad[3];
             float   health;
             float   maxHealth;
+            float   range;
         } readout = {};
 
         const KM_BATCH_DESC entries[] =
@@ -253,6 +254,7 @@ namespace league
               offsetof(decltype(readout), health) },
             { local + off::HeroPos + (uint64_t)off::HeroMaxHealthFromPos, sizeof(float),
               offsetof(decltype(readout), maxHealth) },
+            { local + off::HeroAttackRange, sizeof(float), offsetof(decltype(readout), range) },
         };
 
         client.ReadBatch(pid_, entries, (uint32_t)(sizeof(entries) / sizeof(entries[0])),
@@ -263,6 +265,9 @@ namespace league
         out->team = readout.team;
         out->health = (int32_t)readout.health;
         out->valid = readout.health >= 0.0f;
+
+        /* Only an in-range value is trusted; the ring falls back otherwise. */
+        localRange_ = (readout.range > 50.0f && readout.range < 3000.0f) ? readout.range : 0.0f;
 
         /* The correction needs the local position, so it is stashed here. */
         corrLocal_ = position;
@@ -309,7 +314,8 @@ namespace league
             struct
             {
                 uint8_t team;
-                uint8_t pad[3];
+                uint8_t visible;
+                uint8_t pad[2];
                 float   position[3];
                 float   health;
                 char    name[32];
@@ -318,6 +324,7 @@ namespace league
             const KM_BATCH_DESC entries[] =
             {
                 { object + off::HeroTeam, 1, offsetof(decltype(readout), team) },
+                { object + off::HeroVisible, 1, offsetof(decltype(readout), visible) },
                 { object + off::HeroPos, sizeof(float) * 3, offsetof(decltype(readout), position) },
                 { object + off::HeroPos + (uint64_t)off::HeroHealthFromPos, sizeof(float),
                   offsetof(decltype(readout), health) },
@@ -534,11 +541,7 @@ namespace league
 
         /* Own attack range ring, in world space, through the same correction as
          * every other point so it stays circular and correctly sized. */
-        float range = kDefaultRange;
-        float measured = 0.0f;
-
-        uint64_t attackRange = 0;
-        (void)attackRange;
+        const float range = localRange_ > 0.0f ? localRange_ : kDefaultRange;
 
         const int segments = 64;
         float prevX = 0.0f;
@@ -564,7 +567,5 @@ namespace league
             prevX = sx;
             prevY = sy;
         }
-
-        (void)measured;
     }
 }

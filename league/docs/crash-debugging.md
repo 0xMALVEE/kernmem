@@ -146,4 +146,46 @@ temp file. `mapper::Unmap` also refuses to free the image if it cannot read
 
 ---
 
+## 8. Bugcheck 0x76: locked pages
+
+`PROCESS_HAS_LOCKED_PAGES (0x76)` means a process died while an MDL still had
+pages locked into its address space. The parameters name it directly:
+
+```
+0x76 (0x0, <MDL>, <pages still locked>, 0x0)
+```
+
+If the third parameter is `0x21`, that is 33 pages, which is exactly
+`sizeof(KM_SHARED)`: `Data[0x20000]` + 32 x `KM_SHARED_REQ` (0x400) + a 0x14
+header = `0x20414`. So the offending MDL is the shared read block, not the
+read/write IOCTL path (that one locks and unlocks inside a single request).
+
+The shared block is locked into the process that registered it and stays locked
+until the driver is told to stop. Two things have to be true for that to be safe:
+
+- the loader must not free the VA while the driver still holds the MDL, and
+- the driver must release the block even when the process never asks.
+
+Both were wrong once. `DestroyShared()` freed the block with a bare
+`VirtualFree` and no deregistration, and `nal::Unload(false)` closes the device
+handle and then frees the block while deliberately leaving the host resident, so
+the process exited with the pages still locked. On the driver side
+`IRP_MJ_CLEANUP` was a no-op, so nothing ever cleaned up after an abrupt exit.
+
+How it is fixed now:
+
+- the driver records `OwnerPid` per block and its `IRP_MJ_CLEANUP` handler stops
+every block owned by the closing process. Cleanup fires before the address space
+is torn down, so it is the last moment the pages can be released. Blocks owned by
+other processes are never touched.
+- `nal::DestroyShared()` opens and closes a throwaway handle to the device before
+`VirtualFree`, which triggers that cleanup in its own process, and `nal::Unload`
+frees the shared block before the control handle is closed.
+
+If you see 0x76 on a build older than this change, the leak is in the client, not
+the mapper: re-run `unload` after rebooting so the stale image does not stay
+resident.
+
+---
+
 Back to [index](README.md)

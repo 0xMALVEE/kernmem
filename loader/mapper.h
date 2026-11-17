@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <string>
 
+/* KM_MAX_DEVICE_CHARS, for the device name the driver reports back. */
+#include "km_shared_loader.h"
+
 namespace mapper
 {
     typedef struct _MAP_RESULT
@@ -21,6 +24,9 @@ namespace mapper
         uint64_t driverObject; /* kernel pool DRIVER_OBJECT for teardown */
         uint64_t entryPoint;   /* resolved kernel VA of DriverEntry */
         NTSTATUS status;       /* status returned by DriverEntry */
+        /* Device name the driver actually created. A name still owned by a dead
+         * image is suffixed, so this is not always the one that was requested. */
+        wchar_t deviceName[KM_MAX_DEVICE_CHARS];
     } MAP_RESULT;
 
     /*

@@ -20,7 +20,7 @@
 
 #define KM_DEVICE_TYPE      0x8000
 
-#define KM_PROTOCOL_VERSION 5
+#define KM_PROTOCOL_VERSION 6
 
 #define KM_INIT_MAGIC       0x42475631
 
@@ -68,6 +68,7 @@ static __inline unsigned long KmRecodeIoctl(unsigned long code, unsigned long de
 #define IOCTL_KM_GET_MAIN_BASE    KM_IOCTL(0x809)
 #define IOCTL_KM_GET_INFO         KM_IOCTL(0x80A)
 #define IOCTL_KM_READ_BATCH       KM_IOCTL(0x80B)
+#define IOCTL_KM_SET_CLIENT_BLOCK KM_IOCTL(0x80C)
 
 typedef struct _KM_INIT_PARAMS
 {
@@ -78,6 +79,10 @@ typedef struct _KM_INIT_PARAMS
     unsigned long AltitudeSeed;
     unsigned long PoolTag;
     wchar_t DeviceName[KM_MAX_DEVICE_CHARS];
+    /* Client-allocated shared block: user VA and size. The driver locks it with an
+     * MDL and maps it into system space, so reads cost no IOCTL at all. */
+    unsigned __int64 SharedUser;
+    unsigned long SharedSize;
 } KM_INIT_PARAMS;
 
 /* What the driver reports about its own mapping, so teardown needs no state
@@ -117,6 +122,51 @@ typedef struct _KM_BATCH_REQ
     unsigned long Count;
     KM_BATCH_DESC Entries[KM_BATCH_MAX];
 } KM_BATCH_REQ;
+
+/* A client registers its OWN block with this, once, right after Open(). From then
+ * on its reads are serviced by the driver's worker with no IOCTL, so the hot path
+ * never has a syscall patched. The loader keeps a separate block for kernel reads. */
+typedef struct _KM_BLOCK_REQ
+{
+    unsigned __int64 User;
+    unsigned long Size;
+    unsigned long Pad;
+} KM_BLOCK_REQ;
+
+/*
+ * Shared section. This is the read path during play: the client writes a
+ * descriptor, spins on Done, and copies the answer out of Data. No IOCTL, and so
+ * no syscall patch is live while the game runs.
+ *
+ * Seq is bumped last by the client and Done is set last by the driver, so a slot
+ * is only touched when the two differ. Slots are independent, so several reads
+ * can be outstanding at once.
+ */
+#define KM_SHARED_MAGIC 0x4B4D5348u   /* 'KMSH' */
+#define KM_SHARED_SLOTS 32
+#define KM_SHARED_DATA  0x20000
+
+typedef struct _KM_SHARED_REQ
+{
+    volatile unsigned long Seq;
+    volatile unsigned long Done;
+    unsigned long Pid;
+    unsigned long Size;
+    unsigned __int64 Address;
+    unsigned long Offset;
+    unsigned long Status;
+} KM_SHARED_REQ;
+
+typedef struct _KM_SHARED
+{
+    unsigned long Magic;
+    unsigned long Slots;
+    unsigned long DataSize;
+    volatile unsigned long Ready;
+    volatile unsigned long Heartbeat;
+    KM_SHARED_REQ Reqs[KM_SHARED_SLOTS];
+    unsigned char Data[KM_SHARED_DATA];
+} KM_SHARED;
 
 typedef struct _KM_NAME_REQ
 {

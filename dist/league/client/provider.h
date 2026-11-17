@@ -64,6 +64,10 @@ namespace league
         mutable float       corrOffsetX_ = 0.0f;
         mutable float       corrOffsetY_ = 0.0f;
 
+        /* Own attack range, read with the local player. 0 means unknown, and the
+         * ring then falls back to the default. */
+        mutable float       localRange_ = 0.0f;
+
         void Correct(int width, int height) const;
     };
 }

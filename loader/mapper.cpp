@@ -331,6 +331,10 @@ namespace mapper
         /* Per-install device name, so the namespace is not a build constant. */
         if (const std::wstring& device = nal::DeviceName(); !device.empty())
             wcsncpy_s(params.DeviceName, device.c_str(), _TRUNCATE);
+        /* Shared block: the driver locks and maps it, after which reads cost no
+         * IOCTL and no syscall stays patched. Empty when allocation failed. */
+        params.SharedUser = nal::SharedUser();
+        params.SharedSize = nal::SharedSize();
         WriteToKernel(initBlock, &params, sizeof(params));
 
         const uint64_t entryPoint = kernelImage + image.entryPoint;
@@ -349,6 +353,17 @@ namespace mapper
             nal::FreePool(kernelImage);
             pe::Free(&image);
             return false;
+        }
+
+        /* The driver writes back the device name it actually created, which is
+         * not the requested one when that name was still owned by a dead image.
+         * Read it while the init block is still alive. */
+        {
+            KM_INIT_PARAMS reported = { 0 };
+
+            if (ReadFromKernel(initBlock, &reported, sizeof(reported)))
+                wcsncpy_s(result->deviceName, KM_MAX_DEVICE_CHARS,
+                          reported.DeviceName, _TRUNCATE);
         }
 
         nal::FreePool(initBlock);

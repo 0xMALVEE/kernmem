@@ -66,16 +66,32 @@ namespace km
             const std::wstring name = StateDeviceName();
             deviceType_ = KmDeviceTypeFor(name.c_str());
 
+            {
+                static int reports = 0;
+                if (reports < 40)
+                {
+                    ++reports;
+                    std::printf("[state %d] name-len=%zu name=[%ls]\n", reports,
+                                name.size(), name.c_str());
+                }
+            }
+
             std::vector<std::wstring> candidates;
 
             if (!name.empty())
             {
-                candidates.push_back(L"\\\\\\.\\" + name);
+                /*
+                 * GLOBALROOT first. The \DosDevices alias is not reliably there -
+                 * a name inherited from a dead image resolves through neither, and
+                 * the alias is the one that goes missing - while the device object
+                 * itself is always reachable by its full path.
+                 */
                 candidates.push_back(L"\\\\?\\GLOBALROOT\\Device\\" + name);
+                candidates.push_back(L"\\\\\\.\\" + name);
             }
 
-            candidates.push_back(KM_WIN32_NAME);
             candidates.push_back(L"\\\\?\\GLOBALROOT\\Device\\Kernmem");
+            candidates.push_back(KM_WIN32_NAME);
 
             for (const std::wstring& path : candidates)
             {
@@ -84,7 +100,21 @@ namespace km
                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
                 if (device_ != INVALID_HANDLE_VALUE)
+                {
+                    /* Registers this process's block. A failure is not fatal - the
+                     * reads below simply stay on the IOCTL path. */
+                    RegisterShared();
                     return true;
+                }
+
+                /* First few attempts only, so a long wait does not bury the log. */
+                static int shown = 0;
+                if (shown < 12)
+                {
+                    ++shown;
+                    std::printf("[open] len=%zu path=[%ls] -> %lu\n", path.size(),
+                                path.c_str(), GetLastError());
+                }
             }
 
             return false;
@@ -92,6 +122,10 @@ namespace km
 
         void Close()
         {
+            /* Deregistered first: the driver has to drop its mapping while it still
+             * knows the process, or the pages go away under a live worker. */
+            ReleaseShared();
+
             if (device_ != INVALID_HANDLE_VALUE)
                 CloseHandle(device_);
 
@@ -179,6 +213,16 @@ namespace km
             auto out = static_cast<uint8_t*>(buffer);
             size_t done = 0;
 
+            /* One descriptor, same block, same reasoning as ReadBatch. Only taken
+             * when the whole range fits in a single shared transfer. */
+            if (size && size <= KM_SHARED_DATA)
+            {
+                KM_BATCH_DESC entry = { address, (uint32_t)size, 0 };
+
+                if (SharedRead(pid, &entry, 1, buffer, (uint32_t)size))
+                    return true;
+            }
+
             while (done < size)
             {
                 const size_t remaining = size - done;
@@ -213,6 +257,11 @@ namespace km
         {
             if (!count || count > KM_BATCH_MAX)
                 return false;
+
+            /* Shared block first: no IOCTL, so no syscall patch is live. Falls
+             * through to the IOCTL path when the block is not up. */
+            if (SharedRead(pid, entries, count, out, outSize))
+                return true;
 
             KM_BATCH_REQ request = { 0 };
             request.Pid = pid;
@@ -295,7 +344,21 @@ namespace km
             path += L"km-nal.state";
 
             std::FILE* file = nullptr;
-            if (_wfopen_s(&file, path.c_str(), L"rb") != 0 || !file)
+            const errno_t opened = _wfopen_s(&file, path.c_str(), L"rb");
+
+            {
+                static int reports = 0;
+                if (reports < 80)
+                {
+                    const DWORD attributes = GetFileAttributesW(path.c_str());
+
+                    ++reports;
+                    std::printf("[read %d] exists=%d attr=%lu fopen=%d\n", reports,
+                                (int)attributes != -1, attributes, (int)opened);
+                }
+            }
+
+            if (opened != 0 || !file)
                 return std::wstring();
 
             char line[KM_MAX_DEVICE_CHARS * 2] = { 0 };
@@ -309,9 +372,18 @@ namespace km
                 if (index != 2)
                     continue;
 
+                /*
+                 * Strip by byte class, not by a character set string. The set
+                 * used to be written "\\r\\n", which in C++ is backslash, 'r' and
+                 * 'n' as literals - a real CR/LF is in none of those, so the line
+                 * ending was kept and every path was built as "...name\n". That
+                 * fails with 2, which reads exactly like a missing device.
+                 */
                 std::string text(line);
-                const std::string::size_type end = text.find_last_not_of("\\r\\n");
-                text.erase(end == std::string::npos ? 0 : end + 1);
+
+                while (!text.empty() && static_cast<unsigned char>(text.back()) <= ' ')
+                    text.pop_back();
+
                 device.assign(text.begin(), text.end());
             }
 
@@ -342,8 +414,136 @@ namespace km
             return ok != FALSE;
         }
 
+        /*
+         * Shared block. Registered once per open; while it is up the driver's worker
+         * services it, so a read is a memcpy and a short spin instead of an IOCTL.
+         * That matters because every IOCTL on this path patches and restores a
+         * syscall - the block removes the patch from the hot path entirely.
+         */
+        bool RegisterShared()
+        {
+            if (shared_)
+                return true;
+
+            sharedFailures_ = 0;
+
+            void* block = VirtualAlloc(nullptr, sizeof(KM_SHARED), MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_READWRITE);
+
+            if (!block)
+                return false;
+
+            ZeroMemory(block, sizeof(KM_SHARED));
+            shared_ = static_cast<KM_SHARED*>(block);
+
+            KM_BLOCK_REQ request = { 0 };
+            request.User = reinterpret_cast<uint64_t>(shared_);
+            request.Size = (uint32_t)sizeof(KM_SHARED);
+
+            if (!Call(IOCTL_KM_SET_CLIENT_BLOCK, &request, sizeof(request), nullptr, 0))
+            {
+                VirtualFree(shared_, 0, MEM_RELEASE);
+                shared_ = nullptr;
+                return false;
+            }
+
+            return true;
+        }
+
+        void ReleaseShared()
+        {
+            if (!shared_)
+                return;
+
+            /* Zero user is the deregistration request; the driver unmaps and drops
+             * the worker's reference before the pages go away. */
+            KM_BLOCK_REQ request = { 0 };
+            Call(IOCTL_KM_SET_CLIENT_BLOCK, &request, sizeof(request), nullptr, 0);
+
+            VirtualFree(shared_, 0, MEM_RELEASE);
+            shared_ = nullptr;
+        }
+
+        /*
+         * One slot per descriptor, so a batch runs concurrently inside the worker.
+         * Seq is written last by us and Done last by the driver, so a slot is only
+         * touched when the two differ. Returns false whenever the caller should fall
+         * back to the IOCTL path.
+         */
+        bool SharedRead(uint32_t pid, const KM_BATCH_DESC* entries, uint32_t count,
+                        void* out, uint32_t outSize)
+        {
+            uint32_t seq[KM_SHARED_SLOTS] = { 0 };
+            uint32_t slot;
+
+            /*
+             * After a few failures the block is treated as gone for the rest of
+             * the session. Without that, a block that stopped being serviced made
+             * every frame pay the full wait before falling back to IOCTL.
+             */
+            if (!shared_ || sharedFailures_ >= 3 || shared_->Ready != 1 ||
+                shared_->Magic != KM_SHARED_MAGIC)
+                return false;
+
+            if (!count || count > KM_SHARED_SLOTS || !outSize || outSize > KM_SHARED_DATA)
+                return false;
+
+            for (slot = 0; slot < count; ++slot)
+            {
+                KM_SHARED_REQ* request = &shared_->Reqs[slot];
+                const uint32_t size = entries[slot].Size;
+
+                if (!size || entries[slot].Offset >= outSize ||
+                    size > outSize - entries[slot].Offset)
+                    return false;
+
+                request->Pid = pid;
+                request->Address = entries[slot].Address;
+                request->Size = size;
+                request->Offset = entries[slot].Offset;
+                request->Status = 1;
+
+                seq[slot] = request->Seq + 1;
+                request->Seq = seq[slot];
+            }
+
+            for (slot = 0; slot < count; ++slot)
+            {
+                KM_SHARED_REQ* request = &shared_->Reqs[slot];
+                int spin = 0;
+
+                /*
+                 * Short spin first: a serviced slot answers in well under that, and
+                 * spinning is the cheapest way to take it. Past it the CPU is handed
+                 * over instead - the worker runs at PASSIVE_LEVEL on another thread,
+                 * so a pure spin here starves it of exactly the time it needs and
+                 * starves the overlay pump on this thread too. That was the hang.
+                 */
+                while (request->Done != seq[slot] && spin < 20000)
+                {
+                    YieldProcessor();
+                    ++spin;
+                }
+
+                for (spin = 0; request->Done != seq[slot] && spin < 200; ++spin)
+                    SwitchToThread();
+
+                if (request->Done != seq[slot])
+                {
+                    ++sharedFailures_;
+                    return false;
+                }
+            }
+
+            sharedFailures_ = 0;
+            std::memcpy(out, shared_->Data, outSize);
+            return true;
+        }
+
         HANDLE   device_ = INVALID_HANDLE_VALUE;
         uint32_t deviceType_ = KM_DEVICE_TYPE;
         NTSTATUS lastStatus_ = STATUS_SUCCESS;
+        KM_SHARED* shared_ = nullptr;
+        int sharedFailures_ = 0;   /* consecutive shared-read misses; 3 disables it */
     };
 }

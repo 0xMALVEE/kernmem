@@ -5,6 +5,7 @@
  *   status                    device and version probe
  *   kbase                     resolve the kernel base without loading
  *   load [--client <pid>]     map km.sys through the NAL driver
+ *   load --selftest           map, then verify the shared block against the IOCTL path
  *   unload                    unmap the driver, leave NAL resident (no unload record)
  *   release                   unmap the driver and fully release NAL, state and logs
  *   pid <image name>          resolve a pid by image name
@@ -333,7 +334,11 @@ namespace
         return 0;
     }
 
-    int CmdLoad(uint32_t clientPid)
+    /* Declared here because the stale-image path inside CmdLoad evicts by calling
+     * it, and CmdUnload is defined further down. */
+    int CmdUnload(bool release);
+
+    int CmdLoad(uint32_t clientPid, bool selfTest = false)
     {
         if (!Elevated())
         {
@@ -351,28 +356,35 @@ namespace
                 existing == KM_PROTOCOL_VERSION)
             {
                 km_log::Good("device already present, protocol %u - reusing it", existing);
+
+                /* Nothing was mapped by this process, so there is no shared block to
+                 * verify - say so rather than reporting a pass. */
+                if (selfTest)
+                    km_log::Warn("self-test needs a fresh load - the block is registered at map time");
+
                 return 0;
             }
 
             /*
-             * Anything else is an older or leaked image. `unload` can only free it if
-             * it can read the mapping back, and an image older than protocol 4 cannot
-             * report itself - so say that instead of the vague "unload first".
+             * A different build is mapped - almost always one left resident by an
+             * earlier session, because a plain unload deliberately leaves the host up
+             * so no unload record is written. Evict it here instead of telling the
+             * user to run unload: anything from protocol 4 on can report its own
+             * mapping through GET_INFO, which is all the unmap needs, and asking a
+             * human to do it by hand just loops.
              */
-            km_log::Error("a different driver build is already mapped (protocol %u, expected %u)",
-                           existing, KM_PROTOCOL_VERSION);
+            km_log::Warn("a different driver build is mapped (protocol %u, expected %u) - evicting",
+                         existing, KM_PROTOCOL_VERSION);
 
-            if (existing && existing < KM_PROTOCOL_VERSION)
+            CloseDevice();
+
+            if (CmdUnload(false) != 0)
             {
-                km_log::Info("it cannot report its own mapping, so try `unload` once; "
-                              "if the device still answers afterwards, reboot");
-            }
-            else
-            {
-                km_log::Info("run `unload` first, then load again");
+                km_log::Error("could not evict the mapped image - reboot if it persists");
+                return 1;
             }
 
-            return 1;
+            /* The stale image is gone, so fall through and map ours. */
         }
 
         const std::wstring nalState = nt::GetFullTempPath() + L"\\km-nal.state";
@@ -417,12 +429,21 @@ namespace
 
         _wremove(imagePath.c_str());
 
+        /* Open whatever name the driver ended up with, not the one we asked for. */
+        if (result.deviceName[0])
+            nal::SetDeviceName(result.deviceName);
+
+        /* Persist it. The adopt path had no service name, so its own write was a
+         * no-op, and the client has nothing to open without this file. */
+        nal::PersistState();
+
         MAP_STATE state = { result.imageBase, result.imageSize, result.driverObject, result.entryPoint };
         SaveMapState(state);
 
         if (!OpenDevice())
         {
             km_log::Error("driver mapped but the device did not appear");
+            nal::DestroyShared();
             return 1;
         }
 
@@ -431,6 +452,10 @@ namespace
             version != KM_PROTOCOL_VERSION)
         {
             km_log::Error("mapped image does not answer with protocol %u", KM_PROTOCOL_VERSION);
+
+            /* The block is already registered against this process here, so it has
+             * to go back before the exit or the reap bugchecks 0x76. */
+            nal::DestroyShared();
             return 1;
         }
 
@@ -438,6 +463,21 @@ namespace
 
         if (clientPid)
             km_log::Good("client pid %u registered", clientPid);
+
+        /*
+         * Verify the shared block here, in the process that mapped the driver and so
+         * owns the registered block. A silent fallback to IOCTL would otherwise look
+         * exactly like success.
+         */
+        if (selfTest)
+        {
+            if (!nal::SelfTest())
+            {
+                km_log::Error("shared block self-test failed - reads are on the IOCTL path");
+                nal::DestroyShared();
+                return 1;
+            }
+        }
 
         return 0;
     }
@@ -1261,14 +1301,18 @@ int wmain(int argc, wchar_t** argv)
     else if (verb == L"load")
     {
         uint32_t clientPid = 0;
+        bool selfTest = false;
 
-        for (int i = 2; i + 1 < argc; ++i)
+        for (int i = 2; i < argc; ++i)
         {
-            if (std::wstring(argv[i]) == L"--client")
+            if (std::wstring(argv[i]) == L"--selftest")
+                selfTest = true;
+
+            if (std::wstring(argv[i]) == L"--client" && i + 1 < argc)
                 clientPid = (uint32_t)_wtoi(argv[i + 1]);
         }
 
-        result = CmdLoad(clientPid);
+        result = CmdLoad(clientPid, selfTest);
     }
     else if (verb == L"unload")
     {
@@ -1321,6 +1365,15 @@ int wmain(int argc, wchar_t** argv)
         km_log::Error("unknown verb or missing arguments");
     }
 
+    /*
+     * The shared block is locked into THIS process, so it has to be handed back
+     * before the address space goes away - otherwise the process is reaped with
+     * 33 pages still locked (0x76). DestroyShared closes the control handle, so
+     * CloseDevice has to run first: cleanup only arrives on the last close.
+     * A verb that already tore the block down (unload, release) is a no-op here.
+     */
     CloseDevice();
+    nal::DestroyShared();
+
     return result;
 }

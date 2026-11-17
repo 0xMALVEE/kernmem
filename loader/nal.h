@@ -31,6 +31,14 @@ namespace nal
      * one; callers fall back to the static namespace when it is empty. */
     const std::wstring& DeviceName();
 
+    /* Overrides the name to open. Set from what the driver reported, so a name
+     * that had to be suffixed still resolves. */
+    void SetDeviceName(const std::wstring& name);
+
+    /* Persists the current state (device name included). The client reads that
+     * file to find the device, so it must be written after every successful map. */
+    bool PersistState();
+
     /* Path the host image was dropped to. This is the file name ntoskrnl records
      * in its unload trace, so the scrub needs it. */
     const std::wstring& DriverPath();
@@ -60,6 +68,19 @@ namespace nal
 
     bool MemCopy(uint64_t destination, uint64_t source, uint64_t size);
     bool SetMemory(uint64_t address, uint32_t value, uint64_t size);
+
+    /* Shared block: allocated here, locked and serviced by the driver. Once ready,
+     * kernel reads go through it instead of an IOCTL, so no syscall is patched
+     * while the game runs. */
+    bool     CreateShared();
+    uint64_t SharedUser();
+    uint32_t SharedSize();
+    void     DestroyShared();
+
+    /* Reads a kernel range through the shared block and again through the NAL
+     * IOCTL, then compares them. Only meaningful in the process that mapped the
+     * driver, because the block is registered at map time. */
+    bool     SelfTest();
 
     bool ReadMemory(uint64_t address, void* buffer, uint64_t size);
     bool WriteMemory(uint64_t address, void* buffer, uint64_t size);

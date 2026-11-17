@@ -43,6 +43,14 @@ namespace off
     /* Champion name is ASCII, not UTF-16. */
     constexpr uint64_t HeroName = 0x3890;
 
+    /* Visibility flag. Cited once in the dump and unconfirmed on this build, so a
+     * wrong value only costs the (hidden) marker, never the box. */
+    constexpr uint64_t HeroVisible = 0x2E8;
+
+    /* Own attack range. Read live and confirmed at 700.0, which stays the fallback
+     * if the read fails. */
+    constexpr uint64_t HeroAttackRange = 0x30B0;
+
     /* World position, inline. */
     constexpr uint64_t HeroPos = 0xA0;
 
