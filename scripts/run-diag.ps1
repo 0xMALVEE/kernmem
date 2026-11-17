@@ -1,5 +1,5 @@
-$root  = $PSScriptRoot
-$out   = Join-Path $root 'client.out.txt'
+$root  = Split-Path -Parent $PSScriptRoot
+$out   = Join-Path $root 'logs/client.out.txt'
 $state = Join-Path ([IO.Path]::GetTempPath()) 'km-nal.state'
 
 Get-Process kernmem-loader, kernmem-cs2 -ErrorAction SilentlyContinue | ForEach-Object {

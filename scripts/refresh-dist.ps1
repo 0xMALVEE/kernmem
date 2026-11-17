@@ -6,7 +6,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$root     = $PSScriptRoot
+$root     = Split-Path -Parent $PSScriptRoot
 $buildDir = Join-Path $root 'build'
 $distDir  = Join-Path $root 'dist'
 

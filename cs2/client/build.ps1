@@ -28,7 +28,7 @@ $sources = @('main.cpp', 'provider.cpp') |
 $cl = @(
     '/nologo', '/std:c++17', '/EHsc', '/O2', '/MT', '/W3', '/wd4201', '/D_WIN32_WINNT=0x0A00',
     "/I`"$umInc`"", "/I`"$shared`"", "/I`"$ucrt`"", "/I`"$PSScriptRoot/../../sdk`"",
-    "/I`"$PSScriptRoot/../../sdk/client`"", "/Fe`"$exe`""
+    "/I`"$PSScriptRoot/../../sdk/client`"", "/Fo`"$OutDir\\`"", "/Fe`"$exe`""
 ) + $framework + $sources
 
 $link = @(

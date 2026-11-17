@@ -1,7 +1,7 @@
-$root = $PSScriptRoot
+$root = Split-Path -Parent $PSScriptRoot
 $exe  = Join-Path $root 'dist\kernmem-cs2.exe'
-$out  = Join-Path $root 'client.out.txt'
-$err  = Join-Path $root 'client.err.txt'
+$out  = Join-Path $root 'logs/client.out.txt'
+$err  = Join-Path $root 'logs/client.err.txt'
 $state = Join-Path ([IO.Path]::GetTempPath()) 'km-nal.state'
 
 Remove-Item $out, $err -Force -ErrorAction SilentlyContinue

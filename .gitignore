@@ -25,6 +25,13 @@ league/debugger/ui/dist/
 # rebuild against a live session leaves the old copy here until it exits.
 dist/*.old
 
+# The repository root is for README.md, LICENSE, build.ps1 and this file only.
+# Anything else belongs in scripts/, logs/, dumps/ or docs/.
+/*.obj
+/*.out
+/*.txt
+!/README.md
+
 # IDE / OS
 .vs/
 *.user

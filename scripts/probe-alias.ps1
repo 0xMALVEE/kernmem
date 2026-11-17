@@ -22,7 +22,7 @@ function Try-Open([string]$path) {
     return 'OK'
 }
 
-$root  = $PSScriptRoot
+$root  = Split-Path -Parent $PSScriptRoot
 $state = Join-Path ([IO.Path]::GetTempPath()) 'km-nal.state'
 
 Get-Process kernmem-loader -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch { } }

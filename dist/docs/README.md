@@ -16,6 +16,8 @@ flowchart LR
     D --> E[05 API reference]
     E --> F[06 Troubleshooting]
     F --> G[07 Production checklist]
+    G --> H[08 Driver internals]
+    H --> I[09 Conventions]
 ```
 
 | # | Document | What it answers |
@@ -27,9 +29,11 @@ flowchart LR
 | 05 | [API reference](api-reference.md) | Every IOCTL, every struct, every status code, C++ and Python usage |
 | 06 | [Troubleshooting](troubleshooting.md) | Decision trees for each failure mode |
 | 07 | [Production checklist](production-checklist.md) | What is done, what is genuinely still missing, and in what order |
-| 08 | [Scripting](../league/docs/scripting.md) | How a script reads memory without a handle, and how offsets are managed |
-| 09 | [Overlay](../league/docs/overlay.md) | The in-game renderer: what it draws, how projection works, when it draws nothing |
-| 10 | [Crash debugging](../league/docs/crash-debugging.md) | Where the crash log is, how to read the bugcheck code, and which faults are already fixed |
+| 08 | [Driver internals](driver-internals.md) | How `km.sys` actually works: load sequence, shared block, SEH, teardown, and the hazard index |
+| 09 | [Conventions](conventions.md) | Where files go, how scripts resolve the root, and the rules driver and loader code follow |
+| 10 | [Scripting](../league/docs/scripting.md) | How a script reads memory without a handle, and how offsets are managed |
+| 11 | [Overlay](../league/docs/overlay.md) | The in-game renderer: what it draws, how projection works, when it draws nothing |
+| 12 | [Crash debugging](../league/docs/crash-debugging.md) | Where the crash log is, how to read the bugcheck code, and which faults are already fixed |
 
 ---
 

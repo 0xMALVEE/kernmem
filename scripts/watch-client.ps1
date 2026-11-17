@@ -1,4 +1,4 @@
-$root  = $PSScriptRoot
+$root  = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path ([IO.Path]::GetTempPath()) 'km-logs'
 $state = Join-Path ([IO.Path]::GetTempPath()) 'km-nal.state'
 
