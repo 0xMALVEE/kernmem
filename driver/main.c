@@ -206,6 +206,20 @@ static VOID KmSharedService(KM_BLOCK_STATE* block, KM_SHARED_REQ* req)
      */
     if (!req->Pid)
     {
+        /*
+         * Kernel VAs are valid in any context, but not every value handed over is
+         * one. -1, or a stale object field, is above MmHighestUserAddress and so
+         * takes this raw memcpy path - and that copy has no probe behind it. The
+         * __try below only helps while the exception table is registered, so screen
+         * the range first and refuse it while a status is still possible.
+         */
+        if (!KmAddressCopyable((ULONG_PTR)req->Address, size))
+        {
+            req->Status = (unsigned long)STATUS_PARTIAL_COPY;
+            req->Done = req->Seq;
+            return;
+        }
+
         __try
         {
             RtlCopyMemory(block->Map->Data + req->Offset, (void*)req->Address, size);

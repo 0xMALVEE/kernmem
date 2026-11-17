@@ -212,17 +212,20 @@ namespace mapper
 
             if (functionTable)
             {
-                const uint32_t rebase = (uint32_t)(kernelImage - image.preferredBase);
+                /*
+                 * These RVAs are relative to the BaseAddress handed to
+                 * RtlAddFunctionTable, which is the load address - so they are
+                 * copied verbatim. Adding (kernelImage - preferredBase) to each one
+                 * double-counts the displacement, and that delta does not fit a
+                 * 32-bit RVA anyway, so truncating it corrupted every entry and the
+                 * table was rejected. With no table registered, every __try/__except
+                 * in the driver escalates to 0x1E.
+                 */
                 bool written = true;
 
                 for (size_t i = 0; i < count; ++i)
                 {
-                    RUNTIME_FUNCTION entry = source[i];
-
-                    entry.BeginAddress += rebase;
-                    entry.EndAddress += rebase;
-                    if (entry.UnwindInfoAddress)
-                        entry.UnwindInfoAddress += rebase;
+                    const RUNTIME_FUNCTION entry = source[i];
 
                     if (!WriteToKernel(functionTable + i * sizeof(RUNTIME_FUNCTION),
                                        &entry, sizeof(entry)))
