@@ -2488,7 +2488,9 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
 
         if (!g_RtlAddFunctionTable)
         {
-            DbgPrint("kernmem: RtlAddFunctionTable unresolved - guarded faults will bugcheck\n");
+            /* Not a problem: the header skeleton and the published entry are the
+             * route that actually works on this build. This is only the extra. */
+            DbgPrint("kernmem: RtlAddFunctionTable not exported here - using the image header\n");
         }
         else
         {
@@ -2512,6 +2514,12 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     {
         DbgPrint("kernmem: no exception directory handed over - guarded faults will bugcheck\n");
     }
+
+    /*
+     * The header skeleton and the published entry are what make the guards work, and
+     * both must be in place before anything below can fault. Done after the
+     * RtlAddFunctionTable attempt only because that attempt is the optional extra.
+     */
 
     /*
      * Resolve the identity. An empty name means a service load or an old loader,
