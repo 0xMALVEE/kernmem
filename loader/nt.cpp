@@ -180,24 +180,41 @@ namespace nt
 
     uint64_t GetKernelModuleAddress(const std::string& moduleName)
     {
-        PRTL_PROCESS_MODULES modules = QueryModules();
+        /*
+         * EnumDeviceDrivers, not SystemModuleInformation. QueryModules lists every
+         * module under the right name but with a zeroed ImageBase on this machine -
+         * which is why `ci.dll not resolved` printed on every load while the kernel
+         * base, resolved this same way through psapi, always worked. Matching on the
+         * name here was never the problem; the base was.
+         */
+        LPVOID drivers[1024];
+        DWORD needed = 0;
 
-        if (!modules)
+        if (!EnumDeviceDrivers(drivers, sizeof(drivers), &needed) || !needed)
             return 0;
 
-        uint64_t result = 0;
+        const size_t count = needed / sizeof(LPVOID);
+        const size_t limit = count < (sizeof(drivers) / sizeof(drivers[0]))
+                                 ? count
+                                 : (sizeof(drivers) / sizeof(drivers[0]));
 
-        for (ULONG i = 0; i < modules->NumberOfModules; ++i)
+        const std::wstring wanted(moduleName.begin(), moduleName.end());
+
+        for (size_t i = 0; i < limit; ++i)
         {
-            if (_stricmp(ModuleNameOf(modules->Modules[i]), moduleName.c_str()) == 0)
-            {
-                result = reinterpret_cast<uint64_t>(modules->Modules[i].ImageBase);
-                break;
-            }
+            wchar_t path[MAX_PATH] = { 0 };
+
+            if (!GetDeviceDriverFileNameW(drivers[i], path, MAX_PATH))
+                continue;
+
+            const wchar_t* base = wcsrchr(path, L'\\');
+            base = base ? base + 1 : path;
+
+            if (_wcsicmp(base, wanted.c_str()) == 0)
+                return reinterpret_cast<uint64_t>(drivers[i]);
         }
 
-        VirtualFree(modules, 0, MEM_RELEASE);
-        return result;
+        return 0;
     }
 
     uint64_t GetKernelBase()

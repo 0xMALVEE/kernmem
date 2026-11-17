@@ -1030,27 +1030,24 @@ namespace
             }
         }
 
-        uint32_t pid = LookupPid(L"League of Legends.exe");
+        /*
+         * Nothing is launched here any more. The driver stands on its own and the
+         * overlay attaches on its own, so Riot's launcher is not part of a load -
+         * and a bounded 300 second wait just to find a pid the driver does not need
+         * held up the one path people actually use. Open the game when you want it.
+         */
+        const uint32_t pid = LookupPid(L"League of Legends.exe");
 
-        if (!pid)
+        if (pid)
         {
-            if (LaunchClient())
-                km_log::Info("starting the Riot client - log in and enter a match");
-            else
-                km_log::Info("open League of Legends and enter a match");
-
-            pid = WaitForGame(300);
+            /* Cached, so the overlay reuses this pid instead of re-scanning. */
+            g_sessionPid = pid;
+            km_log::Good("game pid %u", pid);
         }
-
-        if (!pid)
+        else
         {
-            km_log::Error("no game process found - is League of Legends installed?");
-            Pause();
-            return 1;
+            km_log::Info("driver is up - open the game when you want it");
         }
-
-        g_sessionPid = pid;
-        km_log::Good("game pid %u", pid);
 
         /* Lets this process use plain ReadProcessMemory too. */
         CmdAttach(GetCurrentProcessId());

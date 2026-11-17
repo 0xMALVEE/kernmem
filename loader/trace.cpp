@@ -147,26 +147,36 @@ namespace trace
             return false;
 
         PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(&nt);
-        uint64_t best = 0;
-        uint64_t bestSize = 0;
+        uint64_t low = 0;
+        uint64_t high = 0;
 
+        /*
+         * The span covers EVERY writable section, not just the largest one.
+         * Returning only the biggest meant an array or table sitting in any other
+         * writable section was never scanned at all, which is why both heuristics
+         * came back empty on every run. Non-writable gaps inside the span simply
+         * fail their read and are skipped.
+         */
         for (WORD i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++section)
         {
             if (!(section->Characteristics & IMAGE_SCN_MEM_WRITE) || !section->Misc.VirtualSize)
                 continue;
 
-            if (section->Misc.VirtualSize > bestSize)
-            {
-                best = kernelBase + section->VirtualAddress;
-                bestSize = section->Misc.VirtualSize;
-            }
+            const uint64_t start = kernelBase + section->VirtualAddress;
+            const uint64_t end = start + section->Misc.VirtualSize;
+
+            if (!low || start < low)
+                low = start;
+
+            if (end > high)
+                high = end;
         }
 
-        if (!best || !bestSize)
+        if (!low || high <= low)
             return false;
 
-        *outStart = best;
-        *outSize = bestSize;
+        *outStart = low;
+        *outSize = high - low;
         return true;
     }
 
@@ -743,6 +753,7 @@ namespace trace
         }
 
         uint64_t head = 0;
+        uint32_t walked = 0;
 
         if (!nal::ReadMemory(list, &head, sizeof(head)))
         {
@@ -755,6 +766,8 @@ namespace trace
             const uint64_t entry = head;
             uint64_t dllBase = 0;
             std::wstring name;
+
+            ++walked;
 
             /* The cursor comes out of the list, so it is only as trustworthy as the
              * entry that produced it. */
@@ -813,7 +826,7 @@ namespace trace
             return true;
         }
 
-        km_log::Warn("host entry not found in PsLoadedModuleList");
+        km_log::Warn("host entry not found in PsLoadedModuleList (%u entries walked)", walked);
         return false;
     }
 }
