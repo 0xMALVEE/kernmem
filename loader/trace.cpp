@@ -90,6 +90,37 @@ namespace
         return _wcsicmp(left.c_str(), right.c_str()) == 0;
     }
 
+    /*
+     * Whether a name has the shape this loader generates for a dropped host: a
+     * lowercase alphanumeric stem of 10-14 characters and a .sys extension.
+     *
+     * This is what makes the scrub work at all. It is handed the name of the CURRENT
+     * session, but every record it needs to clear was written by an EARLIER session
+     * under a different random name - so matching on the exact string could almost
+     * never succeed, and `trace scrub found nothing` printed on every load. Matching
+     * on shape catches all of our own drops without touching anything else.
+     */
+    bool LooksLikeOurDrop(const std::wstring& name)
+    {
+        const std::wstring::size_type dot = name.rfind(L'.');
+
+        if (dot == std::wstring::npos || dot < 10 || dot > 14)
+            return false;
+
+        if (_wcsicmp(name.c_str() + dot, L".sys") != 0)
+            return false;
+
+        for (std::wstring::size_type i = 0; i < dot; ++i)
+        {
+            const wchar_t c = name[i];
+
+            if (!((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9')))
+                return false;
+        }
+
+        return true;
+    }
+
     /* Reads a UNICODE_STRING at address and returns its base name. False when the
      * descriptor does not look like one, which is the common case while probing. */
     bool ReadUnicodeName(uint64_t address, std::wstring* out)
@@ -146,24 +177,48 @@ namespace trace
             nt.Signature != IMAGE_NT_SIGNATURE)
             return false;
 
-        PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(&nt);
+        const WORD count = nt.FileHeader.NumberOfSections;
+
+        if (!count || count > 96)
+            return false;
+
+        /*
+         * Read the section headers into their own buffer.
+         *
+         * IMAGE_FIRST_SECTION points FIELD_OFFSET(OptionalHeader) + SizeOfOptionalHeader
+         * past the header start - 0xF0 - but sizeof(IMAGE_NT_HEADERS64) is only 0x108.
+         * Everything past the first section header was therefore read off the end of
+         * the local stack copy, so with six sections almost the whole table was
+         * garbage. Both scans use this span and both came back empty on every run,
+         * while the ci.dll path - which reads through ImageSize and a pattern instead -
+         * worked. That asymmetry is the tell.
+         */
+        std::vector<IMAGE_SECTION_HEADER> sections(count);
+        const uint64_t sectionStart = kernelBase + dos.e_lfanew +
+                                      FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader) +
+                                      nt.FileHeader.SizeOfOptionalHeader;
+
+        if (!nal::ReadMemory(sectionStart, sections.data(),
+                             count * sizeof(IMAGE_SECTION_HEADER)))
+            return false;
+
         uint64_t low = 0;
         uint64_t high = 0;
 
         /*
          * The span covers EVERY writable section, not just the largest one.
          * Returning only the biggest meant an array or table sitting in any other
-         * writable section was never scanned at all, which is why both heuristics
-         * came back empty on every run. Non-writable gaps inside the span simply
-         * fail their read and are skipped.
+         * writable section was never scanned at all.
          */
-        for (WORD i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++section)
+        for (WORD i = 0; i < count; ++i)
         {
-            if (!(section->Characteristics & IMAGE_SCN_MEM_WRITE) || !section->Misc.VirtualSize)
+            const IMAGE_SECTION_HEADER& section = sections[i];
+
+            if (!(section.Characteristics & IMAGE_SCN_MEM_WRITE) || !section.Misc.VirtualSize)
                 continue;
 
-            const uint64_t start = kernelBase + section->VirtualAddress;
-            const uint64_t end = start + section->Misc.VirtualSize;
+            const uint64_t start = kernelBase + section.VirtualAddress;
+            const uint64_t end = start + section.Misc.VirtualSize;
 
             if (!low || start < low)
                 low = start;
@@ -229,10 +284,19 @@ namespace trace
                 memcpy(&buffer, chunk.data() + i + kUnloadedNameBuffer, sizeof(buffer));
                 memcpy(&lowSpan, chunk.data() + i + 0x10, sizeof(lowSpan));
 
+                /*
+                 * Name first, and the pointer test as a secondary gate. The old
+                 * `named || KernelRange(lowSpan, ...)` accepted any qword that merely
+                 * looked like a kernel pointer, so the 256-candidate cap filled with
+                 * junk inside the first chunk and the real array - further along the
+                 * span - was never reached. Every UNLOADED_DRIVERS record carries a
+                 * name, so the name is the discriminating test.
+                 */
                 const bool named = length > 4 && length <= 0x200 && !(length & 1) &&
-                                   length <= maximum && KernelRange(buffer, length);
+                                   length <= maximum && KernelRange(buffer, length) &&
+                                   KernelRange(lowSpan, 0x1000);
 
-                if (named || KernelRange(lowSpan, 0x1000))
+                if (named)
                     candidates.push_back(start + offset + i);
             }
 
@@ -432,7 +496,8 @@ namespace trace
             const uint64_t entry = array + i * kUnloadedEntrySize;
             std::wstring name;
 
-            if (!ReadUnicodeName(entry, &name) || !SameName(name, wanted))
+            if (!ReadUnicodeName(entry, &name) ||
+                (!SameName(name, wanted) && !LooksLikeOurDrop(name)))
                 continue;
 
             /* Zero the whole record: name, start, end and timestamp. A partially
@@ -517,7 +582,8 @@ namespace trace
             {
                 std::wstring name;
 
-                if (!ReadUnicodeName(entry + probe, &name) || !SameName(name, wanted))
+                if (!ReadUnicodeName(entry + probe, &name) ||
+                    (!SameName(name, wanted) && !LooksLikeOurDrop(name)))
                     continue;
 
                 uint64_t flink = 0;
@@ -662,7 +728,8 @@ namespace trace
 
             std::wstring name;
 
-            if (ReadUnicodeName(entry + kHashEntryName, &name) && SameName(name, wanted))
+            if (ReadUnicodeName(entry + kHashEntryName, &name) &&
+                (SameName(name, wanted) || LooksLikeOurDrop(name)))
             {
                 uint64_t flink = 0;
                 uint64_t blink = 0;
@@ -709,7 +776,8 @@ namespace trace
                          "cleared for %ls",
                           unloaded, cached, hashed, BaseName(imageName).c_str());
         else
-            km_log::Warn("trace scrub found nothing for %ls", BaseName(imageName).c_str());
+            km_log::Warn("trace scrub found nothing for %ls (a resident image is not in the unload list)",
+                         BaseName(imageName).c_str());
     }
 
     /*
