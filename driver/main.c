@@ -2129,6 +2129,51 @@ static NTSTATUS KmDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
  * Not covered: the LdrpModuleIndex red-black tree, which is what
  * RtlPcToFileHeader consults. An address-to-module lookup by PC still misses.
  */
+/*
+ * Writes back just enough PE header for the unwinder to find .pdata.
+ *
+ * The loader wipes the first 0x400 bytes so a pool scan cannot fingerprint the
+ * mapping by its own MZ/NT signature. RtlLookupFunctionEntry, however, resolves an
+ * image's exception directory by reading that very header - so with the header gone
+ * the lookup finds nothing, RtlLookupFunctionEntry returns NULL, and every
+ * __try/__except escalates to 0x1E. That is exactly how a guarded PEB read still
+ * bugchecked.
+ *
+ * RtlAddFunctionTable would avoid needing the header at all, but ntoskrnl does not
+ * export it on this build, so the header has to be the route. Only the skeleton is
+ * restored - enough for RtlImageDirectoryEntryToData to reach the directory, not a
+ * full header an image scan would recognise at a glance.
+ */
+static VOID KmRestoreExceptionHeader(ULONG exceptionRva, ULONG exceptionSize)
+{
+    const ULONG lfanew = 0x80;
+    PUCHAR base = (PUCHAR)g_ImageBase;
+
+    __try
+    {
+        base[0] = 'M';
+        base[1] = 'Z';
+        *(ULONG*)(base + 0x3C) = lfanew;
+
+        base[lfanew + 0] = 'P';
+        base[lfanew + 1] = 'E';
+        base[lfanew + 2] = 0;
+        base[lfanew + 3] = 0;
+
+        *(USHORT*)(base + lfanew + 0x04) = 0x8664;            /* AMD64 */
+        *(USHORT*)(base + lfanew + 0x14) = 0xF0;              /* SizeOfOptionalHeader */
+        *(USHORT*)(base + lfanew + 0x18) = 0x20B;             /* PE32+ */
+        *(ULONG*)(base + lfanew + 0x50) = (ULONG)g_ImageSize; /* SizeOfImage */
+        *(ULONG*)(base + lfanew + 0x84) = 16;                 /* NumberOfRvaAndSizes */
+        *(ULONG*)(base + lfanew + 0xA0) = exceptionRva;       /* EXCEPTION directory */
+        *(ULONG*)(base + lfanew + 0xA4) = exceptionSize;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        DbgPrint("kernmem: header restore faulted\n");
+    }
+}
+
 static NTSTATUS KmPublishModuleEntry(VOID)
 {
     static const WCHAR prefix[] = L"\\SystemRoot\\System32\\drivers\\";
@@ -2501,6 +2546,9 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
      * the route that does not depend on that export. Name and base are final by
      * this point, which is all the entry needs.
      */
+    if (exceptionRva && exceptionSize)
+        KmRestoreExceptionHeader(exceptionRva, exceptionSize);
+
     if (!NT_SUCCESS(KmPublishModuleEntry()))
         DbgPrint("kernmem: could not publish module entry\n");
 
