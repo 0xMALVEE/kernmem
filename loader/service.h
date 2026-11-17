@@ -18,8 +18,17 @@ namespace service
     NTSTATUS WriteKey(const std::wstring& driverPath, const std::wstring& serviceName);
     NTSTATUS RemoveKey(const std::wstring& serviceName);
 
-    /* Stops and removes every loaded service whose display name contains "iqvw".
-     * Used when the random name was lost with the state file, which otherwise left
-     * \Device\Nal held until a reboot. */
+    /* Removes the key of any service whose ImagePath ends in the given file. Used by
+     * the sweep: the service name and the file name are independently random, so the
+     * key can only be found by the path it stores.
+     *
+     * stopRunning false leaves a loaded service alone and drops only its key - the
+     * case where the host is still resident and the session has just attached to it.
+     */
+    NTSTATUS RemoveKeyForImage(const std::wstring& imagePath, bool stopRunning);
+
+    /* Stops and removes every service that runs out of %TEMP%, or whose display name
+     * still says "iqvw". Used when the random name was lost with the state file,
+     * which otherwise left \Device\Nal held until a reboot. */
     int StopAllIqvw();
 }

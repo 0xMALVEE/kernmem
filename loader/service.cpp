@@ -29,7 +29,24 @@ namespace service
             return STATUS_REGISTRY_IO_FAILED;
         }
 
+        /*
+         * A complete key, not just ImagePath and Type. An installer always writes
+         * Start and ErrorControl and almost always a DisplayName, so a key carrying
+         * two values out of six is itself the anomaly - regardless of how random the
+         * name is.
+         */
+        const DWORD errorControl = 1;
+        const DWORD start = 3; /* SERVICE_DEMAND_START */
+
         status = RegSetKeyValueW(key, nullptr, L"Type", REG_DWORD, &kServiceTypeKernel, sizeof(DWORD));
+        if (status == ERROR_SUCCESS)
+            status = RegSetKeyValueW(key, nullptr, L"ErrorControl", REG_DWORD, &errorControl, sizeof(DWORD));
+        if (status == ERROR_SUCCESS)
+            status = RegSetKeyValueW(key, nullptr, L"Start", REG_DWORD, &start, sizeof(DWORD));
+        if (status == ERROR_SUCCESS)
+            status = RegSetKeyValueW(key, nullptr, L"DisplayName", REG_SZ, serviceName.c_str(),
+                                     (DWORD)((serviceName.size() + 1) * sizeof(wchar_t)));
+
         if (status != ERROR_SUCCESS)
         {
             RegCloseKey(key);
@@ -49,6 +66,83 @@ namespace service
         return (status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND)
                    ? STATUS_SUCCESS
                    : STATUS_REGISTRY_IO_FAILED;
+    }
+
+    NTSTATUS RemoveKeyForImage(const std::wstring& imagePath, bool stopRunning)
+    {
+        SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+        if (!manager)
+            return STATUS_REGISTRY_IO_FAILED;
+
+        DWORD needed = 0;
+        DWORD count = 0;
+
+        EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER, SERVICE_STATE_ALL,
+                              nullptr, 0, &needed, &count, nullptr, nullptr);
+
+        auto buffer = static_cast<LPBYTE>(malloc(needed + 0x400));
+
+        if (!buffer)
+        {
+            CloseServiceHandle(manager);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        NTSTATUS result = STATUS_SUCCESS;
+
+        if (EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER, SERVICE_STATE_ALL,
+                                  buffer, needed + 0x400, &needed, &count, nullptr, nullptr))
+        {
+            auto entries = reinterpret_cast<LPENUM_SERVICE_STATUS_PROCESSW>(buffer);
+
+            for (DWORD i = 0; i < count; ++i)
+            {
+                SC_HANDLE service = OpenServiceW(manager, entries[i].lpServiceName,
+                                                 SERVICE_STOP | DELETE | SERVICE_QUERY_CONFIG);
+                if (!service)
+                    continue;
+
+                DWORD configSize = 0;
+                QueryServiceConfigW(service, nullptr, 0, &configSize);
+
+                auto config = static_cast<LPQUERY_SERVICE_CONFIGW>(malloc(configSize + 0x100));
+                bool match = false;
+
+                /* Stored as \??\C:\...\file.sys, so the file name is the tail. */
+                if (config && QueryServiceConfigW(service, config, configSize + 0x100, &configSize))
+                {
+                    const std::wstring binary = config->lpBinaryPathName;
+
+                    if (binary.size() >= imagePath.size() &&
+                        _wcsicmp(binary.c_str() + (binary.size() - imagePath.size()),
+                                 imagePath.c_str()) == 0)
+                        match = true;
+                }
+
+                free(config);
+                CloseServiceHandle(service);
+
+                if (!match)
+                    continue;
+
+                /* A resident host keeps running; only its key goes. Deleting a key
+                 * out from under a loaded service is what HideTrail already does, and
+                 * the service stays up until it is unloaded. */
+                if (stopRunning)
+                {
+                    if (!NT_SUCCESS(StopAndRemove(entries[i].lpServiceName)))
+                        result = STATUS_REGISTRY_IO_FAILED;
+                }
+                else if (!NT_SUCCESS(RemoveKey(entries[i].lpServiceName)))
+                {
+                    result = STATUS_REGISTRY_IO_FAILED;
+                }
+            }
+        }
+
+        free(buffer);
+        CloseServiceHandle(manager);
+        return result;
     }
 
     NTSTATUS RegisterAndStart(const std::wstring& driverPath, const std::wstring& serviceName)
@@ -111,14 +205,40 @@ namespace service
 
             for (DWORD i = 0; i < count; ++i)
             {
-                if (!wcsstr(entries[i].lpDisplayName, L"iqvw"))
-                    continue;
-
                 SC_HANDLE service = OpenServiceW(manager, entries[i].lpServiceName,
-                                                 SERVICE_STOP | DELETE);
+                                                 SERVICE_STOP | DELETE | SERVICE_QUERY_CONFIG);
 
                 if (!service)
                     continue;
+
+                /*
+                 * Matched on where the image lives, not on its name. Both the
+                 * service name and the file name are random now, so a display-name
+                 * test only ever caught the historical fixed pair. Anything running
+                 * out of %TEMP% is a drop of ours; the iqvw display name stays as a
+                 * fallback for a key written by an older build.
+                 */
+                bool ours = wcsstr(entries[i].lpDisplayName, L"iqvw") != nullptr;
+
+                if (!ours)
+                {
+                    DWORD configSize = 0;
+                    QueryServiceConfigW(service, nullptr, 0, &configSize);
+
+                    auto config = static_cast<LPQUERY_SERVICE_CONFIGW>(malloc(configSize + 0x100));
+
+                    if (config && QueryServiceConfigW(service, config, configSize + 0x100, &configSize))
+                        ours = wcsstr(config->lpBinaryPathName, L"\\Temp\\") != nullptr ||
+                               wcsstr(config->lpBinaryPathName, L"\\temp\\") != nullptr;
+
+                    free(config);
+                }
+
+                if (!ours)
+                {
+                    CloseServiceHandle(service);
+                    continue;
+                }
 
                 SERVICE_STATUS status = { 0 };
                 ControlService(service, SERVICE_CONTROL_STOP, &status);

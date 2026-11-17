@@ -21,6 +21,10 @@ league/debugger/ui/dist/
 *.pyc
 *.obj
 
+# Swapped-aside binaries: a running exe cannot be overwritten, only renamed, so a
+# rebuild against a live session leaves the old copy here until it exits.
+dist/*.old
+
 # IDE / OS
 .vs/
 *.user

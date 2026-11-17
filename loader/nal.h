@@ -67,17 +67,21 @@ namespace nal
     bool Unload(bool release);
 
     /*
-     * Deletes the dropped host image from disk right after a successful map.
+     * Deletes the dropped host image from disk and removes its service key.
      *
-     * The image section keeps its own reference, so the driver stays loaded and
-     * unloading still works; what goes away is the file a scanner can hash, read a
-     * version resource out of or match a TimeDateStamp against. Until this runs, a
-     * driver loaded out of %TEMP% sits on disk under its random name.
+     * The image itself is already gone by the time this is called - Load() unlinks
+     * it as soon as the device answers, because everything after that point can
+     * bugcheck and a bugcheck runs no cleanup. This call is what takes the registry
+     * entry, and it stays idempotent so the map-failure and success paths can both
+     * reach it.
      *
-     * The path string is kept, because the trace scrub keys off the file name and
-     * the release path deletes it again (harmlessly) on teardown.
+     * The path string is kept, because the trace scrub keys off the file name.
      */
     void HideTrail();
+
+    /* Random file name for the staged driver image, extension included. The image is
+     * on disk only for the length of a map, but a fixed prefix is still a literal. */
+    std::wstring RandomImageName();
 
     bool MemCopy(uint64_t destination, uint64_t source, uint64_t size);
     bool SetMemory(uint64_t address, uint32_t value, uint64_t size);

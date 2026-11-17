@@ -407,7 +407,9 @@ namespace
         std::wstring imagePath;
         if (!nt::GetFullTempPath().empty())
         {
-            imagePath = nt::GetFullTempPath() + L"\\km-mapped.sys";
+            /* Random, so nothing on disk carries a project prefix. The sweep finds
+             * a leftover by its bytes, never by the name. */
+            imagePath = nt::GetFullTempPath() + L"\\" + nal::RandomImageName();
             if (!nt::CreateFileFromMemory(imagePath,
                                           reinterpret_cast<const char*>(km_sys),
                                           km_sys_size))
