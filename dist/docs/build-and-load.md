@@ -129,6 +129,7 @@ flowchart TD
 | `dist/kernmem-loader.exe` | `loader/*.cpp` | **yes** | **yes** | the product |
 | `dist/kernmem-league.exe` | `league/client/` | **yes** | **yes** | end-to-end smoke test |
 | `dist/kernmem-cs2.exe` | `cs2/client/` | **yes** | **yes** | reference client for adding a game |
+| `dist/kernmem-apex.exe` | `apex-legends/client/` | **yes** | **yes** | Apex Legends client |
 | `dist/sdk/` | `sdk/` | **yes** | **yes** | client API |
 | `dist/docs/` | `docs/` | **yes** | **yes** | this set |
 

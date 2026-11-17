@@ -195,6 +195,13 @@ Write-Host '=== cs2 client ==='
 & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'cs2/client/build.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'cs2 client build failed' }
 
+# Apex has its own dump in apex-legends/offsets.txt and its own provider; it is
+# built on every run for the same reason as CS2 - a client that silently stops
+# building is worse than one that fails loudly here.
+Write-Host '=== apex client ==='
+& powershell -ExecutionPolicy Bypass -File (Join-Path $root 'apex-legends/client/build.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'apex client build failed' }
+
 # A locked binary gets renamed aside by the retry path, so drop the leftovers
 # rather than letting them pile up in dist. Ones still held stay until next run.
 Get-ChildItem -Path $distDir -Filter '*.old*' -File -ErrorAction SilentlyContinue |
@@ -203,10 +210,11 @@ Get-ChildItem -Path $distDir -Filter '*.old*' -File -ErrorAction SilentlyContinu
 Copy-Retry (Join-Path $buildDir 'kernmem-loader.exe') (Join-Path $distDir 'kernmem-loader.exe')
 Copy-Retry (Join-Path $buildDir 'kernmem-league.exe') (Join-Path $distDir 'kernmem-league.exe')
 Copy-Retry (Join-Path $buildDir 'kernmem-cs2.exe') (Join-Path $distDir 'kernmem-cs2.exe')
+Copy-Retry (Join-Path $buildDir 'kernmem-apex.exe') (Join-Path $distDir 'kernmem-apex.exe')
 
 # cs2/cheat-referance is a vendored third-party project, not ours - shipping it
 # into dist doubles the bundle for no benefit.
-foreach ($d in @('docs', 'sdk', 'tools', 'league', 'valorant', 'cs2')) {
+foreach ($d in @('docs', 'sdk', 'tools', 'league', 'valorant', 'cs2', 'apex-legends')) {
     $src = Join-Path $root $d
     if (Test-Path $src) {
         $target = Join-Path $distDir $d

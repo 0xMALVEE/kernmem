@@ -100,17 +100,32 @@ This project is **not** a claim of permanent undetected status. What remains obs
 |---------|-------------------|----------------------|
 | Device object `\Device\<random>` | `IoCreateDevice` registers it | name randomised per install, device type and `DriverName` derived from it |
 | Open handle to that device | your process holds it while working | open lazily, close when idle |
-| `iqvw64e.sys` service key | created by the loader, persists while loaded | unload deletes it; keep sessions short |
+| `iqvw64e.sys` service key | created by the loader to start the host | **deleted immediately after a successful map**; the host stays resident, so unload still works |
+| Dropped host image in `%TEMP%` | the service needs a file to load | **deleted immediately after a successful map** — the image section keeps its own reference, so the driver keeps running |
+| Host image identity (hash, version resource, `TimeDateStamp`) | the file and its headers are intact | only observable while the map is in progress now that the file is removed |
+| `iqvw64e.sys` in `MmUnloadedDrivers` | ntoskrnl records the unload | scrubbed before the map |
+| `iqvw64e.sys` in the PiDDB cache | one entry per image ever loaded | scrubbed before the map |
+| `iqvw64e.sys` in ci.dll's hash bucket list | one entry per image ever loaded, for the life of the boot | scrubbed before the map, under the cache lock |
+| `DriverStart` in NonPagedPool | manual mapping, no image section | nothing — structural |
 | Non-Microsoft code in kernel | `vgk` can hash kernel pages | nothing, short of a signed driver |
 | Timing of `ReadProcessMemory` bursts | volume + cadence | throttle in the client |
 | Registered client PID | a single PID gets rights restored | rotate if it matters |
 
-### What would move this from "works" to "harder to see"
+### Done
 
-1. Randomised device name and symbolic link per build.
-2. Kernel page hashing defeat (`MmSetPageProtection` + restore after patch).
-3. A pool-tag sweep so allocations do not carry a recognisable tag.
-4. Signed driver via an EV certificate â€” removes the NAL dependency entirely.
+1. Randomised device name, `DriverName` and service key per install, lowercase and vendor-shaped.
+2. Pool tag generated per install rather than stamped into the image.
+3. Object callback altitude seeded per install instead of a fixed constant.
+4. PE headers wiped before the image leaves user mode.
+5. All three kernel trace lists scrubbed: `MmUnloadedDrivers`, the PiDDB cache, and ci.dll's hash bucket list.
+6. Service key and dropped image removed immediately after a successful map, not deferred to release.
+7. Entry published in `PsLoadedModuleList`, so a named `\Driver\` object no longer contradicts `SystemModuleInformation`.
+
+### Still open
+
+1. Kernel page hashing defeat (`MmSetPageProtection` + restore after patch).
+2. `LdrpModuleIndex`: the red-black tree `RtlPcToFileHeader` consults. The list entry covers enumeration, not address-to-module lookup.
+3. Signed driver via an EV certificate â€” removes the NAL dependency entirely.
 
 ---
 

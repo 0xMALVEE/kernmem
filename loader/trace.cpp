@@ -23,6 +23,30 @@ namespace
     constexpr uint32_t kMaxNodes = 256;
     constexpr uint32_t kMaxDepth = 64;
 
+    /* _HASH_BUCKET_ENTRY on x64: List (0x00, 16 bytes), DriverName UNICODE_STRING
+     * (0x10), CertHash[5] (0x20). g_KernelHashBucketList is the list head, so the
+     * first eight bytes at it are the Flink of a sentinel node. */
+    constexpr uint64_t kHashEntryFlink = 0x00;
+    constexpr uint64_t kHashEntryName = 0x10;
+    constexpr uint64_t kHashEntrySize = 0x38;
+
+    /*
+     * g_KernelHashBucketList and g_HashCacheLock are not exported. This is the
+     * ci.dll sequence that references the list; the lock is a `lea rcx,[rip+x]`
+     * in the bytes just ahead of it. Neither offset is stable across builds, so
+     * both are resolved from the pattern instead of being hardcoded.
+     */
+    constexpr uint8_t kHashPattern[] =
+    {
+        0x48, 0x8B, 0x1D, 0x00, 0x00, 0x00, 0x00, 0xEB, 0x00,
+        0xF7, 0x43, 0x40, 0x00, 0x20, 0x00, 0x00
+    };
+    constexpr char kHashMask[] = "xxx????x?xxxxxxx";
+
+    constexpr uint8_t kLockPattern[] = { 0x48, 0x8D, 0x0D };
+    constexpr char kLockMask[] = "xxx";
+    constexpr uint32_t kLockSearchBack = 50;
+
     bool KernelRange(uint64_t address, uint64_t size)
     {
         return address >= 0xFFFF800000000000ULL &&
@@ -255,6 +279,82 @@ namespace trace
         return 0;
     }
 
+    /*
+     * Scans a kernel image for a masked byte pattern ('?' is a wildcard). Chunked,
+     * so a multi-megabyte image never needs one big read, and overlapped by the
+     * pattern length so a match straddling a chunk boundary is still found.
+     */
+    uint64_t FindPatternInImage(uint64_t base, uint32_t size, const uint8_t* pattern,
+                                const char* mask)
+    {
+        const size_t length = strlen(mask);
+        std::vector<uint8_t> chunk(kChunk + length);
+
+        for (uint64_t offset = 0; offset + length <= size; offset += kChunk)
+        {
+            const uint64_t span =
+                (size - offset < kChunk + length) ? size - offset : kChunk + length;
+
+            if (!nal::ReadMemory(base + offset, chunk.data(), span))
+                continue;
+
+            for (uint64_t i = 0; i + length <= span; ++i)
+            {
+                size_t j = 0;
+
+                for (; j < length; ++j)
+                {
+                    if (mask[j] != '?' && chunk[(size_t)i + j] != pattern[j])
+                        break;
+                }
+
+                if (j == length)
+                    return base + offset + i;
+            }
+        }
+
+        return 0;
+    }
+
+    /* The disp32 at `offset` is relative to the end of the instruction, which sits
+     * `length` bytes past its start. */
+    uint64_t Relative(uint64_t instruction, uint64_t offset, uint64_t length)
+    {
+        int32_t displacement = 0;
+
+        if (!nal::ReadMemory(instruction + offset, &displacement, sizeof(displacement)))
+            return 0;
+
+        return instruction + length + (int64_t)displacement;
+    }
+
+    /* SizeOfImage from a live image's own headers, so a scan has a bound. */
+    uint32_t ImageSize(uint64_t base)
+    {
+        uint8_t headers[0x40] = { 0 };
+
+        if (!nal::ReadMemory(base, headers, sizeof(headers)))
+            return 0;
+
+        if (headers[0] != 'M' || headers[1] != 'Z')
+            return 0;
+
+        int32_t ntHeaders = 0;
+        memcpy(&ntHeaders, headers + 0x3C, sizeof(ntHeaders));
+
+        if (ntHeaders <= 0)
+            return 0;
+
+        /* lfanew + NT signature (4) + IMAGE_FILE_HEADER (0x14) + SizeOfImage
+         * (0x38 into the optional header). */
+        uint32_t size = 0;
+
+        if (!nal::ReadMemory(base + (uint64_t)ntHeaders + 0x50, &size, sizeof(size)))
+            return 0;
+
+        return size;
+    }
+
     int ScrubUnloadedDrivers(const std::wstring& imageName)
     {
         const std::wstring wanted = BaseName(imageName);
@@ -438,14 +538,146 @@ namespace trace
         return unlinked;
     }
 
+    /*
+     * ci.dll keeps a validated-image record for the life of the boot, keyed by the
+     * image's own name, and it is not cleared by unloading: cleaning
+     * MmUnloadedDrivers and the PiDDB cache still leaves this list holding the
+     * host image's name until reboot.
+     *
+     * Neither the list nor its lock is exported, so both are resolved from the
+     * ci.dll byte sequence that references them. The walk runs under the cache
+     * lock through the kernel-call trampoline, and every write is validated
+     * first - the descriptor must read as a real name and both neighbours must
+     * point back at the entry - because a half-unlinked list here faults the
+     * machine rather than just losing the scrub.
+     */
+    int ScrubHashBucketList(const std::wstring& imageName)
+    {
+        const std::wstring wanted = BaseName(imageName);
+        const uint64_t kernelBase = nal::ResolveKernelBase();
+
+        if (wanted.empty() || !kernelBase)
+            return 0;
+
+        const uint64_t ci = nal::GetKernelModuleBase("ci.dll");
+
+        if (!ci)
+        {
+            km_log::Warn("ci.dll not resolved - hash bucket entry left in place");
+            return 0;
+        }
+
+        const uint32_t size = ImageSize(ci);
+
+        if (!size)
+            return 0;
+
+        const uint64_t hit = FindPatternInImage(ci, size, kHashPattern, kHashMask);
+
+        if (!hit)
+        {
+            km_log::Warn("g_KernelHashBucketList not found - hash bucket entry left in place");
+            return 0;
+        }
+
+        const uint64_t list = Relative(hit, 3, 7);
+
+        /* The lock reference is a few bytes ahead of the list reference. */
+        const uint64_t lockHit =
+            FindPatternInImage(hit - kLockSearchBack, kLockSearchBack, kLockPattern, kLockMask);
+
+        if (!list || !lockHit)
+        {
+            km_log::Warn("g_HashCacheLock not found - hash bucket entry left in place");
+            return 0;
+        }
+
+        const uint64_t lock = Relative(lockHit, 3, 7);
+
+        if (!KernelRange(list, 0x10) || !KernelRange(lock, 0x10))
+            return 0;
+
+        const uint64_t acquire =
+            nal::GetKernelModuleExport(kernelBase, "ExAcquireResourceExclusiveLite");
+        const uint64_t release =
+            nal::GetKernelModuleExport(kernelBase, "ExReleaseResourceLite");
+
+        if (!acquire || !release)
+        {
+            km_log::Warn("cache lock helpers unresolved - hash bucket entry left in place");
+            return 0;
+        }
+
+        uint64_t locked = 0;
+
+        if (!nal::CallKernelFunction(&locked, acquire, lock, (uint64_t)1) || !locked)
+        {
+            km_log::Warn("g_HashCacheLock could not be taken - hash bucket entry left in place");
+            return 0;
+        }
+
+        int unlinked = 0;
+        uint64_t entry = 0;
+
+        if (!nal::ReadMemory(list, &entry, sizeof(entry)))
+            entry = 0;
+
+        for (uint32_t guard = 0; entry && KernelRange(entry, kHashEntrySize) && guard < kMaxNodes;
+             ++guard)
+        {
+            uint64_t next = 0;
+
+            if (!nal::ReadMemory(entry + kHashEntryFlink, &next, sizeof(next)))
+                break;
+
+            std::wstring name;
+
+            if (ReadUnicodeName(entry + kHashEntryName, &name) && SameName(name, wanted))
+            {
+                uint64_t flink = 0;
+                uint64_t blink = 0;
+
+                if (nal::ReadMemory(entry, &flink, sizeof(flink)) &&
+                    nal::ReadMemory(entry + 0x08, &blink, sizeof(blink)) &&
+                    KernelRange(flink, 0x10) && KernelRange(blink, 0x10) &&
+                    Aligned(flink) && Aligned(blink))
+                {
+                    uint64_t check = 0;
+
+                    if (nal::ReadMemory(flink + 0x08, &check, sizeof(check)) && check == entry &&
+                        nal::ReadMemory(blink, &check, sizeof(check)) && check == entry &&
+                        nal::WriteMemory(flink + 0x08, &blink, sizeof(blink)) &&
+                        nal::WriteMemory(blink, &flink, sizeof(flink)))
+                    {
+                        ++unlinked;
+
+                        /* The entry's own forward link is the next node. */
+                        next = flink;
+                    }
+                }
+            }
+
+            entry = next;
+        }
+
+        uint64_t released = 0;
+
+        if (!nal::CallKernelFunction(&released, release, lock))
+            km_log::Warn("g_HashCacheLock could not be released");
+
+        return unlinked;
+    }
+
     void Scrub(const std::wstring& imageName)
     {
         const int unloaded = ScrubUnloadedDrivers(imageName);
         const int cached = ScrubPiddbCache(imageName);
+        const int hashed = ScrubHashBucketList(imageName);
 
-        if (unloaded || cached)
-            km_log::Good("trace scrub: %d unload slot(s), %d cache entry(ies) cleared for %ls",
-                          unloaded, cached, BaseName(imageName).c_str());
+        if (unloaded || cached || hashed)
+            km_log::Good("trace scrub: %d unload slot(s), %d cache entry(ies), %d hash entry(ies) "
+                         "cleared for %ls",
+                          unloaded, cached, hashed, BaseName(imageName).c_str());
         else
             km_log::Warn("trace scrub found nothing for %ls", BaseName(imageName).c_str());
     }

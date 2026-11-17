@@ -40,13 +40,14 @@ Per game â€” each folder holds that game's scripts, offsets, overlay and no
  league/    League of Legends
  valorant/  Valorant
  cs2/       Counter-Strike 2
+ apex-legends/  Apex Legends
 ```
 
 The driver does not change per game.
 
 The ESP itself is **not** per game. `sdk/client/` holds everything that is identical everywhere: the click-through layered window, the double buffer, box/health/range drawing, the attach retry, the re-attach on game loss, the stop key, and the driver open with protocol check. A game supplies only offsets and one `esp::Provider` implementation.
 
-A game folder therefore holds `offsets.h`, `provider.h/.cpp` and a three-line `main.cpp`, plus its docs. `cs2/client/` is the reference — copy its shape. Python in a game folder is offset-recovery tooling only and is never in the frame loop.
+A game folder therefore holds `offsets.h`, `provider.h/.cpp` and a three-line `main.cpp`, plus its docs. `cs2/client/` is the reference — copy its shape. `apex-legends/client/` is a second worked example where the entity list is a flat array rather than a chunk table. Python in a game folder is offset-recovery tooling only and is never in the frame loop.
 
 ---
 
@@ -85,7 +86,7 @@ Manual control, if you want it:
 
 The loader itself draws nothing and knows no offsets. The ESP lives in the per-game client, on the shared framework in `sdk/client`, so adding a game never touches the loader.
 
-See [league/docs/overlay.md](league/docs/overlay.md) and [cs2/README.md](cs2/README.md).
+See [league/docs/overlay.md](league/docs/overlay.md), [cs2/README.md](cs2/README.md) and [apex-legends/README.md](apex-legends/README.md).
 
 ```python
 import km

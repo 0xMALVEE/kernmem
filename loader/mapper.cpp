@@ -30,6 +30,26 @@ namespace
     constexpr uint64_t kObjectHeaderPointerCountOffset = 0x00;
     constexpr uint64_t kObjectHeaderTypeIndexOffset = 0x18;
 
+    /*
+     * Drops a registered exception table again. The table lives in kernel pool,
+     * so it is deleted from the dispatch list before the block is released.
+     */
+    void DropFunctionTable(uint64_t table)
+    {
+        if (!table)
+            return;
+
+        const uint64_t args[4] = { table, 0, 0, 0 };
+        const uint64_t remove = nal::GetKernelModuleExport(nal::ntoskrnlBase,
+                                                           "RtlDeleteFunctionTable");
+
+        if (remove &&
+            !nal::CallKernelFunctionRaw(nullptr, remove, args, 1))
+            km_log::Warn("RtlDeleteFunctionTable call failed");
+
+        nal::FreePool(table);
+    }
+
     /* _OBJECT_TYPE.Index - the TypeIndex stored in every object header. */
     constexpr uint64_t kObjectTypeIndexOffset = 0x28;
 
@@ -52,6 +72,15 @@ namespace mapper
             return false;
 
         ZeroMemory(result, sizeof(*result));
+
+        /* Import resolution is what fills the IAT. With no kernel base every
+         * slot stays NULL and the image faults on its first imported call, so
+         * stop here instead of mapping something that cannot run. */
+        if (!nal::ntoskrnlBase)
+        {
+            km_log::Error("kernel base unresolved - cannot resolve imports");
+            return false;
+        }
 
         pe::IMAGE_INFO image = { 0 };
         if (!pe::Load(driverPath, &image))
@@ -160,6 +189,69 @@ namespace mapper
             nal::FreePool(kernelImage);
             pe::Free(&image);
             return false;
+        }
+
+        /*
+         * Hand the image's exception table to the kernel before any of its code
+         * runs. A manually mapped image is invisible to the SEH dispatcher: it is
+         * absent from PsLoadedModuleList and carries no registered
+         * RUNTIME_FUNCTION, so RtlLookupFunctionEntry finds nothing for a RIP
+         * inside it and every __try/__except guard in the driver escalates to
+         * KMODE_EXCEPTION_NOT_HANDLED (0x1E) instead of being caught. Copy .pdata
+         * into pool, rebase its RVAs onto the real load address, register it.
+         */
+        uint64_t functionTable = 0;
+
+        if (image.exceptionRva && image.exceptionSize >= sizeof(RUNTIME_FUNCTION))
+        {
+            const size_t count = (size_t)(image.exceptionSize / sizeof(RUNTIME_FUNCTION));
+            const auto* source = reinterpret_cast<const RUNTIME_FUNCTION*>(
+                localImage + image.exceptionRva);
+
+            functionTable = nal::AllocatePool(count * sizeof(RUNTIME_FUNCTION));
+
+            if (functionTable)
+            {
+                const uint32_t rebase = (uint32_t)(kernelImage - image.preferredBase);
+                bool written = true;
+
+                for (size_t i = 0; i < count; ++i)
+                {
+                    RUNTIME_FUNCTION entry = source[i];
+
+                    entry.BeginAddress += rebase;
+                    entry.EndAddress += rebase;
+                    if (entry.UnwindInfoAddress)
+                        entry.UnwindInfoAddress += rebase;
+
+                    if (!WriteToKernel(functionTable + i * sizeof(RUNTIME_FUNCTION),
+                                       &entry, sizeof(entry)))
+                    {
+                        written = false;
+                        break;
+                    }
+                }
+
+                const uint64_t add = nal::GetKernelModuleExport(nal::ntoskrnlBase,
+                                                                "RtlAddFunctionTable");
+                uint64_t tableArgs[4] = { functionTable, count, kernelImage, 0 };
+
+                if (!written || !add ||
+                    !nal::CallKernelFunctionRaw(nullptr, add, tableArgs, 3))
+                {
+                    km_log::Warn("exception table not registered - guarded faults will bugcheck");
+                    DropFunctionTable(functionTable);
+                    functionTable = 0;
+                }
+                else
+                {
+                    km_log::Step("registered %zu exception entries", count);
+                }
+            }
+        }
+        else
+        {
+            km_log::Warn("image has no exception directory - guarded faults will bugcheck");
         }
 
         free(localImage);
@@ -348,6 +440,7 @@ namespace mapper
         if (!nal::CallKernelFunctionRaw(&entryStatus, entryPoint, args, 2))
         {
             km_log::Error("the kernel call for DriverEntry failed");
+            DropFunctionTable(functionTable);
             nal::FreePool(initBlock);
             nal::FreePool(driverObject - kObjectHeaderSize);
             nal::FreePool(kernelImage);
@@ -372,6 +465,7 @@ namespace mapper
         result->imageSize = image.imageSize;
         result->driverObject = driverObject;
         result->entryPoint = entryPoint;
+        result->functionTable = functionTable;
         result->status = static_cast<NTSTATUS>(entryStatus);
 
         pe::Free(&image);
@@ -379,6 +473,8 @@ namespace mapper
         if (!NT_SUCCESS(result->status))
         {
             km_log::Error("DriverEntry returned 0x%08X", (unsigned)result->status);
+            DropFunctionTable(result->functionTable);
+            result->functionTable = 0;
             nal::FreePool(driverObject - kObjectHeaderSize);
             nal::FreePool(kernelImage);
             return false;
@@ -435,6 +531,9 @@ namespace mapper
          * window before that flag is observable.
          */
         Sleep(250);
+
+        /* The image is about to vanish, so its exception table has to go first. */
+        DropFunctionTable(result.functionTable);
 
         nal::FreePool(result.imageBase);
         return true;

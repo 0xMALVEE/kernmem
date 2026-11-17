@@ -24,6 +24,8 @@ namespace pe
         uint64_t       relocationSize;
         uint64_t       importRva;
         uint64_t       importSize;
+        uint64_t       exceptionRva;   /* .pdata: RUNTIME_FUNCTION array */
+        uint64_t       exceptionSize;
     } IMAGE_INFO;
 
     /* Reads the file and validates it as an x64 native image with relocations. */

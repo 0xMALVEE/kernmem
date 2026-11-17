@@ -23,6 +23,7 @@ namespace mapper
         uint64_t imageSize;
         uint64_t driverObject; /* kernel pool DRIVER_OBJECT for teardown */
         uint64_t entryPoint;   /* resolved kernel VA of DriverEntry */
+        uint64_t functionTable; /* kernel pool RUNTIME_FUNCTION array, 0 if none */
         NTSTATUS status;       /* status returned by DriverEntry */
         /* Device name the driver actually created. A name still owned by a dead
          * image is suffixed, so this is not always the one that was requested. */

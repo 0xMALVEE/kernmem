@@ -66,6 +66,19 @@ namespace nal
      * is stopped, the key and the dropped image deleted and the state file removed. */
     bool Unload(bool release);
 
+    /*
+     * Deletes the dropped host image from disk right after a successful map.
+     *
+     * The image section keeps its own reference, so the driver stays loaded and
+     * unloading still works; what goes away is the file a scanner can hash, read a
+     * version resource out of or match a TimeDateStamp against. Until this runs, a
+     * driver loaded out of %TEMP% sits on disk under its random name.
+     *
+     * The path string is kept, because the trace scrub keys off the file name and
+     * the release path deletes it again (harmlessly) on teardown.
+     */
+    void HideTrail();
+
     bool MemCopy(uint64_t destination, uint64_t source, uint64_t size);
     bool SetMemory(uint64_t address, uint32_t value, uint64_t size);
 
@@ -107,10 +120,21 @@ namespace nal
      * NtAddAtom from user mode with the given arguments, then restores it. */
     bool CallKernelFunctionRaw(void* outResult, uint64_t kernelFunction, const uint64_t args[4], int argCount);
 
+    /*
+     * Builds the argument array from the count instead of trailing zeros: a fixed
+     * `{ args..., 0, 0, 0 }` initializer is too many initializers as soon as the
+     * call passes one argument, so it only ever compiled for zero-argument calls.
+     */
     template <typename... A>
     bool CallKernelFunction(void* outResult, uint64_t kernelFunction, A... args)
     {
-        const uint64_t argv[4] = { (uint64_t)args..., 0, 0, 0 };
-        return CallKernelFunctionRaw(outResult, kernelFunction, argv, (int)sizeof...(A));
+        constexpr size_t count = sizeof...(A);
+        const uint64_t values[count ? count : 1] = { (uint64_t)args... };
+        uint64_t argv[4] = { 0, 0, 0, 0 };
+
+        for (size_t i = 0; i < count && i < 4; ++i)
+            argv[i] = values[i];
+
+        return CallKernelFunctionRaw(outResult, kernelFunction, argv, (int)count);
     }
 }

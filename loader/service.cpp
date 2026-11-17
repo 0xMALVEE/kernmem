@@ -10,7 +10,7 @@ namespace service
 {
     static const DWORD kServiceTypeKernel = 1;
 
-    NTSTATUS RegisterAndStart(const std::wstring& driverPath, const std::wstring& serviceName)
+    NTSTATUS WriteKey(const std::wstring& driverPath, const std::wstring& serviceName)
     {
         const std::wstring servicesPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
         const std::wstring imagePath = L"\\??\\" + driverPath;
@@ -38,6 +38,26 @@ namespace service
         }
 
         RegCloseKey(key);
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS RemoveKey(const std::wstring& serviceName)
+    {
+        const std::wstring servicesPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
+        const LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
+
+        return (status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND)
+                   ? STATUS_SUCCESS
+                   : STATUS_REGISTRY_IO_FAILED;
+    }
+
+    NTSTATUS RegisterAndStart(const std::wstring& driverPath, const std::wstring& serviceName)
+    {
+        const std::wstring servicesPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
+
+        const NTSTATUS written = WriteKey(driverPath, serviceName);
+        if (!NT_SUCCESS(written))
+            return written;
 
         const ULONG kSeLoadDriverPrivilege = 10UL;
         BOOLEAN wasEnabled = FALSE;

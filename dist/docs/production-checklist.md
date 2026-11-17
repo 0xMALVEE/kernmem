@@ -92,6 +92,8 @@ Eight items. Nothing here is optional â€” a driver that cannot be loaded an
 - [ ] clean-machine test: Secure Boot on, HVCI off
 - [ ] clean-machine test: HVCI on
 - [ ] uninstall path verified (unload + key deleted + temp file gone)
+- [ ] after a successful map, the service key and the dropped image are gone while the driver still answers
+- [ ] `MmUnloadedDrivers`, the PiDDB cache and the ci.dll hash bucket all report clear for the host image
 - [ ] antivirus false-positive sweep on a fresh Defender definition
 
 ---
@@ -102,7 +104,7 @@ Eight items. Nothing here is optional â€” a driver that cannot be loaded an
 2. **Elevation required to load.** Not required to use.
 3. **One client pid at a time.**
 4. **Writes to read-only game pages can fail.** Reads always work.
-5. **`iqvw64e.sys` ships as a third-party binary.** Intel-signed, but it is Intel's file.
+5. **`iqvw64e.sys` ships as a third-party binary.** Intel-signed, but it is Intel's file — and the host is still identifiable as NAL by its IOCTL surface even after the file is deleted.
 6. **Not a guarantee of permanent undetection.** See [02 Â§6](detection-model.md).
 7. **Patch-day risk.** Vanguard updates can move the callback altitude; `321000` is the constant to revisit first.
 
@@ -117,6 +119,7 @@ Eight items. Nothing here is optional â€” a driver that cannot be loaded an
 | `PsGetNextProcess` export appears/disappears | fallback already covers both â€” verify both paths |
 | Intel pulls `iqvw64e.sys` | re-extract from a current driver package |
 | IOCTL surface change | bump `KM_PROTOCOL_VERSION`, update `docs/05` |
+| Windows build change (ci.dll) | re-verify the `g_KernelHashBucketList` pattern; a miss logs a warning and skips the scrub rather than failing |
 
 ---
 

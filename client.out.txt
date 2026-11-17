@@ -1,0 +1,132 @@
+[*] client: attaching to driver
+[read 1] exists=0 attr=4294967295 fopen=2
+[state 1] name-len=0 name=[]
+[open] len=29 path=[\\?\GLOBALROOT\Device\Kernmem] -> 2
+[open] len=11 path=[\\.\Kernmem] -> 2
+[read 2] exists=0 attr=4294967295 fopen=2
+[state 2] name-len=0 name=[]
+[open] len=29 path=[\\?\GLOBALROOT\Device\Kernmem] -> 2
+[open] len=11 path=[\\.\Kernmem] -> 2
+[read 3] exists=0 attr=4294967295 fopen=2
+[state 3] name-len=0 name=[]
+[open] len=29 path=[\\?\GLOBALROOT\Device\Kernmem] -> 2
+[open] len=11 path=[\\.\Kernmem] -> 2
+[read 4] exists=0 attr=4294967295 fopen=2
+[state 4] name-len=0 name=[]
+[open] len=29 path=[\\?\GLOBALROOT\Device\Kernmem] -> 2
+[open] len=11 path=[\\.\Kernmem] -> 2
+[read 5] exists=0 attr=4294967295 fopen=2
+[state 5] name-len=0 name=[]
+[open] len=29 path=[\\?\GLOBALROOT\Device\Kernmem] -> 2
+[open] len=11 path=[\\.\Kernmem] -> 2
+[read 6] exists=0 attr=4294967295 fopen=2
+[state 6] name-len=0 name=[]
+[open] len=29 path=[\\?\GLOBALROOT\Device\Kernmem] -> 2
+[open] len=11 path=[\\.\Kernmem] -> 2
+[read 7] exists=0 attr=4294967295 fopen=2
+[state 7] name-len=0 name=[]
+[read 8] exists=0 attr=4294967295 fopen=2
+[state 8] name-len=0 name=[]
+[*] starting the loader - accept the elevation prompt
+[read 9] exists=0 attr=4294967295 fopen=2
+[state 9] name-len=0 name=[]
+[read 10] exists=1 attr=32 fopen=0
+[state 10] name-len=12 name=[gghsmrjylagk]
+[+] driver connected
+[+] attached to pid 9460 at 0x7FFA01080000
+[-] 120 frames, 9 players
+[-] 240 frames, 7 players
+[-] 360 frames, 8 players
+[-] 480 frames, 8 players
+[-] 600 frames, 9 players
+[-] 720 frames, 9 players
+[-] 840 frames, 8 players
+[-] 960 frames, 9 players
+[-] 1080 frames, 8 players
+[-] 1200 frames, 7 players
+[-] 1320 frames, 9 players
+[-] 1440 frames, 7 players
+[-] 1560 frames, 7 players
+[-] 1680 frames, 10 players
+[-] 1800 frames, 8 players
+[-] 1920 frames, 11 players
+[-] 2040 frames, 12 players
+[-] 2160 frames, 10 players
+[-] 2280 frames, 9 players
+[-] 2400 frames, 12 players
+[-] 2520 frames, 9 players
+[-] 2640 frames, 11 players
+[-] 2760 frames, 12 players
+[-] 2880 frames, 13 players
+[-] 3000 frames, 11 players
+[-] 3120 frames, 9 players
+[-] 3240 frames, 11 players
+[-] 3360 frames, 11 players
+[-] 3480 frames, 10 players
+[-] 3600 frames, 10 players
+[-] 3720 frames, 11 players
+[-] 3840 frames, 11 players
+[-] 3960 frames, 10 players
+[-] 4080 frames, 11 players
+[-] 4200 frames, 13 players
+[-] 4320 frames, 12 players
+[-] 4440 frames, 12 players
+[-] 4560 frames, 10 players
+[-] 4680 frames, 12 players
+[-] 4800 frames, 11 players
+[-] 4920 frames, 9 players
+[-] 5040 frames, 12 players
+[-] 5160 frames, 11 players
+[-] 5280 frames, 12 players
+[-] 5400 frames, 12 players
+[-] 5520 frames, 12 players
+[-] 5640 frames, 12 players
+[-] 5760 frames, 12 players
+[-] 5880 frames, 12 players
+[-] 6000 frames, 13 players
+[-] 6120 frames, 11 players
+[-] 6240 frames, 11 players
+[-] 6360 frames, 11 players
+[-] 6480 frames, 12 players
+[-] 6600 frames, 12 players
+[-] 6720 frames, 10 players
+[-] 6840 frames, 12 players
+[-] 6960 frames, 10 players
+[-] 7080 frames, 12 players
+[-] 7200 frames, 12 players
+[-] 7320 frames, 13 players
+[-] 7440 frames, 11 players
+[-] 7560 frames, 11 players
+[-] 7680 frames, 12 players
+[-] 7800 frames, 13 players
+[-] 7920 frames, 11 players
+[-] 8040 frames, 13 players
+[-] 8160 frames, 11 players
+[-] 8280 frames, 14 players
+[-] 8400 frames, 14 players
+[-] 8520 frames, 12 players
+[-] 8640 frames, 13 players
+[-] 8760 frames, 10 players
+[-] 8880 frames, 13 players
+[-] 9000 frames, 12 players
+[-] 9120 frames, 10 players
+[-] 9240 frames, 12 players
+[-] 9360 frames, 11 players
+[-] 9480 frames, 13 players
+[-] 9600 frames, 12 players
+[-] 9720 frames, 12 players
+[-] 9840 frames, 13 players
+[-] 9960 frames, 10 players
+[-] 10080 frames, 12 players
+[-] 10200 frames, 11 players
+[-] 10320 frames, 10 players
+[-] 10440 frames, 12 players
+[-] 10560 frames, 12 players
+[-] 10680 frames, 12 players
+[-] 10800 frames, 11 players
+[-] 10920 frames, 9 players
+[-] 11040 frames, 11 players
+[-] 11160 frames, 10 players
+[-] 11280 frames, 10 players
+[-] 11400 frames, 11 players
+[-] 11520 frames, 12

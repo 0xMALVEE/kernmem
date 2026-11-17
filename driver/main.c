@@ -115,6 +115,10 @@ static unsigned __int64 g_ImageBase = 0;
 static unsigned __int64 g_ImageSize = 0;
 static PVOID            g_DriverObject = NULL;
 
+/* Published LDR_DATA_TABLE_ENTRY, or NULL. Pool, so it outlives nothing of its
+ * own: unload unlinks and frees it before the image goes. */
+static PVOID            g_ModuleEntry = NULL;
+
 /*
  * Shared block. The client allocates it and hands the user VA over in the init
  * block; it is locked here and mapped into system space, and a worker thread
@@ -128,6 +132,11 @@ static PVOID            g_DriverObject = NULL;
 #define KM_BLOCK_COUNT  2
 #define KM_BLOCK_KERNEL 0
 #define KM_BLOCK_CLIENT 1
+
+/* Upper bound on a client-supplied block. One KM_SHARED is all anything needs,
+ * and an unbounded size hands an absurd VA range to MmProbeAndLockPages, which
+ * then raises with part of the range already locked. */
+#define KM_MAX_SHARED_BYTES 0x100000
 
 typedef struct _KM_BLOCK_STATE
 {
@@ -305,7 +314,8 @@ static BOOLEAN KmStartShared(ULONG index, unsigned __int64 user, ULONG size)
     NTSTATUS status;
     KM_SHARED* map;
 
-    if (index >= KM_BLOCK_COUNT || !user || size < sizeof(KM_SHARED))
+    if (index >= KM_BLOCK_COUNT || !user || size < sizeof(KM_SHARED) ||
+        size > KM_MAX_SHARED_BYTES)
         return FALSE;
 
     block = &g_Blocks[index];
@@ -341,6 +351,22 @@ static BOOLEAN KmStartShared(ULONG index, unsigned __int64 user, ULONG size)
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
+        /*
+         * The probe raises after part of the range is already locked, and an MDL
+         * freed without unlocking leaves those pages charged to the calling
+         * process for good - bugcheck 0x76 PROCESS_HAS_LOCKED_PAGES, 33 pages for
+         * one KM_SHARED. Unlock under its own guard: a half-built MDL can raise
+         * again here, and that must not take the machine down on a path that is
+         * already failing.
+         */
+        __try
+        {
+            MmUnlockPages(block->Mdl);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+
         IoFreeMdl(block->Mdl);
         block->Mdl = NULL;
         return FALSE;
@@ -639,6 +665,12 @@ static NTSTATUS KmRegisterObjectCallback(void)
                           g_AltitudeFallbacks[i]);
 
     RtlZeroMemory(operations, sizeof(operations));
+    /*
+     * PsProcessType is a data import, so the symbol IS the IAT slot address. The
+     * registration wants exactly that: a pointer to the variable that holds the
+     * OBJECT_TYPE, not the type object itself (which is what *PsProcessType is
+     * and what the pre-operation compares against).
+     */
     operations[0].ObjectType = PsProcessType;
     operations[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
     operations[0].PreOperation = KmProcessPreOperation;
@@ -1564,7 +1596,8 @@ static BOOLEAN KmAddressCopyable(ULONG_PTR address, ULONG size)
     if (last < address)
         return FALSE;
 
-    if (address <= (ULONG_PTR)MmHighestUserAddress)
+    /* MmHighestUserAddress is a data import: dereference the IAT slot. */
+    if (address <= *(ULONG_PTR*)&MmHighestUserAddress)
         return TRUE;
 
     if (!MmIsAddressValid((PVOID)address) || !MmIsAddressValid((PVOID)last))
@@ -2017,6 +2050,131 @@ static NTSTATUS KmDefaultDispatch(PDEVICE_OBJECT device, PIRP irp)
     return STATUS_INVALID_DEVICE_REQUEST;
 }
 
+/*
+ * Publishes this image in PsLoadedModuleList.
+ *
+ * DriverStart already points at the mapped image, but nothing listed it, so
+ * NtQuerySystemInformation(SystemModuleInformation) and a \Driver\ walk
+ * disagreed: one showed the driver, the other showed nothing. This closes that
+ * gap for anything that walks load order.
+ *
+ * The block carries 0x10 bytes ahead of the entry for the two reserved fields a
+ * real LDR_DATA_TABLE_ENTRY has before InLoadOrderLinks, and the name buffer
+ * directly behind it, so the entry is self-contained and one free undoes it.
+ *
+ * Not covered: the LdrpModuleIndex red-black tree, which is what
+ * RtlPcToFileHeader consults. An address-to-module lookup by PC still misses.
+ */
+static NTSTATUS KmPublishModuleEntry(VOID)
+{
+    static const WCHAR prefix[] = L"\\SystemRoot\\System32\\drivers\\";
+    static const WCHAR suffix[] = L".sys";
+
+    KM_LDR_ENTRY* entry;
+    PLIST_ENTRY head;
+    UNICODE_STRING fullName;
+    UNICODE_STRING baseName;
+    SIZE_T deviceChars = 0;
+    SIZE_T nameChars;
+    SIZE_T bytes;
+    WCHAR* buffer;
+    PVOID block;
+
+    if (!g_ImageBase || !g_ImageSize || !g_DeviceName[0])
+        return STATUS_INVALID_PARAMETER;
+
+    if (!NT_SUCCESS(RtlStringCchLengthW(g_DeviceName, KM_MAX_DEVICE_CHARS, &deviceChars)))
+        return STATUS_INVALID_PARAMETER;
+
+    nameChars = (RTL_NUMBER_OF(prefix) - 1) + deviceChars + (RTL_NUMBER_OF(suffix) - 1);
+    bytes = 0x10 + sizeof(KM_LDR_ENTRY) + (nameChars + 1) * sizeof(WCHAR);
+
+    block = ExAllocatePoolWithTag(NonPagedPool, bytes, g_PoolTag);
+
+    if (!block)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(block, bytes);
+
+    entry = (KM_LDR_ENTRY*)((PUCHAR)block + 0x10);
+    buffer = (WCHAR*)((PUCHAR)entry + sizeof(KM_LDR_ENTRY));
+
+    RtlStringCchCopyW(buffer, nameChars + 1, prefix);
+    RtlStringCchCatW(buffer, nameChars + 1, g_DeviceName);
+    RtlStringCchCatW(buffer, nameChars + 1, suffix);
+
+    fullName.Buffer = buffer;
+    fullName.Length = (USHORT)(nameChars * sizeof(WCHAR));
+    fullName.MaximumLength = (USHORT)((nameChars + 1) * sizeof(WCHAR));
+
+    /* BaseDllName is the bare file name, not the full path. */
+    baseName.Buffer = buffer + (RTL_NUMBER_OF(prefix) - 1);
+    baseName.Length = (USHORT)((deviceChars + (RTL_NUMBER_OF(suffix) - 1)) * sizeof(WCHAR));
+    baseName.MaximumLength = (USHORT)(baseName.Length + sizeof(WCHAR));
+
+    entry->DllBase = (PVOID)g_ImageBase;
+    entry->EntryPoint = NULL;
+    entry->SizeOfImage = (ULONG)g_ImageSize;
+    entry->FullDllName = fullName;
+    entry->BaseDllName = baseName;
+    /* Exact flag bits drift between builds and nothing load-bearing reads them. */
+    entry->Flags = 0x00002000;
+    entry->LoadCount = 1;
+    entry->TlsIndex = 0;
+
+    /*
+     * PsLoadedModuleList is a DATA import, so the compiler addresses the IAT
+     * slot itself for &PsLoadedModuleList instead of the list head - and that
+     * slot is the LAST import in the table. head->Blink therefore reads 8 bytes
+     * past the end of the IAT, which is zero, and InsertTailList writes through
+     * NULL: bugcheck 0x1E with c0000005, a read of address 0. Dereferencing the
+     * slot once yields the real list head.
+     */
+    head = *(PLIST_ENTRY*)&PsLoadedModuleList;
+
+    if (!head)
+    {
+        ExFreePoolWithTag(block, g_PoolTag);
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
+
+    /*
+     * One insert, not three. InMemoryOrderLinks and InInitializationOrderLinks
+     * belong to the user-mode PEB loader lists; the kernel walks
+     * PsLoadedModuleList through InLoadOrderLinks and resolves every cursor with
+     * CONTAINING_RECORD(cursor, KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks). Linking
+     * the same entry three times into that single list made each walker read the
+     * entry 0x10 bytes off - which is what made EnumDeviceDrivers and
+     * SystemModuleInformation fault with 0xC0000005 right after the fix. The two
+     * unused links stay self-linked so RemoveEntryList stays safe on them.
+     */
+    InitializeListHead(&entry->InMemoryOrderLinks);
+    InitializeListHead(&entry->InInitializationOrderLinks);
+
+    InsertTailList(head, &entry->InLoadOrderLinks);
+
+    g_ModuleEntry = block;
+    return STATUS_SUCCESS;
+}
+
+/* Unlinks and frees the published entry. Runs before the image is freed. */
+static VOID KmRetractModuleEntry(VOID)
+{
+    KM_LDR_ENTRY* entry;
+
+    if (!g_ModuleEntry)
+        return;
+
+    entry = (KM_LDR_ENTRY*)((PUCHAR)g_ModuleEntry + 0x10);
+
+    RemoveEntryList(&entry->InInitializationOrderLinks);
+    RemoveEntryList(&entry->InMemoryOrderLinks);
+    RemoveEntryList(&entry->InLoadOrderLinks);
+
+    ExFreePoolWithTag(g_ModuleEntry, g_PoolTag);
+    g_ModuleEntry = NULL;
+}
+
 static VOID KmUnload(PDRIVER_OBJECT driver)
 {
     LARGE_INTEGER timeout;
@@ -2062,7 +2220,14 @@ static VOID KmUnload(PDRIVER_OBJECT driver)
     }
 
     if (g_Symlink.Buffer)
+    {
         IoDeleteSymbolicLink(&g_Symlink);
+        /* Cleared so a reload of the same image cannot delete it twice. */
+        g_Symlink.Buffer = NULL;
+    }
+
+    /* Before the image is freed, so the list never holds a dead pointer. */
+    KmRetractModuleEntry();
 
     if (g_DeviceObject)
     {
@@ -2179,12 +2344,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         }
     }
 
-    /* The shared block is optional - without it every read stays on IOCTL. */
-    if (sharedUser && KmStartShared(KM_BLOCK_KERNEL, sharedUser, sharedSize))
-        DbgPrint("kernmem: shared block up, reads need no IOCTL\n");
-    else if (sharedUser)
-        DbgPrint("kernmem: shared block failed, reads stay on IOCTL\n");
-
     /*
      * Resolve the identity. An empty name means a service load or an old loader,
      * so the historical static namespace stays as the fallback.
@@ -2274,7 +2433,39 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     if (!NT_SUCCESS(status))
     {
         KmTeardownShared();
+
+        if (g_Symlink.Buffer)
+        {
+            IoDeleteSymbolicLink(&g_Symlink);
+            g_Symlink.Buffer = NULL;
+        }
+
+        KmRetractModuleEntry();
+
+        if (g_DeviceObject)
+        {
+            IoDeleteDevice(g_DeviceObject);
+            g_DeviceObject = NULL;
+        }
+
         return status;
+    }
+
+    /*
+     * Brought up only now, with the device and symlink already in place. Starting
+     * it earlier put a live system thread on the blocks while the entry was still
+     * building the device, and left a worker running behind a load that could
+     * still fail - the half-up state the next load then collided with.
+     *
+     * Optional: without it every read stays on IOCTL, so a failure here is not
+     * fatal to the load and needs no unwind.
+     */
+    if (sharedUser)
+    {
+        if (KmStartShared(KM_BLOCK_KERNEL, sharedUser, sharedSize))
+            DbgPrint("kernmem: shared block up, reads need no IOCTL\n");
+        else
+            DbgPrint("kernmem: shared block failed, reads stay on IOCTL\n");
     }
 
     /* The driver object name has to follow the device name actually used, or an
@@ -2291,8 +2482,35 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
         RtlStringCchCopyNW(initParams->DeviceName, KM_MAX_DEVICE_CHARS,
                            g_DeviceName, KM_MAX_DEVICE_CHARS - 1);
 
-    /* A failing object callback is not fatal: attach-based R/W still works. */
-    KmRegisterObjectCallback();
+    /*
+     * Last, once the image base, size and name are all final. A failing publish
+     * is not fatal either: everything else about the driver works without it, it
+     * just stays invisible to module enumeration.
+     */
+    /*
+     * Both of these walk kernel structures by hand from inside an image the
+     * kernel knows nothing about, so a raised fault here would bugcheck the whole
+     * machine on an otherwise good load. Guarded, and non-fatal either way: the
+     * driver works without the entry and without the callback.
+     */
+    __try
+    {
+        if (!NT_SUCCESS(KmPublishModuleEntry()))
+            DbgPrint("kernmem: could not publish module entry\n");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        DbgPrint("kernmem: publish faulted\n");
+    }
+
+    __try
+    {
+        KmRegisterObjectCallback();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        DbgPrint("kernmem: callback registration faulted\n");
+    }
 
     return STATUS_SUCCESS;
 }

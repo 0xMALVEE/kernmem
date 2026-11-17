@@ -49,6 +49,11 @@ NTKERNELAPI PEPROCESS NTAPI PsGetNextProcess(_In_opt_ PEPROCESS Process);
 
 NTKERNELAPI PUCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
+/* Not declared by the WDK headers, but exported by ntoskrnl. The head of the
+ * loaded-module list: a named \Driver\ object that appears in no module list is
+ * a cheap contradiction to spot, so the driver publishes itself here. */
+extern LIST_ENTRY PsLoadedModuleList;
+
 /*
  * Minimal x64 PEB layout. The WDK only forward-declares _PEB, so the two
  * fields this driver touches are laid out explicitly. Offsets are fixed for

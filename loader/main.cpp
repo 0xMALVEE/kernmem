@@ -461,6 +461,13 @@ namespace
 
         km_log::Good("driver loaded, protocol %u", version);
 
+        /*
+         * The host is up and answering, so the file it was loaded from is no
+         * longer needed. Removing it now rather than on release means the temp
+         * directory only holds the image while the map is actually in progress.
+         */
+        nal::HideTrail();
+
         if (clientPid)
             km_log::Good("client pid %u registered", clientPid);
 
