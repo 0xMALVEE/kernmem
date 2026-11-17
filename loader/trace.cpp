@@ -221,7 +221,24 @@ namespace trace
     constexpr uint32_t kMaxCandidates = 256;
 
     /* Largest writable section of ntoskrnl, which is where both live. */
-    bool KernelWritableRange(uint64_t kernelBase, uint64_t* outStart, uint64_t* outSize)
+    /* One writable section, as a start and a length. */
+    typedef struct _KM_SPAN
+    {
+        uint64_t Start;
+        uint64_t Size;
+    } KM_SPAN;
+
+    /*
+     * Fills out with each writable section separately.
+     *
+     * Returning ONE bounding span across every writable section looked right and was
+     * not: the span includes the non-writable gaps between sections, and the scans
+     * read a whole 64 KB chunk at a time. A chunk that straddles a gap is a read over
+     * unmapped or read-only pages, and the host's copy routine has no probe behind it,
+     * so the machine bugchecks 0x50 instead of the scan skipping. Every section is
+     * contiguous and mapped on its own, so per-section ranges are safe by construction.
+     */
+    bool KernelWritableRanges(uint64_t kernelBase, std::vector<KM_SPAN>* out)
     {
         IMAGE_DOS_HEADER dos = { 0 };
         IMAGE_NT_HEADERS64 nt = { 0 };
@@ -254,18 +271,18 @@ namespace trace
                                       FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader) +
                                       nt.FileHeader.SizeOfOptionalHeader;
 
-        if (!nal::ReadMemory(sectionStart, sections.data(),
+        if (!Mapped(sectionStart, count * sizeof(IMAGE_SECTION_HEADER)) ||
+            !nal::ReadMemory(sectionStart, sections.data(),
                              count * sizeof(IMAGE_SECTION_HEADER)))
             return false;
 
-        uint64_t low = 0;
-        uint64_t high = 0;
-
         /*
-         * The span covers EVERY writable section, not just the largest one.
-         * Returning only the biggest meant an array or table sitting in any other
-         * writable section was never scanned at all.
+         * Every writable section, individually. Returning only the largest meant an
+         * array or table sitting in any other writable section was never scanned at
+         * all; returning one merged span made the scans read across the gaps.
          */
+        out->clear();
+
         for (WORD i = 0; i < count; ++i)
         {
             const IMAGE_SECTION_HEADER& section = sections[i];
@@ -273,22 +290,15 @@ namespace trace
             if (!(section.Characteristics & IMAGE_SCN_MEM_WRITE) || !section.Misc.VirtualSize)
                 continue;
 
-            const uint64_t start = kernelBase + section.VirtualAddress;
-            const uint64_t end = start + section.Misc.VirtualSize;
+            KM_SPAN span = { kernelBase + section.VirtualAddress, section.Misc.VirtualSize };
 
-            if (!low || start < low)
-                low = start;
+            if (!Mapped(span.Start, span.Size))
+                continue;
 
-            if (end > high)
-                high = end;
+            out->push_back(span);
         }
 
-        if (!low || high <= low)
-            return false;
-
-        *outStart = low;
-        *outSize = high - low;
-        return true;
+        return !out->empty();
     }
 
     bool LooksLikeImageName(uint64_t address, std::wstring* out)
@@ -312,19 +322,20 @@ namespace trace
      */
     uint64_t FindUnloadedArray(uint64_t kernelBase)
     {
-        uint64_t start = 0;
-        uint64_t size = 0;
+        std::vector<KM_SPAN> ranges;
         std::vector<uint8_t> chunk(kChunk);
         std::vector<uint64_t> candidates;
 
-        if (!KernelWritableRange(kernelBase, &start, &size))
+        if (!KernelWritableRanges(kernelBase, &ranges))
             return 0;
 
-        for (uint64_t offset = 0; offset < size; offset += kChunk)
+        for (const KM_SPAN& range : ranges)
+        for (uint64_t offset = 0; offset < range.Size; offset += kChunk)
         {
-            const uint64_t span = (size - offset < kChunk) ? size - offset : kChunk;
+            const uint64_t span = (range.Size - offset < kChunk) ? range.Size - offset : kChunk;
+            const uint64_t start = range.Start + offset;
 
-            if (!nal::ReadMemory(start + offset, chunk.data(), span))
+            if (!Mapped(start, span) || !nal::ReadMemory(start, chunk.data(), span))
                 continue;
 
             candidates.clear();
@@ -353,7 +364,7 @@ namespace trace
                                    KernelRange(lowSpan, 0x1000);
 
                 if (named)
-                    candidates.push_back(start + offset + i);
+                    candidates.push_back(start + i);
             }
 
             for (uint64_t candidate : candidates)
@@ -386,18 +397,19 @@ namespace trace
      */
     uint64_t FindPiddbTable(uint64_t kernelBase)
     {
-        uint64_t start = 0;
-        uint64_t size = 0;
+        std::vector<KM_SPAN> ranges;
         std::vector<uint8_t> chunk(kChunk);
 
-        if (!KernelWritableRange(kernelBase, &start, &size))
+        if (!KernelWritableRanges(kernelBase, &ranges))
             return 0;
 
-        for (uint64_t offset = 0; offset < size; offset += kChunk)
+        for (const KM_SPAN& range : ranges)
+        for (uint64_t offset = 0; offset < range.Size; offset += kChunk)
         {
-            const uint64_t span = (size - offset < kChunk) ? size - offset : kChunk;
+            const uint64_t span = (range.Size - offset < kChunk) ? range.Size - offset : kChunk;
+            const uint64_t start = range.Start + offset;
 
-            if (!nal::ReadMemory(start + offset, chunk.data(), span))
+            if (!Mapped(start, span) || !nal::ReadMemory(start, chunk.data(), span))
                 continue;
 
             for (uint64_t i = 0; i + sizeof(uint64_t) <= span; i += 8)
@@ -407,7 +419,10 @@ namespace trace
 
                 memcpy(&table, chunk.data() + i, sizeof(table));
 
-                if (!KernelRange(table, 0x80))
+                /* Mapped, not canonical: this is the read that bugchecked. The value
+                 * comes out of a scanned buffer, so it is only as good as the scan, and
+                 * the copy behind it has no probe. */
+                if (!Mapped(table, 0x80))
                     continue;
 
                 if (!nal::ReadMemory(table + kTableRootRightChild, &root, sizeof(root)))
@@ -416,7 +431,7 @@ namespace trace
                 if (!root)
                     return table;
 
-                if (!KernelRange(root, 0x20))
+                if (!Mapped(root, 0x20))
                     continue;
 
                 for (uint64_t probe = 0x08; probe <= 0x58; probe += 0x08)
@@ -527,7 +542,7 @@ namespace trace
         if (symbol && KernelRange(symbol, sizeof(uint64_t)))
             nal::ReadMemory(symbol, &array, sizeof(array));
 
-        if (!array || !KernelRange(array, kUnloadedEntrySize))
+        if (!array || !Mapped(array, kUnloadedEntrySize * 2))
         {
             if (!g_unloadedScanned)
             {
@@ -599,7 +614,7 @@ namespace trace
         if (symbol && KernelRange(symbol, sizeof(uint64_t)))
             nal::ReadMemory(symbol, &table, sizeof(table));
 
-        if (!table || !KernelRange(table, 0x80))
+        if (!table || !Mapped(table, 0x80))
         {
             if (!g_piddbScanned)
             {
@@ -660,7 +675,7 @@ namespace trace
                     !nal::ReadMemory(entry + 0x08, &blink, sizeof(blink)))
                     break;
 
-                if (!KernelRange(flink, 0x10) || !KernelRange(blink, 0x10) ||
+                if (!Mapped(flink, 0x10) || !Mapped(blink, 0x10) ||
                     !Aligned(flink) || !Aligned(blink))
                     break;
 
@@ -690,11 +705,11 @@ namespace trace
             uint64_t left = 0;
             uint64_t right = 0;
 
-            if (nal::ReadMemory(node + 0x08, &left, sizeof(left)) && left && KernelRange(left, 0x20) &&
+            if (nal::ReadMemory(node + 0x08, &left, sizeof(left)) && left && Mapped(left, 0x20) &&
                 depth < kMaxDepth)
                 stack[depth++] = left;
 
-            if (nal::ReadMemory(node + 0x10, &right, sizeof(right)) && right && KernelRange(right, 0x20) &&
+            if (nal::ReadMemory(node + 0x10, &right, sizeof(right)) && right && Mapped(right, 0x20) &&
                 depth < kMaxDepth)
                 stack[depth++] = right;
         }
@@ -804,7 +819,7 @@ namespace trace
 
                 if (nal::ReadMemory(entry, &flink, sizeof(flink)) &&
                     nal::ReadMemory(entry + 0x08, &blink, sizeof(blink)) &&
-                    KernelRange(flink, 0x10) && KernelRange(blink, 0x10) &&
+                    Mapped(flink, 0x10) && Mapped(blink, 0x10) &&
                     Aligned(flink) && Aligned(blink))
                 {
                     uint64_t check = 0;
@@ -907,7 +922,7 @@ namespace trace
 
             /* The cursor comes out of the list, so it is only as trustworthy as the
              * entry that produced it. */
-            if (!KernelRange(entry, 0x60))
+            if (!Mapped(entry, 0x60))
             {
                 km_log::Warn("disguise: entry 0x%llX is not a kernel range",
                              (unsigned long long)entry);
@@ -921,7 +936,7 @@ namespace trace
             }
 
             if (!nal::ReadMemory(entry + kLdrDllBase, &dllBase, sizeof(dllBase)) ||
-                !KernelRange(dllBase, 0x1000))
+                !Mapped(dllBase, 0x1000))
                 continue;
 
             if (!ReadUnicodeName(entry + kLdrBaseName, &name) || !SameName(name, wanted))
